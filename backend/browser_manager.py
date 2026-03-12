@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,6 +173,16 @@ class BrowserManager:
         display, ws_port = await self.vnc.allocate()
         cdp_port = BASE_CDP_PORT + (display - self.vnc.BASE_DISPLAY)
 
+        # Verify CDP port is available before launching Chrome on it
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", cdp_port))
+            except OSError:
+                async with self._lock:
+                    self._launching.discard(profile_id)
+                await self.vnc.stop_vnc(display)
+                raise ValueError(f"CDP port {cdp_port} is already in use")
+
         # Clean stale Chromium lock files (left by previous container crashes)
         user_data_dir = Path(profile["user_data_dir"])
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
@@ -241,8 +252,8 @@ class BrowserManager:
             for p in context.pages:
                 try:
                     await p.evaluate(_clipboard_init_js)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Clipboard init failed on existing page: %s", exc)
 
             running = RunningProfile(
                 profile_id=profile_id,

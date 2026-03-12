@@ -80,8 +80,10 @@ class VNCManager:
 
         if proc.poll() is not None:
             try:
-                err = open(log_path).read()
-            except Exception:
+                with open(log_path) as f:
+                    err = f.read()
+            except Exception as exc:
+                logger.debug("Failed to read Xvnc log %s: %s", log_path, exc)
                 err = ""
             raise RuntimeError(f"Xvnc failed to start on :{display}: {err}")
 
@@ -124,7 +126,7 @@ class VNCManager:
             if result.returncode == 0:
                 logger.info("Cleaned up stale Xvnc processes")
         except FileNotFoundError:
-            pass
+            logger.debug("pkill not found, skipping stale Xvnc cleanup")
 
     def get_ws_port(self, display: int) -> int | None:
         """Get WebSocket port for a display."""

@@ -320,3 +320,186 @@ def test_cdp_json_version_not_running(app_client: TestClient):
 def test_cdp_json_list_not_running(app_client: TestClient):
     resp = app_client.get("/api/profiles/nonexistent/cdp/json/list")
     assert resp.status_code == 404
+
+
+def _mock_running_profile(pid: str) -> MagicMock:
+    """Create a mock RunningProfile and register it in browser_mgr."""
+    mock = MagicMock(spec=RunningProfile)
+    mock.display = 100
+    mock.ws_port = 6100
+    mock.cdp_port = 5100
+    mock.profile_id = pid
+    main.browser_mgr.running[pid] = mock
+    return mock
+
+
+def test_cdp_json_version_rewrites_ws_url(app_client: TestClient):
+    """GET /cdp/json/version rewrites webSocketDebuggerUrl through our proxy."""
+    create = app_client.post("/api/profiles", json={"name": "CdpVer"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    chrome_response = MagicMock()
+    chrome_response.json.return_value = {
+        "webSocketDebuggerUrl": "ws://127.0.0.1:5100/devtools/browser/abc-123",
+        "Browser": "Chrome/145.0.0.0",
+    }
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=chrome_response)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/cdp/json/version")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["webSocketDebuggerUrl"] == f"ws://testserver/api/profiles/{pid}/cdp"
+    assert data["Browser"] == "Chrome/145.0.0.0"
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_json_version_uses_wss_behind_https(app_client: TestClient):
+    """X-Forwarded-Proto: https should produce wss:// URLs."""
+    create = app_client.post("/api/profiles", json={"name": "CdpWss"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    chrome_response = MagicMock()
+    chrome_response.json.return_value = {
+        "webSocketDebuggerUrl": "ws://127.0.0.1:5100/devtools/browser/abc",
+    }
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=chrome_response)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(
+            f"/api/profiles/{pid}/cdp/json/version",
+            headers={"X-Forwarded-Proto": "https"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["webSocketDebuggerUrl"].startswith("wss://")
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_json_list_rewrites_page_urls(app_client: TestClient):
+    """GET /cdp/json/list rewrites per-page webSocketDebuggerUrl."""
+    create = app_client.post("/api/profiles", json={"name": "CdpList"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    chrome_response = MagicMock()
+    chrome_response.json.return_value = [
+        {
+            "id": "page1",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:5100/devtools/page/DEADBEEF",
+        },
+        {
+            "id": "page2",
+            "title": "No WS URL",
+        },
+    ]
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=chrome_response)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/cdp/json/list")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data[0]["webSocketDebuggerUrl"] == (
+        f"ws://testserver/api/profiles/{pid}/cdp/devtools/page/DEADBEEF"
+    )
+    assert "webSocketDebuggerUrl" not in data[1]
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_json_version_chrome_unreachable(app_client: TestClient):
+    """502 when Chrome CDP endpoint is down."""
+    create = app_client.post("/api/profiles", json={"name": "CdpDown"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/cdp/json/version")
+
+    assert resp.status_code == 502
+    main.browser_mgr.running.pop(pid, None)
+
+
+# ── WebSocket Origin Validation ──────────────────────────────────────────────
+
+
+def test_vnc_ws_rejects_cross_origin(app_client: TestClient):
+    """VNC WebSocket should reject cross-origin browser connections."""
+    create = app_client.post("/api/profiles", json={"name": "OriginVnc"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    with pytest.raises(Exception):
+        with app_client.websocket_connect(
+            f"/api/profiles/{pid}/vnc",
+            headers={"origin": "http://evil.com"},
+        ):
+            pass
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_ws_rejects_cross_origin(app_client: TestClient):
+    """CDP WebSocket should reject cross-origin browser connections."""
+    create = app_client.post("/api/profiles", json={"name": "OriginCdp"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    with pytest.raises(Exception):
+        with app_client.websocket_connect(
+            f"/api/profiles/{pid}/cdp",
+            headers={"origin": "http://evil.com"},
+        ):
+            pass
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_ws_allows_same_origin(app_client: TestClient):
+    """WebSocket from same origin should pass Origin check (not get 4403)."""
+    create = app_client.post("/api/profiles", json={"name": "OriginOk"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    # Same-origin passes Origin check. VNC proxy then fails to connect to
+    # real KasmVNC (not running), but that's fine — we're testing Origin only.
+    # The connection is accepted (no 4403), then closes due to VNC connect error.
+    try:
+        with app_client.websocket_connect(
+            f"/api/profiles/{pid}/vnc",
+            headers={"origin": "http://testserver"},
+        ) as ws:
+            pass  # connection accepted = Origin check passed
+    except Exception as exc:
+        # Any error other than 4403 means Origin check passed
+        assert "4403" not in str(exc)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_ws_allows_no_origin(app_client: TestClient):
+    """WebSocket without Origin header (Playwright/Puppeteer) should be accepted."""
+    create = app_client.post("/api/profiles", json={"name": "NoOrigin"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    try:
+        with app_client.websocket_connect(f"/api/profiles/{pid}/vnc") as ws:
+            pass
+    except Exception as exc:
+        assert "4403" not in str(exc)
+    main.browser_mgr.running.pop(pid, None)

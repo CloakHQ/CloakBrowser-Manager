@@ -71,8 +71,8 @@ export function ProfileViewer({ profileId, cdpUrl, onDisconnect }: ProfileViewer
       if (rfb) {
         try {
           rfb.disconnect();
-        } catch {
-          // ignore
+        } catch (err) {
+          console.debug("[vnc] disconnect cleanup failed:", err);
         }
       }
       rfbRef.current = null;
@@ -174,7 +174,9 @@ export function ProfileViewer({ profileId, cdpUrl, onDisconnect }: ProfileViewer
         if (text && text !== lastText) {
           lastText = text;
           console.log("[clipboard] poll: new VNC clipboard:", text.substring(0, 50), "len:", text.length);
-          await navigator.clipboard.writeText(text).catch(() => {});
+          await navigator.clipboard.writeText(text).catch((err) =>
+            console.warn("[clipboard] poll writeText failed:", err)
+          );
         }
       } catch (err) {
         console.warn("[clipboard] poll error, stopping:", err);
@@ -239,10 +241,10 @@ export function ProfileViewer({ profileId, cdpUrl, onDisconnect }: ProfileViewer
             <button
               onClick={() => {
                 const base = `${window.location.protocol}//${window.location.host}${cdpUrl}`;
-                navigator.clipboard.writeText(base).then(() => {
+                navigator.clipboard?.writeText(base).then(() => {
                   setCdpCopied(true);
                   setTimeout(() => setCdpCopied(false), 2000);
-                });
+                }).catch((err) => console.warn("[cdp] copy failed:", err));
               }}
               className={`p-1 ${cdpCopied ? "text-emerald-400" : "text-gray-500 hover:text-gray-300"}`}
               title={cdpCopied ? "Copied!" : "Copy CDP endpoint URL"}

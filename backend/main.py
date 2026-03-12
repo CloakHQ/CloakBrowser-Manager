@@ -15,6 +15,7 @@ import shutil
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -76,6 +77,62 @@ def _check_auth(scope: Scope) -> bool:
                     return True
             break
 
+    return False
+
+
+def _is_https(request: Request) -> bool:
+    """Check if the original client connection was HTTPS (via reverse proxy header)."""
+    proto = request.headers.get("x-forwarded-proto", "")
+    return "https" in proto
+
+
+async def _check_websocket_origin(websocket: WebSocket) -> bool:
+    """Reject cross-origin WebSocket connections (CSWSH protection).
+
+    Browsers always send an Origin header on WebSocket upgrades.
+    Non-browser clients (Playwright, curl) typically don't — those are allowed.
+    If Origin is present, its host must match the request Host header.
+    """
+    origin = None
+    host = None
+    for key, val in websocket.scope.get("headers", []):
+        if key == b"origin":
+            origin = val.decode("latin-1")
+        elif key == b"host":
+            host = val.decode("latin-1")
+
+    # No Origin header → non-browser client (Playwright, Puppeteer) → allow
+    if not origin:
+        return True
+
+    # Parse origin to extract host:port
+    try:
+        parsed = urlparse(origin)
+        origin_host = parsed.hostname or ""
+        origin_port = parsed.port
+    except ValueError:
+        logger.warning("WebSocket origin malformed: %s", origin)
+        await websocket.close(code=4403, reason="Origin not allowed")
+        return False
+    # Build origin netloc (host:port or just host if default port)
+    if origin_port and origin_port not in (80, 443):
+        origin_netloc = f"{origin_host}:{origin_port}"
+    else:
+        origin_netloc = origin_host
+
+    if not host:
+        return True  # no Host header to compare against
+
+    # Strip default port from Host too (some proxies send "example.com:443")
+    host_normalized = host
+    if host.endswith(":80") or host.endswith(":443"):
+        host_normalized = host.rsplit(":", 1)[0]
+
+    if origin_netloc == host_normalized:
+        return True
+
+    logger.warning("WebSocket origin mismatch: origin=%s host=%s", origin, host)
+    await websocket.close(code=4403, reason="Origin not allowed")
     return False
 
 
@@ -342,25 +399,29 @@ async def auth_status(request: starlette.requests.Request):
 
 
 @app.post("/api/auth/login")
-async def auth_login(body: LoginRequest, response: Response):
+async def auth_login(body: LoginRequest, request: Request, response: Response):
     if not AUTH_TOKEN:
         return {"ok": True}
     if not body.token or not hmac.compare_digest(body.token, AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid token")
+    is_https = _is_https(request)
     response.set_cookie(
         key="auth_token",
         value=AUTH_TOKEN,
         httponly=True,
         samesite="strict",
-        secure=False,
+        secure=is_https,
         path="/",
     )
     return {"ok": True}
 
 
 @app.post("/api/auth/logout")
-async def auth_logout(response: Response):
-    response.delete_cookie(key="auth_token", path="/")
+async def auth_logout(request: Request, response: Response):
+    is_https = _is_https(request)
+    response.delete_cookie(
+        key="auth_token", path="/", secure=is_https, samesite="strict",
+    )
     return {"ok": True}
 
 
@@ -573,7 +634,8 @@ async def get_clipboard(profile_id: str):
                 text = await page.evaluate("window.__clipboardText || ''")
                 if text:
                     return {"text": text[:_CLIPBOARD_MAX_READ]}
-            except Exception:
+            except Exception as exc:
+                logger.debug("Clipboard read failed on page: %s", exc)
                 continue
     except Exception as exc:
         logger.debug("Playwright clipboard read failed: %s", exc)
@@ -608,6 +670,9 @@ async def get_clipboard(profile_id: str):
 @app.websocket("/api/profiles/{profile_id}/vnc")
 async def vnc_proxy(websocket: WebSocket, profile_id: str):
     """Proxy WebSocket frames between the frontend and a profile's KasmVNC."""
+    if not await _check_websocket_origin(websocket):
+        return
+
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
@@ -761,8 +826,8 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
     finally:
         try:
             await websocket.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("VNC proxy: websocket.close() failed: %s", exc)
 
 
 # ── CDP WebSocket Proxy ──────────────────────────────────────────────────────
@@ -783,6 +848,7 @@ async def cdp_info(profile_id: str):
     }
 
 
+@app.get("/api/profiles/{profile_id}/cdp/json/version/")
 @app.get("/api/profiles/{profile_id}/cdp/json/version")
 async def cdp_json_version(profile_id: str, request: Request):
     """Proxy Chrome's /json/version, rewriting WS URLs to go through our proxy."""
@@ -802,11 +868,14 @@ async def cdp_json_version(profile_id: str, request: Request):
 
     # Rewrite webSocketDebuggerUrl to point through our proxy
     host = request.headers.get("host", "localhost:8080")
-    data["webSocketDebuggerUrl"] = f"ws://{host}/api/profiles/{profile_id}/cdp"
+    ws_scheme = "wss" if _is_https(request) else "ws"
+    data["webSocketDebuggerUrl"] = f"{ws_scheme}://{host}/api/profiles/{profile_id}/cdp"
     return data
 
 
+@app.get("/api/profiles/{profile_id}/cdp/json/list/")
 @app.get("/api/profiles/{profile_id}/cdp/json/list")
+@app.get("/api/profiles/{profile_id}/cdp/json/")
 @app.get("/api/profiles/{profile_id}/cdp/json")
 async def cdp_json_list(profile_id: str, request: Request):
     """Proxy Chrome's /json/list, rewriting WS URLs."""
@@ -825,26 +894,88 @@ async def cdp_json_list(profile_id: str, request: Request):
         raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
 
     host = request.headers.get("host", "localhost:8080")
+    ws_scheme = "wss" if _is_https(request) else "ws"
     for entry in data:
         if "webSocketDebuggerUrl" in entry:
             ws_path = entry["webSocketDebuggerUrl"].split("/devtools/")[-1]
             entry["webSocketDebuggerUrl"] = (
-                f"ws://{host}/api/profiles/{profile_id}/cdp/devtools/{ws_path}"
+                f"{ws_scheme}://{host}/api/profiles/{profile_id}/cdp/devtools/{ws_path}"
             )
     return data
+
+
+async def _proxy_cdp_websocket(
+    websocket: WebSocket, target_url: str, label: str,
+) -> None:
+    """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
+
+    Used by both browser-level and page-level CDP proxy endpoints.
+    """
+    import websockets
+
+    try:
+        async with websockets.connect(
+            target_url, max_size=None, ping_interval=None, ping_timeout=None
+        ) as cdp_ws:
+            logger.info("%s: connected to %s", label, target_url)
+
+            async def client_to_cdp():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            break
+                        if "text" in msg and msg["text"]:
+                            await cdp_ws.send(msg["text"])
+                        elif "bytes" in msg and msg["bytes"]:
+                            await cdp_ws.send(msg["bytes"])
+                except WebSocketDisconnect:
+                    pass
+                except Exception as exc:
+                    logger.warning("%s [c->cdp]: %s: %s", label, type(exc).__name__, exc)
+
+            async def cdp_to_client():
+                try:
+                    async for msg in cdp_ws:
+                        if isinstance(msg, str):
+                            await websocket.send_text(msg)
+                        else:
+                            await websocket.send_bytes(msg)
+                except WebSocketDisconnect:
+                    pass
+                except Exception as exc:
+                    logger.warning("%s [cdp->c]: %s: %s", label, type(exc).__name__, exc)
+
+            c2d = asyncio.create_task(client_to_cdp(), name="c2d")
+            d2c = asyncio.create_task(cdp_to_client(), name="d2c")
+            done, pending = await asyncio.wait(
+                [c2d, d2c], return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            logger.info("%s: disconnected", label)
+
+    except Exception as exc:
+        logger.error("%s error: %s", label, exc)
+    finally:
+        try:
+            await websocket.close()
+        except Exception as exc:
+            logger.debug("%s: websocket.close() failed: %s", label, exc)
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp")
 async def cdp_proxy(websocket: WebSocket, profile_id: str):
     """Proxy WebSocket frames between external tools and Chrome's CDP."""
+    if not await _check_websocket_origin(websocket):
+        return
+
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
         return
 
     await websocket.accept()
-
-    import websockets
 
     # Get browser-level CDP WebSocket URL from Chrome
     try:
@@ -858,56 +989,15 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4005, reason="CDP not available")
         return
 
-    try:
-        async with websockets.connect(
-            ws_url, max_size=None, ping_interval=None, ping_timeout=None
-        ) as cdp_ws:
-            logger.info("CDP proxy: connected for %s", profile_id)
-
-            async def client_to_cdp():
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        if msg.get("type") == "websocket.disconnect":
-                            break
-                        if "text" in msg and msg["text"]:
-                            await cdp_ws.send(msg["text"])
-                        elif "bytes" in msg and msg["bytes"]:
-                            await cdp_ws.send(msg["bytes"])
-                except WebSocketDisconnect:
-                    pass
-
-            async def cdp_to_client():
-                try:
-                    async for msg in cdp_ws:
-                        if isinstance(msg, str):
-                            await websocket.send_text(msg)
-                        else:
-                            await websocket.send_bytes(msg)
-                except WebSocketDisconnect:
-                    pass
-
-            c2d = asyncio.create_task(client_to_cdp(), name="c2d")
-            d2c = asyncio.create_task(cdp_to_client(), name="d2c")
-            done, pending = await asyncio.wait(
-                [c2d, d2c], return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-            logger.info("CDP proxy: disconnected for %s", profile_id)
-
-    except Exception as exc:
-        logger.error("CDP proxy error for %s: %s", profile_id, exc)
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]")
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
 async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     """Proxy page-specific CDP WebSocket connections (e.g. /devtools/page/GUID)."""
+    if not await _check_websocket_origin(websocket):
+        return
+
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
@@ -915,54 +1005,8 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
 
     await websocket.accept()
 
-    import websockets
-
     target_url = f"ws://127.0.0.1:{running.cdp_port}/devtools/{path}"
-
-    try:
-        async with websockets.connect(
-            target_url, max_size=None, ping_interval=None, ping_timeout=None
-        ) as cdp_ws:
-            logger.info("CDP page proxy: connected for %s /devtools/%s", profile_id, path)
-
-            async def client_to_cdp():
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        if msg.get("type") == "websocket.disconnect":
-                            break
-                        if "text" in msg and msg["text"]:
-                            await cdp_ws.send(msg["text"])
-                        elif "bytes" in msg and msg["bytes"]:
-                            await cdp_ws.send(msg["bytes"])
-                except WebSocketDisconnect:
-                    pass
-
-            async def cdp_to_client():
-                try:
-                    async for msg in cdp_ws:
-                        if isinstance(msg, str):
-                            await websocket.send_text(msg)
-                        else:
-                            await websocket.send_bytes(msg)
-                except WebSocketDisconnect:
-                    pass
-
-            c2d = asyncio.create_task(client_to_cdp(), name="c2d")
-            d2c = asyncio.create_task(cdp_to_client(), name="d2c")
-            done, pending = await asyncio.wait(
-                [c2d, d2c], return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-
-    except Exception as exc:
-        logger.error("CDP page proxy error for %s: %s", profile_id, exc)
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+    await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
 
 
 # ── Static Frontend ───────────────────────────────────────────────────────────

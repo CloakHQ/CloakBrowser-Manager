@@ -51,6 +51,7 @@ const fakeProfile = {
   tags: [],
   status: "stopped" as const,
   vnc_ws_port: null,
+  cdp_url: null,
 };
 
 beforeEach(() => {

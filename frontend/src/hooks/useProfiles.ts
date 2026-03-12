@@ -65,17 +65,25 @@ export function useProfiles() {
 
   const launch = useCallback(
     async (id: string) => {
-      const result = await api.launchProfile(id);
-      await refresh();
-      return result;
+      try {
+        const result = await api.launchProfile(id);
+        await refresh();
+        return result;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to launch profile");
+      }
     },
     [refresh],
   );
 
   const stop = useCallback(
     async (id: string) => {
-      await api.stopProfile(id);
-      await refresh();
+      try {
+        await api.stopProfile(id);
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to stop profile");
+      }
     },
     [refresh],
   );

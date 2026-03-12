@@ -9,7 +9,7 @@ import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { LoginPage } from "./components/LoginPage";
 
-type AuthState = "checking" | "required" | "ok";
+type AuthState = "checking" | "required" | "ok" | "error";
 type View = "empty" | "create" | "edit" | "view";
 
 export default function App() {
@@ -28,7 +28,10 @@ export default function App() {
           setAuthState("required");
         }
       })
-      .catch(() => setAuthState("ok"));
+      .catch((err) => {
+        console.warn("[auth] status check failed:", err);
+        setAuthState("error");
+      });
 
     return () => setOnUnauthorized(null);
   }, []);
@@ -37,6 +40,30 @@ export default function App() {
     return (
       <div className="h-screen flex items-center justify-center">
         <div className="text-gray-500 text-sm">Loading...</div>
+      </div>
+    );
+  }
+
+  if (authState === "error") {
+    return (
+      <div className="h-screen flex items-center justify-center bg-surface-0">
+        <div className="text-center">
+          <p className="text-red-400 text-sm mb-2">Unable to reach the server</p>
+          <button
+            onClick={() => {
+              setAuthState("checking");
+              api.authStatus()
+                .then(({ auth_required, authenticated }) => {
+                  setAuthRequired(auth_required);
+                  setAuthState(!auth_required || authenticated ? "ok" : "required");
+                })
+                .catch(() => setAuthState("error"));
+            }}
+            className="text-xs text-gray-400 hover:text-gray-200 underline"
+          >
+            Retry
+          </button>
+        </div>
       </div>
     );
   }
@@ -102,8 +129,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
   const handleLaunch = useCallback(async () => {
     if (!selectedId) return;
-    await launch(selectedId);
-    setView("view");
+    const result = await launch(selectedId);
+    if (result) setView("view");
   }, [selectedId, launch]);
 
   const handleStop = useCallback(async () => {
