@@ -174,8 +174,10 @@ export function ProfileViewer({ profileId, onDisconnect }: ProfileViewerProps) {
           console.log("[clipboard] poll: new VNC clipboard:", text.substring(0, 50), "len:", text.length);
           await navigator.clipboard.writeText(text).catch(() => {});
         }
-      } catch {
-        // profile stopped or network error — stop polling
+      } catch (err) {
+        console.warn("[clipboard] poll error, stopping:", err);
+        cancelled = true;
+        return;
       }
       if (!cancelled) {
         setTimeout(poll, 2000);

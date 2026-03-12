@@ -79,8 +79,12 @@ def _parse_kasmvnc_clipboard(data: bytes) -> str | None:
 
 
 def _build_server_cut_text(text: str) -> bytes:
-    """Build standard RFB ServerCutText (type 3) message."""
-    text_bytes = text.encode("utf-8")
+    """Build standard RFB ServerCutText (type 3) message.
+
+    RFB spec mandates Latin-1 encoding for ServerCutText.
+    Characters outside Latin-1 (CJK, emoji, etc.) are replaced with '?'.
+    """
+    text_bytes = text.encode("latin-1", errors="replace")
     return struct.pack(">BxxxI", 3, len(text_bytes)) + text_bytes
 
 
@@ -386,6 +390,9 @@ async def get_system_status():
 
 _CLIPBOARD_MAX_READ = 1_048_576  # 1MB cap on GET response
 
+# Track xclip processes per display so we can kill the old one before spawning new
+_xclip_procs: dict[int, asyncio.subprocess.Process] = {}
+
 
 @app.post("/api/profiles/{profile_id}/clipboard")
 async def set_clipboard(profile_id: str, body: ClipboardRequest):
@@ -396,17 +403,24 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
 
     import os
 
+    # Kill previous xclip for this display (it stays alive to serve paste)
+    old = _xclip_procs.pop(running.display, None)
+    if old and old.returncode is None:
+        old.kill()
+        await old.wait()
+
     env = {**os.environ, "DISPLAY": f":{running.display}"}
     proc = await asyncio.create_subprocess_exec(
         "xclip", "-selection", "clipboard",
         stdin=asyncio.subprocess.PIPE,
         env=env,
     )
-    # xclip reads stdin then stays alive to serve paste requests (never exits).
-    # Write the text, close stdin, and return — don't wait for exit.
+    # xclip reads stdin then stays alive to serve paste requests.
     proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
     await proc.stdin.drain()  # type: ignore[union-attr]
     proc.stdin.close()  # type: ignore[union-attr]
+
+    _xclip_procs[running.display] = proc
 
     return {"ok": True}
 
@@ -427,18 +441,15 @@ async def get_clipboard(profile_id: str):
     # Chrome's native copy (via VNC Ctrl+C) doesn't write to X11 clipboard
     # and doesn't fire DOM events, so we read the visible selection instead.
     # The init script also captures copy events when they do fire.
+    # Check all pages — user may have copied in any tab
     try:
-        pages = running.context.pages
-        if pages:
-            page = pages[0]
-            # Check init script's captured clipboard text first
-            text = await page.evaluate("window.__clipboardText || ''")
-            if text:
-                return {"text": text[:_CLIPBOARD_MAX_READ]}
-            # Fall back to current selection (user may have selected but not copied)
-            text = await page.evaluate("(window.getSelection() || '').toString()")
-            if text:
-                return {"text": text[:_CLIPBOARD_MAX_READ]}
+        for page in running.context.pages:
+            try:
+                text = await page.evaluate("window.__clipboardText || ''")
+                if text:
+                    return {"text": text[:_CLIPBOARD_MAX_READ]}
+            except Exception:
+                continue
     except Exception as exc:
         logger.debug("Playwright clipboard read failed: %s", exc)
 
@@ -456,6 +467,7 @@ async def get_clipboard(profile_id: str):
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()
         return {"text": ""}
 
     if proc.returncode != 0:
