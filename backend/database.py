@@ -78,6 +78,9 @@ def init_db():
         if "auto_launch" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN auto_launch BOOLEAN DEFAULT 0")
             conn.commit()
+        if "auto_restart" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN auto_restart BOOLEAN DEFAULT 1")
+            conn.commit()
 
 
 def _now() -> str:
@@ -101,9 +104,9 @@ def create_profile(
                 id, name, fingerprint_seed, proxy, timezone, locale, platform,
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
-                clipboard_sync, auto_launch, color_scheme, launch_args, notes,
+                clipboard_sync, auto_launch, auto_restart, color_scheme, launch_args, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
                 fields.get("proxy"),
@@ -122,6 +125,7 @@ def create_profile(
                 fields.get("geoip", False),
                 fields.get("clipboard_sync", True),
                 fields.get("auto_launch", False),
+                fields.get("auto_restart", True),
                 fields.get("color_scheme"),
                 json.dumps(fields.get("launch_args") or []),
                 fields.get("notes"),
@@ -187,7 +191,7 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
-        "clipboard_sync", "auto_launch", "color_scheme", "launch_args", "notes",
+        "clipboard_sync", "auto_launch", "auto_restart", "color_scheme", "launch_args", "notes",
     ):
         if col in fields:
             update_cols.append(f"{col} = ?")
