@@ -10,6 +10,7 @@ from starlette.testclient import TestClient
 
 from backend import main
 from backend.browser_manager import RunningProfile
+from pathlib import Path
 
 
 # ── Profile CRUD ─────────────────────────────────────────────────────────────
@@ -560,3 +561,104 @@ def test_ws_allows_no_origin(app_client: TestClient):
     except Exception as exc:
         assert "4403" not in str(exc)
     main.browser_mgr.running.pop(pid, None)
+
+
+# ── Profile Reset ────────────────────────────────────────────────────────────
+
+
+def test_reset_profile_not_found(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/reset")
+    assert resp.status_code == 404
+
+
+def test_reset_profile_returns_updated_profile(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResetTest", "fingerprint_seed": 99999})
+    pid = create.json()["id"]
+    old_seed = create.json()["fingerprint_seed"]
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "ResetTest"
+    assert data["fingerprint_seed"] != old_seed
+    assert data["status"] == "stopped"
+    assert "id" in data
+
+
+def test_reset_profile_preserves_tags(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={
+        "name": "ResetTags",
+        "tags": [{"tag": "work", "color": "#ff0000"}],
+    })
+    pid = create.json()["id"]
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    assert len(resp.json()["tags"]) == 1
+    assert resp.json()["tags"][0]["tag"] == "work"
+
+
+def test_reset_profile_stops_running(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResetRunning"})
+    pid = create.json()["id"]
+
+    # Inject mock running profile
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.display = 100
+    mock_running.ws_port = 6100
+    mock_running.cdp_port = 5100
+    main.browser_mgr.running[pid] = mock_running
+    main.browser_mgr.stop = AsyncMock()
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    main.browser_mgr.stop.assert_called_once_with(pid)
+
+
+def test_reset_profile_wipes_state_files(app_client: TestClient, tmp_path: Path):
+    create = app_client.post("/api/profiles", json={"name": "ResetWipe"})
+    pid = create.json()["id"]
+
+    # Get the profile's user_data_dir
+    profile = app_client.get(f"/api/profiles/{pid}").json()
+    default_dir = Path(profile["user_data_dir"]) / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create fake state files
+    (default_dir / "Cookies").write_text("fake cookies")
+    (default_dir / "History").write_text("fake history")
+    cache_dir = default_dir / "Cache"
+    cache_dir.mkdir()
+    (cache_dir / "data").write_text("cached")
+
+    # Create preserved files
+    (default_dir / "Bookmarks").write_text("{}")
+    (default_dir / "Preferences").write_text("{}")
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+
+    # State files should be deleted
+    assert not (default_dir / "Cookies").exists()
+    assert not (default_dir / "History").exists()
+    assert not cache_dir.exists()
+
+    # Preserved files should still exist
+    assert (default_dir / "Bookmarks").exists()
+    assert (default_dir / "Preferences").exists()
+
+
+def test_reset_profile_keeps_bookmarks(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResetBM"})
+    pid = create.json()["id"]
+
+    profile = app_client.get(f"/api/profiles/{pid}").json()
+    default_dir = Path(profile["user_data_dir"]) / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    (default_dir / "Bookmarks").write_text('{"test": true}')
+    (default_dir / "Preferences").write_text('{"test": true}')
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    assert (default_dir / "Bookmarks").read_text() == '{"test": true}'
+    assert (default_dir / "Preferences").read_text() == '{"test": true}'
