@@ -84,6 +84,8 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8080
 ```
 
+By default, Docker stores profile data in `/data`. For local development, if `/data` is not writable, the backend falls back to `backend/.data`. You can override this with `CLOAKBROWSER_MANAGER_DATA_DIR=/path/to/data`.
+
 ### Frontend
 
 ```bash

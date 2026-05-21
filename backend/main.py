@@ -24,19 +24,34 @@ from fastapi.staticfiles import StaticFiles
 import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import database as db
-from .browser_manager import BrowserManager
-from .models import (
-    ClipboardRequest,
-    LaunchResponse,
-    LoginRequest,
-    ProfileCreate,
-    ProfileResponse,
-    ProfileStatusResponse,
-    ProfileUpdate,
-    StatusResponse,
-    TagResponse,
-)
+if __package__:
+    from . import database as db
+    from .browser_manager import BrowserManager
+    from .models import (
+        ClipboardRequest,
+        LaunchResponse,
+        LoginRequest,
+        ProfileCreate,
+        ProfileResponse,
+        ProfileStatusResponse,
+        ProfileUpdate,
+        StatusResponse,
+        TagResponse,
+    )
+else:  # Support `uvicorn main:app` from the backend directory.
+    import database as db
+    from browser_manager import BrowserManager
+    from models import (
+        ClipboardRequest,
+        LaunchResponse,
+        LoginRequest,
+        ProfileCreate,
+        ProfileResponse,
+        ProfileStatusResponse,
+        ProfileUpdate,
+        StatusResponse,
+        TagResponse,
+    )
 
 logger = logging.getLogger("cloakbrowser.manager")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

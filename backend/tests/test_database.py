@@ -10,6 +10,22 @@ import pytest
 from backend import database as db
 
 
+# ── data directory resolution ────────────────────────────────────────────────
+
+
+def test_resolve_data_dir_uses_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(db.ENV_DATA_DIR, str(tmp_path))
+
+    assert db._resolve_data_dir() == tmp_path
+
+
+def test_resolve_data_dir_falls_back_to_local(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(db.ENV_DATA_DIR, raising=False)
+    monkeypatch.setattr(db, "_is_usable_data_dir", lambda _path: False)
+
+    assert db._resolve_data_dir() == db.LOCAL_DATA_DIR
+
+
 # ── init_db ──────────────────────────────────────────────────────────────────
 
 
