@@ -225,6 +225,7 @@ class BrowserManager:
                 human_preset=profile.get("human_preset", "default"),
                 geoip=bool(profile.get("geoip", False)),
                 color_scheme=profile.get("color_scheme") or None,
+                search_engine=profile.get("search_engine") or None,
                 user_agent=profile.get("user_agent") or None,
                 viewport={
                     "width": profile.get("screen_width", 1920),

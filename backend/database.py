@@ -52,6 +52,7 @@ def init_db():
                 clipboard_sync BOOLEAN DEFAULT 1,
                 auto_launch BOOLEAN DEFAULT 0,
                 color_scheme TEXT,
+                search_engine TEXT,
                 notes TEXT,
                 user_data_dir TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -78,6 +79,12 @@ def init_db():
         if "auto_launch" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN auto_launch BOOLEAN DEFAULT 0")
             conn.commit()
+        if "color_scheme" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN color_scheme TEXT")
+            conn.commit()
+        if "search_engine" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN search_engine TEXT")
+            conn.commit()
 
 
 def _now() -> str:
@@ -101,9 +108,9 @@ def create_profile(
                 id, name, fingerprint_seed, proxy, timezone, locale, platform,
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
-                clipboard_sync, auto_launch, color_scheme, launch_args, notes,
+                clipboard_sync, auto_launch, color_scheme, search_engine, launch_args, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
                 fields.get("proxy"),
@@ -123,6 +130,7 @@ def create_profile(
                 fields.get("clipboard_sync", True),
                 fields.get("auto_launch", False),
                 fields.get("color_scheme"),
+                fields.get("search_engine"),
                 json.dumps(fields.get("launch_args") or []),
                 fields.get("notes"),
                 user_data_dir, now, now,
@@ -187,7 +195,7 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
-        "clipboard_sync", "auto_launch", "color_scheme", "launch_args", "notes",
+        "clipboard_sync", "auto_launch", "color_scheme", "search_engine", "launch_args", "notes",
     ):
         if col in fields:
             update_cols.append(f"{col} = ?")

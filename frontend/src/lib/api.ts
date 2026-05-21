@@ -23,6 +23,7 @@ export interface Profile {
   clipboard_sync: boolean;
   auto_launch: boolean;
   color_scheme: string | null;
+  search_engine: string | null;
   launch_args: string[];
   notes: string | null;
   user_data_dir: string;
@@ -54,6 +55,7 @@ export interface ProfileCreateData {
   clipboard_sync?: boolean;
   auto_launch?: boolean;
   color_scheme?: string | null;
+  search_engine?: string | null;
   launch_args?: string[];
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];

@@ -98,6 +98,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
         color_scheme: profile.color_scheme,
+        search_engine: profile.search_engine,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
@@ -465,6 +466,19 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                 <option value="light">Light</option>
                 <option value="dark">Dark</option>
                 <option value="no-preference">No preference</option>
+              </select>
+            </div>
+            <div>
+              <label className="label">Default Search Engine</label>
+              <select
+                className="input"
+                value={form.search_engine ?? ""}
+                onChange={(e) => set("search_engine", e.target.value || null)}
+              >
+                <option value="">System default</option>
+                <option value="google">Google</option>
+                <option value="bing">Bing</option>
+                <option value="duckduckgo">DuckDuckGo</option>
               </select>
             </div>
             <div>

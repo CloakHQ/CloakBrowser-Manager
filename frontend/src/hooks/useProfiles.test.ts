@@ -45,6 +45,7 @@ const fakeProfile = {
   geoip: false,
   clipboard_sync: true,
   color_scheme: null,
+  search_engine: null,
   notes: null,
   user_data_dir: "/data/profiles/abc-123",
   created_at: "2026-01-01T00:00:00Z",
