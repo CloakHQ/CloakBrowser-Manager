@@ -163,6 +163,10 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._next_cdp_port = BASE_CDP_PORT
         self._auto_launch_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._restart_counts: dict[str, int] = {}  # profile_id -> consecutive crash count
+        self._restart_times: dict[str, float] = {}  # profile_id -> last restart timestamp
+        self._stopped_profiles: set[str] = set()  # profiles explicitly stopped by user
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance for the given profile."""
@@ -265,8 +269,8 @@ class BrowserManager:
             )
 
             # Auto-cleanup if browser crashes or user closes Chrome via VNC
-            context.on("close", lambda: asyncio.ensure_future(
-                self._on_browser_closed(profile_id)
+            context.on("close", lambda pid=profile_id: asyncio.ensure_future(
+                self._on_browser_closed(pid)
             ))
 
             async with self._lock:
@@ -286,17 +290,24 @@ class BrowserManager:
             await self.vnc.stop_vnc(display)
             raise
 
-    async def _on_browser_closed(self, profile_id: str):
-        """Called when browser exits (crash, user closed via VNC, or stop())."""
+    async def _on_browser_closed(self, profile_id: str) -> bool:
+        """Called when browser exits (crash, user closed via VNC, or stop()).
+
+        Returns True if cleanup was performed (profile was still in self.running).
+        """
         async with self._lock:
             running = self.running.pop(profile_id, None)
 
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
             await self.vnc.stop_vnc(running.display)
+            return True
+        return False
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance."""
+        # Mark as explicitly stopped so watchdog doesn't restart it
+        self._stopped_profiles.add(profile_id)
         # Pop before close so _on_browser_closed() finds nothing to clean up
         async with self._lock:
             running = self.running.pop(profile_id, None)
@@ -327,6 +338,14 @@ class BrowserManager:
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown."""
+        # Cancel watchdog before stopping profiles
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+
         async with self._lock:
             profile_ids = list(self.running.keys())
 
@@ -375,6 +394,105 @@ class BrowserManager:
                 except OSError:
                     continue
         raise ValueError("No free CDP ports available in range %d-%d" % (BASE_CDP_PORT, BASE_CDP_PORT + CDP_PORT_RANGE - 1))
+
+    async def start_watchdog(self, interval: float = 5.0) -> None:
+        """Start the watchdog task that periodically checks for crashed profiles.
+
+        Called once during application startup (from lifespan).
+        """
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop(interval))
+        logger.info("Watchdog started (interval=%.1fs)", interval)
+
+    async def _watchdog_loop(self, interval: float) -> None:
+        """Periodically check running profiles and restart crashed ones."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._check_and_restart_crashed()
+            except asyncio.CancelledError:
+                logger.info("Watchdog cancelled")
+                raise
+            except Exception:
+                logger.exception("Watchdog error during health check")
+
+    async def _check_and_restart_crashed(self) -> None:
+        """Check each running profile for liveness and restart if crashed."""
+        from . import database as db
+
+        # Snapshot running profile IDs
+        async with self._lock:
+            profile_ids = list(self.running.keys())
+
+        for profile_id in profile_ids:
+            running = self.running.get(profile_id)
+            if not running:
+                continue
+
+            # Check if context is still alive by trying to get pages
+            alive = True
+            try:
+                pages = running.context.pages
+                if pages:
+                    await pages[0].evaluate("1")
+            except Exception:
+                alive = False
+
+            if alive:
+                continue
+
+            # Profile has crashed — clean up and consider restart
+            logger.warning("Profile %s appears to have crashed", profile_id)
+            await self._on_browser_closed(profile_id)
+            await self._attempt_restart(profile_id, db)
+
+    async def _attempt_restart(self, profile_id: str, db_module: Any) -> None:
+        """Attempt to restart a crashed profile with exponential backoff."""
+        if profile_id in self._stopped_profiles:
+            logger.info("Profile %s was explicitly stopped, skipping restart", profile_id)
+            return
+
+        profile = db_module.get_profile(profile_id)
+        if not profile:
+            logger.warning("Profile %s not found in database, skipping restart", profile_id)
+            return
+
+        if not profile.get("auto_restart", True):
+            logger.info("Profile %s has auto_restart disabled, skipping", profile_id)
+            return
+
+        count = self._restart_counts.get(profile_id, 0)
+        if count >= 3:
+            logger.error(
+                "Profile %s has crashed %d times, giving up on auto-restart",
+                profile_id, count,
+            )
+            self._restart_counts.pop(profile_id, None)
+            self._restart_times.pop(profile_id, None)
+            return
+
+        # Exponential backoff: 1s, 2s, 4s (capped at 30s)
+        delay = min(2 ** count, 30)
+        logger.info(
+            "Restarting profile %s (attempt %d/3, backoff=%ds)",
+            profile_id, count + 1, delay,
+        )
+        await asyncio.sleep(delay)
+
+        try:
+            await self.launch(profile)
+            # Success — reset counter
+            self._restart_counts.pop(profile_id, None)
+            self._restart_times.pop(profile_id, None)
+            logger.info("Successfully restarted profile %s", profile_id)
+        except Exception as exc:
+            self._restart_counts[profile_id] = count + 1
+            self._restart_times[profile_id] = asyncio.get_event_loop().time()
+            logger.error(
+                "Failed to restart profile %s (attempt %d/3): %s",
+                profile_id, count + 1, exc,
+            )
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:
         """Build extra Chromium args from profile fingerprint settings."""

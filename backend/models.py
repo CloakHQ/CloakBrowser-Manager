@@ -26,6 +26,7 @@ class ProfileCreate(BaseModel):
     geoip: bool = False
     clipboard_sync: bool = True
     auto_launch: bool = False
+    auto_restart: bool = True
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
     launch_args: list[str] = Field(default_factory=list)
     notes: str | None = None
@@ -51,6 +52,7 @@ class ProfileUpdate(BaseModel):
     geoip: bool | None = None
     clipboard_sync: bool | None = None
     auto_launch: bool | None = None
+    auto_restart: bool | None = None
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
     launch_args: list[str] | None = None
     notes: str | None = Field(default=None)
@@ -87,6 +89,7 @@ class ProfileResponse(BaseModel):
     geoip: bool = False
     clipboard_sync: bool = True
     auto_launch: bool = False
+    auto_restart: bool = True
 
     @field_validator("clipboard_sync", mode="before")
     @classmethod
