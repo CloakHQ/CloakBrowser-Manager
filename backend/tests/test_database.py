@@ -71,6 +71,7 @@ def test_create_profile_all_fields(tmp_db: Path):
         headless=True,
         geoip=True,
         color_scheme="dark",
+        search_engine="google",
         notes="test note",
     )
     assert p["proxy"] == "http://host:8080"
@@ -80,7 +81,7 @@ def test_create_profile_all_fields(tmp_db: Path):
     assert p["humanize"] == 1  # SQLite stores bool as int
     assert p["human_preset"] == "careful"
     assert p["color_scheme"] == "dark"
-
+    assert p["search_engine"] == "google"
 
 def test_create_profile_with_tags(tmp_db: Path):
     p = db.create_profile(

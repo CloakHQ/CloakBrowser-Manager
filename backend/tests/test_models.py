@@ -51,12 +51,14 @@ def test_profile_create_all_fields():
         headless=True,
         geoip=True,
         color_scheme="dark",
+        search_engine="google",
         notes="test note",
         tags=[TagCreate(tag="work", color="#ff0000")],
     )
     assert p.platform == "macos"
     assert p.human_preset == "careful"
     assert p.color_scheme == "dark"
+    assert p.search_engine == "google"
     assert len(p.tags) == 1
 
 
@@ -89,6 +91,10 @@ def test_profile_create_invalid_human_preset():
 def test_profile_create_invalid_color_scheme():
     with pytest.raises(ValidationError):
         ProfileCreate(name="Bad", color_scheme="auto")
+
+def test_profile_create_invalid_search_engine():
+    with pytest.raises(ValidationError):
+        ProfileCreate(name="Bad", search_engine="yahoo")
 
 
 # ── ProfileUpdate ────────────────────────────────────────────────────────────

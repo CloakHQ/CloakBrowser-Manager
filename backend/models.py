@@ -27,6 +27,7 @@ class ProfileCreate(BaseModel):
     clipboard_sync: bool = True
     auto_launch: bool = False
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
+    search_engine: Literal["google", "bing", "duckduckgo"] | None = None
     launch_args: list[str] = Field(default_factory=list)
     notes: str | None = None
     tags: list[TagCreate] | None = None
@@ -52,6 +53,7 @@ class ProfileUpdate(BaseModel):
     clipboard_sync: bool | None = None
     auto_launch: bool | None = None
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
+    search_engine: Literal["google", "bing", "duckduckgo"] | None = Field(default=None)
     launch_args: list[str] | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
@@ -94,6 +96,7 @@ class ProfileResponse(BaseModel):
         return v if v is not None else True
 
     color_scheme: str | None = None
+    search_engine: str | None = None
     launch_args: list[str] = []
     notes: str | None = None
     user_data_dir: str
