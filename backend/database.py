@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import random
 import sqlite3
 import uuid
@@ -11,7 +12,36 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("/data")
+ENV_DATA_DIR = "CLOAKBROWSER_MANAGER_DATA_DIR"
+DOCKER_DATA_DIR = Path("/data")
+LOCAL_DATA_DIR = Path(__file__).resolve().parent / ".data"
+
+
+def _is_usable_data_dir(path: Path) -> bool:
+    """Return True if path can be created and written to."""
+    probe = path / f".write-test-{os.getpid()}"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_data_dir() -> Path:
+    """Resolve the profile data directory for Docker and local development."""
+    configured = os.environ.get(ENV_DATA_DIR)
+    if configured:
+        return Path(configured).expanduser()
+
+    if _is_usable_data_dir(DOCKER_DATA_DIR):
+        return DOCKER_DATA_DIR
+
+    return LOCAL_DATA_DIR
+
+
+DATA_DIR = _resolve_data_dir()
 DB_PATH = DATA_DIR / "profiles.db"
 
 

@@ -218,7 +218,13 @@ def test_allocate_cdp_port_all_occupied_raises():
         for i in range(CDP_PORT_RANGE):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", BASE_CDP_PORT + i))
+            try:
+                s.bind(("127.0.0.1", BASE_CDP_PORT + i))
+            except OSError:
+                # A real local service may already occupy a port in the range;
+                # that still counts as unavailable to BrowserManager.
+                s.close()
+                continue
             s.listen(1)
             blockers.append(s)
         with pytest.raises(ValueError, match="No free CDP ports"):

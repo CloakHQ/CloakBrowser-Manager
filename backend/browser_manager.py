@@ -14,7 +14,10 @@ from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
 
-from .vnc_manager import VNCManager
+if __package__:
+    from .vnc_manager import VNCManager
+else:  # Support importing browser_manager as a top-level module.
+    from vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
@@ -341,7 +344,10 @@ class BrowserManager:
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
-        from . import database as db
+        if __package__:
+            from . import database as db
+        else:
+            import database as db
 
         profiles = db.list_profiles()
         auto_profiles = [p for p in profiles if p.get("auto_launch")]
