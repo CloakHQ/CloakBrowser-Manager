@@ -222,3 +222,21 @@ def delete_profile(profile_id: str) -> bool:
         cursor = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
         conn.commit()
         return cursor.rowcount > 0
+
+
+def reset_profile(profile_id: str) -> dict[str, Any] | None:
+    """Re-roll fingerprint_seed and update timestamp. Returns updated profile or None."""
+    existing = get_profile(profile_id)
+    if not existing:
+        return None
+
+    new_seed = random.randint(10000, 99999)
+    now = _now()
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE profiles SET fingerprint_seed = ?, updated_at = ? WHERE id = ?",
+            (new_seed, now, profile_id),
+        )
+        conn.commit()
+
+    return get_profile(profile_id)

@@ -519,6 +519,75 @@ async def delete_profile(profile_id: str):
     return {"ok": True}
 
 
+@app.post("/api/profiles/{profile_id}/reset", response_model=ProfileResponse)
+async def reset_profile(profile_id: str):
+    """Reset a profile: stop browser, wipe state files, re-roll fingerprint seed.
+
+    Preserves bookmarks, preferences, and all profile settings (name, proxy, tags, etc.).
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    # Stop browser if running
+    if profile_id in browser_mgr.running:
+        await browser_mgr.stop(profile_id)
+
+    # Wipe browser state files (cookies, history, cache, etc.)
+    # Preserve Bookmarks and Preferences (search engine config)
+    user_data_dir = Path(profile["user_data_dir"])
+    default_dir = user_data_dir / "Default"
+    if default_dir.exists():
+        _STATE_FILES = [
+            "Cookies", "Cookies-journal",
+            "History", "History-journal", "History Provider Cache",
+            "Login Data", "Login Data-journal",
+            "Web Data", "Web Data-journal",
+            "Favicons", "Favicons-journal",
+            "Shortcuts", "Shortcuts-journal",
+            "Top Sites", "Top Sites-journal",
+            "Visited Links",
+            "Network Action Predictor",
+            "Network Action Predictor-journal",
+            "TransportSecurity",
+            "SecurePreferences",
+            "Current Session", "Current Tabs",
+            "Last Session", "Last Tabs",
+            "affiliation_db", "coupon_db",
+            "DownloadMetadata",
+            "autofill_regex_whitelist.json",
+        ]
+        _STATE_DIRS = [
+            "Cache", "Code Cache", "GPUCache",
+            "Service Worker", "Service Worker/CacheStorage",
+            "Local Storage", "Session Storage",
+            "IndexedDB", "databases",
+            "blob_storage",
+            "File System",
+            "GCM Store",
+            "Extension Rules", "Extension Scripts", "Extension State",
+            "Platform Notifications",
+        ]
+        for fname in _STATE_FILES:
+            (default_dir / fname).unlink(missing_ok=True)
+        for dname in _STATE_DIRS:
+            dirpath = default_dir / dname
+            if dirpath.exists():
+                shutil.rmtree(dirpath, ignore_errors=True)
+
+    # Re-roll fingerprint seed in DB
+    updated = db.reset_profile(profile_id)
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to reset profile")
+
+    status = browser_mgr.get_status(profile_id)
+    updated["status"] = status["status"]
+    updated["vnc_ws_port"] = status["vnc_ws_port"]
+    updated["cdp_url"] = status["cdp_url"]
+    updated["tags"] = [TagResponse(**t) for t in updated.get("tags", [])]
+    return ProfileResponse(**updated)
+
+
 # ── Launch / Stop ─────────────────────────────────────────────────────────────
 
 

@@ -139,6 +139,9 @@ export const api = {
   deleteProfile: (id: string) =>
     request<{ ok: boolean }>(`/api/profiles/${id}`, { method: "DELETE" }),
 
+  resetProfile: (id: string) =>
+    request<Profile>(`/api/profiles/${id}/reset`, { method: "POST" }),
+
   launchProfile: (id: string) =>
     request<LaunchResult>(`/api/profiles/${id}/launch`, { method: "POST" }),
 
