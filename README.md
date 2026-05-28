@@ -37,7 +37,7 @@ cd CloakBrowser-Manager
 docker compose up --build
 ```
 
-Open [http://localhost:8080](http://localhost:8080) in your browser. Create a profile. Click Launch. Done.
+Open [http://localhost:8080](http://localhost:8080) in your browser. Create a profile. eClick Launch. Done.
 
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues).
 
