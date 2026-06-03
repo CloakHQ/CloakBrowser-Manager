@@ -108,11 +108,13 @@ def load_comments(path: Path, count: int | None, start_line: int) -> list[str]:
     return comments
 
 
-def mark_next_comment_button(page: Any, seen_post_keys: set[str]) -> dict[str, Any]:
+def mark_next_comment_button(
+    page: Any, seen_post_keys: set[str], min_action_page_y: int
+) -> dict[str, Any]:
     token = f"codex-fb-comment-{time.time_ns()}"
     result = page.evaluate(
         """
-        ({ token, seenPostKeys }) => {
+        ({ token, seenPostKeys, minActionPageY }) => {
           const reactionActionNames = new Set(["Like", "Thích", "React", "Bày tỏ cảm xúc"]);
 
           const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
@@ -153,39 +155,48 @@ def mark_next_comment_button(page: Any, seen_post_keys: set[str]) -> dict[str, A
           const postContainerFor = (group) => {
             const groupRect = group.getBoundingClientRect();
             let node = group.parentElement;
-            for (let depth = 0; node && node !== document.body && depth < 14; depth += 1) {
+            for (let depth = 0; node && node !== document.body && depth < 18; depth += 1) {
               const rect = node.getBoundingClientRect();
               const containsGroup =
                 rect.top <= groupRect.top &&
                 rect.bottom >= groupRect.bottom &&
                 rect.left <= groupRect.left + 10 &&
                 rect.right >= groupRect.right - 10;
+              const hasPostMenu = Array.from(node.querySelectorAll('[role="button"]'))
+                .map(labelOf)
+                .some((name) => /actions for this post|open menu for|ẩn bài viết|hide post/i.test(name));
               const hasEnoughShape =
                 rect.width >= 420 &&
                 rect.height >= Math.max(130, groupRect.height + 80) &&
                 rect.height <= Math.max(2600, window.innerHeight * 3);
-              if (containsGroup && hasEnoughShape) {
+              if (containsGroup && hasPostMenu && hasEnoughShape) {
                 return node;
               }
               node = node.parentElement;
             }
-            return group;
+            return null;
           };
 
           const postKey = (post) => {
             const rect = post.getBoundingClientRect();
-            const text = normalize(post.innerText).slice(0, 180);
             const links = Array.from(post.querySelectorAll('a, [role="link"]'))
-              .map(labelOf)
+              .map((link) => {
+                const href = link.href || link.getAttribute("href") || "";
+                const label = labelOf(link);
+                return href || label;
+              })
               .filter(Boolean)
-              .slice(0, 5)
+              .slice(0, 8)
               .join("|");
+            const menu = Array.from(post.querySelectorAll('[role="button"]'))
+              .map(labelOf)
+              .find((name) => /actions for this post|open menu for|ẩn bài viết|hide post/i.test(name)) || "";
             return [
-              Math.round(rect.top + window.scrollY),
+              menu,
               Math.round(rect.left),
               Math.round(rect.width),
               links,
-              text,
+              Math.round((rect.top + window.scrollY) / 25) * 25,
             ].join("|");
           };
 
@@ -210,10 +221,19 @@ def mark_next_comment_button(page: Any, seen_post_keys: set[str]) -> dict[str, A
             if (!group) {
               continue;
             }
+            const rect = button.getBoundingClientRect();
+            const actionPageY = Math.round(window.scrollY + rect.top);
+            if (actionPageY <= minActionPageY) {
+              continue;
+            }
+
             const key = actionKey(group);
             groups.add(key);
 
             const post = postContainerFor(group);
+            if (!post) {
+              continue;
+            }
             const keyForPost = postKey(post);
             posts.add(keyForPost);
             if (
@@ -225,13 +245,13 @@ def mark_next_comment_button(page: Any, seen_post_keys: set[str]) -> dict[str, A
 
             button.setAttribute("data-codex-fb-comment-target", token);
             post.setAttribute("data-codex-fb-comment-post-target", token);
-            const rect = button.getBoundingClientRect();
             const postRect = post.getBoundingClientRect();
             return {
               ok: true,
               token,
               actionKey: key,
               postKey: keyForPost,
+              actionPageY,
               label: name,
               visibleActionGroups: groups.size,
               visiblePosts: posts.size,
@@ -260,7 +280,11 @@ def mark_next_comment_button(page: Any, seen_post_keys: set[str]) -> dict[str, A
           };
         }
         """,
-        {"token": token, "seenPostKeys": list(seen_post_keys)},
+        {
+            "token": token,
+            "seenPostKeys": list(seen_post_keys),
+            "minActionPageY": min_action_page_y,
+        },
     )
     return result
 
@@ -409,6 +433,7 @@ def scroll_past_post(page: Any, target: dict[str, Any], min_scroll: int) -> None
 
           const nextTop = Math.max(
             window.scrollY + Math.max(160, Math.floor(minScroll / 3)),
+            (postRect?.actionPageY || 0) + Math.max(220, Math.floor(minScroll / 2)),
             pageBottom - Math.floor(window.innerHeight * 0.18)
           );
           window.scrollTo({ top: nextTop, behavior: "instant" });
@@ -416,7 +441,10 @@ def scroll_past_post(page: Any, target: dict[str, Any], min_scroll: int) -> None
         """,
         {
             "token": target.get("token"),
-            "postRect": target.get("postRect") or {},
+            "postRect": {
+                **(target.get("postRect") or {}),
+                "actionPageY": target.get("actionPageY", 0),
+            },
             "minScroll": min_scroll,
         },
     )
@@ -431,6 +459,7 @@ def main() -> int:
         return 2
 
     seen_post_keys: set[str] = set()
+    min_action_page_y = -1
     posted = 0
     scrolls = 0
     url = cdp_url(args.host, args.profile_id)
@@ -446,7 +475,7 @@ def main() -> int:
         print(f"Loaded {len(comments)} comment line(s) from start line {args.start_line}.")
 
         while posted < len(comments) and scrolls < args.max_scrolls:
-            target = mark_next_comment_button(page, seen_post_keys)
+            target = mark_next_comment_button(page, seen_post_keys, min_action_page_y)
             if not target.get("ok"):
                 scrolls += 1
                 print(
@@ -461,6 +490,10 @@ def main() -> int:
 
             comment = comments[posted]
             seen_post_keys.add(target["postKey"])
+            min_action_page_y = max(
+                min_action_page_y,
+                int(target.get("actionPageY", 0)) + max(220, args.scroll_px // 2),
+            )
             selector = f'[data-codex-fb-comment-target="{target["token"]}"]'
             button = page.locator(selector).first
             button.scroll_into_view_if_needed(timeout=5_000)
@@ -469,6 +502,7 @@ def main() -> int:
                 print(
                     f"Dry run target {posted + 1}/{len(comments)}: "
                     f"{target['label']} at {target.get('rect')} "
+                    f"pageY {target.get('actionPageY')} "
                     f"post {target.get('postRect')} -> {comment!r}"
                 )
                 mark_post_processed(page, target)
@@ -499,7 +533,7 @@ def main() -> int:
             mark_post_processed(page, target)
             print(
                 f"Commented {posted}/{len(comments)} at {target.get('rect')}: "
-                f"{comment!r} "
+                f"{comment!r} pageY {target.get('actionPageY')} "
                 f"(button click: {click_method}, textbox click: {textbox_click_method})"
             )
             scroll_past_post(page, target, args.scroll_px)
