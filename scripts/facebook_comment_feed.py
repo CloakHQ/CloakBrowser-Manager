@@ -108,11 +108,11 @@ def load_comments(path: Path, count: int | None, start_line: int) -> list[str]:
     return comments
 
 
-def mark_next_comment_button(page: Any, seen_action_keys: set[str]) -> dict[str, Any]:
+def mark_next_comment_button(page: Any, seen_post_keys: set[str]) -> dict[str, Any]:
     token = f"codex-fb-comment-{time.time_ns()}"
     result = page.evaluate(
         """
-        ({ token, seenActionKeys }) => {
+        ({ token, seenPostKeys }) => {
           const reactionActionNames = new Set(["Like", "Thích", "React", "Bày tỏ cảm xúc"]);
 
           const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
@@ -150,6 +150,45 @@ def mark_next_comment_button(page: Any, seen_action_keys: set[str]) -> dict[str,
             return null;
           };
 
+          const postContainerFor = (group) => {
+            const groupRect = group.getBoundingClientRect();
+            let node = group.parentElement;
+            for (let depth = 0; node && node !== document.body && depth < 14; depth += 1) {
+              const rect = node.getBoundingClientRect();
+              const containsGroup =
+                rect.top <= groupRect.top &&
+                rect.bottom >= groupRect.bottom &&
+                rect.left <= groupRect.left + 10 &&
+                rect.right >= groupRect.right - 10;
+              const hasEnoughShape =
+                rect.width >= 420 &&
+                rect.height >= Math.max(130, groupRect.height + 80) &&
+                rect.height <= Math.max(2600, window.innerHeight * 3);
+              if (containsGroup && hasEnoughShape) {
+                return node;
+              }
+              node = node.parentElement;
+            }
+            return group;
+          };
+
+          const postKey = (post) => {
+            const rect = post.getBoundingClientRect();
+            const text = normalize(post.innerText).slice(0, 180);
+            const links = Array.from(post.querySelectorAll('a, [role="link"]'))
+              .map(labelOf)
+              .filter(Boolean)
+              .slice(0, 5)
+              .join("|");
+            return [
+              Math.round(rect.top + window.scrollY),
+              Math.round(rect.left),
+              Math.round(rect.width),
+              links,
+              text,
+            ].join("|");
+          };
+
           const actionKey = (group) => {
             const rect = group.getBoundingClientRect();
             const text = normalize(group.innerText).slice(0, 160);
@@ -159,6 +198,7 @@ def mark_next_comment_button(page: Any, seen_action_keys: set[str]) -> dict[str,
           const buttons = Array.from(document.querySelectorAll('[role="button"]'))
             .filter(isVisible);
           const groups = new Set();
+          const posts = new Set();
 
           for (const button of buttons) {
             const name = labelOf(button);
@@ -172,23 +212,41 @@ def mark_next_comment_button(page: Any, seen_action_keys: set[str]) -> dict[str,
             }
             const key = actionKey(group);
             groups.add(key);
-            if (seenActionKeys.includes(key)) {
+
+            const post = postContainerFor(group);
+            const keyForPost = postKey(post);
+            posts.add(keyForPost);
+            if (
+              post.getAttribute("data-codex-fb-comment-processed") === "true" ||
+              seenPostKeys.includes(keyForPost)
+            ) {
               continue;
             }
 
             button.setAttribute("data-codex-fb-comment-target", token);
+            post.setAttribute("data-codex-fb-comment-post-target", token);
             const rect = button.getBoundingClientRect();
+            const postRect = post.getBoundingClientRect();
             return {
               ok: true,
               token,
               actionKey: key,
+              postKey: keyForPost,
               label: name,
               visibleActionGroups: groups.size,
+              visiblePosts: posts.size,
               rect: {
                 x: Math.round(rect.left),
                 y: Math.round(rect.top),
                 width: Math.round(rect.width),
                 height: Math.round(rect.height),
+              },
+              postRect: {
+                x: Math.round(postRect.left),
+                y: Math.round(postRect.top),
+                width: Math.round(postRect.width),
+                height: Math.round(postRect.height),
+                pageBottom: Math.round(window.scrollY + postRect.bottom),
               },
             };
           }
@@ -198,10 +256,11 @@ def mark_next_comment_button(page: Any, seen_action_keys: set[str]) -> dict[str,
             token,
             visibleButtons: buttons.length,
             visibleActionGroups: groups.size,
+            visiblePosts: posts.size,
           };
         }
         """,
-        {"token": token, "seenActionKeys": list(seen_action_keys)},
+        {"token": token, "seenPostKeys": list(seen_post_keys)},
     )
     return result
 
@@ -319,6 +378,50 @@ def click_with_dom_fallback(locator: Locator, timeout: int) -> str:
         return "dom"
 
 
+def mark_post_processed(page: Any, target: dict[str, Any]) -> None:
+    page.evaluate(
+        """
+        ({ token }) => {
+          const post = document.querySelector(
+            `[data-codex-fb-comment-post-target="${token}"]`
+          );
+          if (post) {
+            post.setAttribute("data-codex-fb-comment-processed", "true");
+          }
+        }
+        """,
+        {"token": target.get("token")},
+    )
+
+
+def scroll_past_post(page: Any, target: dict[str, Any], min_scroll: int) -> None:
+    page.evaluate(
+        """
+        ({ token, postRect, minScroll }) => {
+          const post = document.querySelector(
+            `[data-codex-fb-comment-post-target="${token}"]`
+          );
+          let pageBottom = postRect?.pageBottom || window.scrollY + minScroll;
+          if (post) {
+            const rect = post.getBoundingClientRect();
+            pageBottom = window.scrollY + rect.bottom;
+          }
+
+          const nextTop = Math.max(
+            window.scrollY + Math.max(160, Math.floor(minScroll / 3)),
+            pageBottom - Math.floor(window.innerHeight * 0.18)
+          );
+          window.scrollTo({ top: nextTop, behavior: "instant" });
+        }
+        """,
+        {
+            "token": target.get("token"),
+            "postRect": target.get("postRect") or {},
+            "minScroll": min_scroll,
+        },
+    )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try:
@@ -327,7 +430,7 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    seen_action_keys: set[str] = set()
+    seen_post_keys: set[str] = set()
     posted = 0
     scrolls = 0
     url = cdp_url(args.host, args.profile_id)
@@ -343,20 +446,21 @@ def main() -> int:
         print(f"Loaded {len(comments)} comment line(s) from start line {args.start_line}.")
 
         while posted < len(comments) and scrolls < args.max_scrolls:
-            target = mark_next_comment_button(page, seen_action_keys)
+            target = mark_next_comment_button(page, seen_post_keys)
             if not target.get("ok"):
                 scrolls += 1
                 print(
                     f"No visible comment target; scrolling {scrolls}/{args.max_scrolls} "
                     f"(visible buttons: {target.get('visibleButtons', 0)}, "
-                    f"action groups: {target.get('visibleActionGroups', 0)})"
+                    f"action groups: {target.get('visibleActionGroups', 0)}, "
+                    f"posts: {target.get('visiblePosts', 0)})"
                 )
                 page.mouse.wheel(0, args.scroll_px)
                 page.wait_for_timeout(random.randint(1200, 2200))
                 continue
 
             comment = comments[posted]
-            seen_action_keys.add(target["actionKey"])
+            seen_post_keys.add(target["postKey"])
             selector = f'[data-codex-fb-comment-target="{target["token"]}"]'
             button = page.locator(selector).first
             button.scroll_into_view_if_needed(timeout=5_000)
@@ -364,8 +468,11 @@ def main() -> int:
             if args.dry_run:
                 print(
                     f"Dry run target {posted + 1}/{len(comments)}: "
-                    f"{target['label']} at {target.get('rect')} -> {comment!r}"
+                    f"{target['label']} at {target.get('rect')} "
+                    f"post {target.get('postRect')} -> {comment!r}"
                 )
+                mark_post_processed(page, target)
+                scroll_past_post(page, target, args.scroll_px)
                 posted += 1
                 page.wait_for_timeout(random.randint(700, 1300))
                 continue
@@ -379,6 +486,7 @@ def main() -> int:
                     f"Skipped target {posted + 1}: could not find comment box "
                     f"near {target.get('rect')}"
                 )
+                scroll_past_post(page, target, args.scroll_px)
                 continue
 
             textbox = page.locator(f'[data-codex-fb-comment-box="{box["token"]}"]').first
@@ -388,11 +496,13 @@ def main() -> int:
             textbox.press("Enter", timeout=8_000)
 
             posted += 1
+            mark_post_processed(page, target)
             print(
                 f"Commented {posted}/{len(comments)} at {target.get('rect')}: "
                 f"{comment!r} "
                 f"(button click: {click_method}, textbox click: {textbox_click_method})"
             )
+            scroll_past_post(page, target, args.scroll_px)
             page.wait_for_timeout(random.randint(1800, 3200))
 
         action = "Planned" if args.dry_run else "Commented"
