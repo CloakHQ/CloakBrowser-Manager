@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from playwright.sync_api import Locator
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -44,6 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of lines to post. Defaults to all non-empty lines.",
     )
     parser.add_argument(
+        "--start-line",
+        type=int,
+        default=1,
+        help=(
+            "1-based non-empty comment line to start from. Use 2 to resume after "
+            "the first comment line was already posted."
+        ),
+    )
+    parser.add_argument(
         "--feed-url",
         default="https://www.facebook.com/",
         help="Facebook feed URL to open before commenting.",
@@ -72,20 +82,25 @@ def cdp_url(host: str, profile_id: str) -> str:
     return f"{host.rstrip('/')}/api/profiles/{profile_id}/cdp"
 
 
-def is_same_host(current_url: str, target_url: str) -> bool:
-    current_host = urlparse(current_url).hostname or ""
-    target_host = urlparse(target_url).hostname or ""
-    return current_host == target_host
+def is_same_page(current_url: str, target_url: str) -> bool:
+    current = urlparse(current_url)
+    target = urlparse(target_url)
+    current_path = current.path.rstrip("/") or "/"
+    target_path = target.path.rstrip("/") or "/"
+    return current.hostname == target.hostname and current_path == target_path
 
 
-def load_comments(path: Path, count: int | None) -> list[str]:
+def load_comments(path: Path, count: int | None, start_line: int) -> list[str]:
     if count is not None and count < 1:
         raise ValueError("--count must be at least 1")
+    if start_line < 1:
+        raise ValueError("--start-line must be at least 1")
     if not path.exists():
         raise FileNotFoundError(f"Comments file not found: {path}")
 
     lines = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines()]
     comments = [line for line in lines if line]
+    comments = comments[start_line - 1 :]
     if count is not None:
         comments = comments[:count]
     if not comments:
@@ -274,7 +289,7 @@ def mark_nearest_comment_box(page: Any, target_rect: dict[str, int]) -> dict[str
 
 def open_feed_page(page: Any, feed_url: str) -> None:
     page.on("dialog", lambda dialog: dialog.dismiss())
-    if page.url == "about:blank" or not is_same_host(page.url, feed_url):
+    if page.url == "about:blank" or not is_same_page(page.url, feed_url):
         page.goto(feed_url, wait_until="domcontentloaded", timeout=60_000)
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
@@ -285,10 +300,29 @@ def open_feed_page(page: Any, feed_url: str) -> None:
         page.wait_for_timeout(1_000)
 
 
+def click_with_dom_fallback(locator: Locator, timeout: int) -> str:
+    try:
+        locator.click(timeout=timeout)
+        return "playwright"
+    except PlaywrightTimeoutError:
+        locator.evaluate(
+            """
+            (el) => {
+              el.scrollIntoView({ block: "center", inline: "center" });
+              if (typeof el.focus === "function") {
+                el.focus();
+              }
+              el.click();
+            }
+            """
+        )
+        return "dom"
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        comments = load_comments(args.comments_file, args.count)
+        comments = load_comments(args.comments_file, args.count, args.start_line)
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -306,7 +340,7 @@ def main() -> int:
         print(f"Connected: {url}")
         open_feed_page(page, args.feed_url)
         print(f"Page: {page.title()} ({page.url})")
-        print(f"Loaded {len(comments)} comment line(s).")
+        print(f"Loaded {len(comments)} comment line(s) from start line {args.start_line}.")
 
         while posted < len(comments) and scrolls < args.max_scrolls:
             target = mark_next_comment_button(page, seen_action_keys)
@@ -336,7 +370,7 @@ def main() -> int:
                 page.wait_for_timeout(random.randint(700, 1300))
                 continue
 
-            button.click(timeout=8_000)
+            click_method = click_with_dom_fallback(button, timeout=8_000)
             page.wait_for_timeout(random.randint(900, 1500))
 
             box = mark_nearest_comment_box(page, target.get("rect", {}))
@@ -348,7 +382,7 @@ def main() -> int:
                 continue
 
             textbox = page.locator(f'[data-codex-fb-comment-box="{box["token"]}"]').first
-            textbox.click(timeout=5_000)
+            textbox_click_method = click_with_dom_fallback(textbox, timeout=5_000)
             textbox.fill(comment, timeout=8_000)
             page.wait_for_timeout(random.randint(300, 700))
             textbox.press("Enter", timeout=8_000)
@@ -356,7 +390,8 @@ def main() -> int:
             posted += 1
             print(
                 f"Commented {posted}/{len(comments)} at {target.get('rect')}: "
-                f"{comment!r}"
+                f"{comment!r} "
+                f"(button click: {click_method}, textbox click: {textbox_click_method})"
             )
             page.wait_for_timeout(random.randint(1800, 3200))
 
