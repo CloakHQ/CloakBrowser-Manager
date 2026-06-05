@@ -59,15 +59,17 @@ class ScriptRun:
     task: asyncio.Task | None = field(default=None, repr=False)
 
 
-def _literal(node: ast.AST | None) -> Any:
+def _literal(node: ast.AST | None, constants: dict[str, Any] | None = None) -> Any:
     if node is None:
         return None
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, (ast.List, ast.Tuple)):
-        values = [_literal(item) for item in node.elts]
+        values = [_literal(item, constants) for item in node.elts]
         return values if all(value is not None for value in values) else None
     if isinstance(node, ast.Name):
+        if constants and node.id in constants:
+            return constants[node.id]
         return node.id
     if isinstance(node, ast.Attribute):
         return node.attr
@@ -101,6 +103,23 @@ def _preferred_flag(parameter: ScriptParameter) -> str:
         if flag.startswith("--"):
             return flag
     return parameter.flags[0]
+
+
+def _module_constants(tree: ast.Module) -> dict[str, Any]:
+    constants: dict[str, Any] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            value = _literal(node.value, constants)
+            if value is None:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    constants[target.id] = value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            value = _literal(node.value, constants)
+            if value is not None and node.target.id.isupper():
+                constants[node.target.id] = value
+    return constants
 
 
 class ScriptRunner:
@@ -247,6 +266,7 @@ class ScriptRunner:
         docstring = ast.get_docstring(tree)
         description = docstring.splitlines()[0] if docstring else None
         parameters: list[ScriptParameter] = []
+        constants = _module_constants(tree)
 
         calls = [
             node
@@ -258,13 +278,13 @@ class ScriptRunner:
         calls.sort(key=lambda node: getattr(node, "lineno", 0))
 
         for node in calls:
-            flags = [_literal(arg) for arg in node.args]
+            flags = [_literal(arg, constants) for arg in node.args]
             flags = [flag for flag in flags if isinstance(flag, str)]
             if not flags:
                 continue
 
             kwargs = {
-                keyword.arg: _literal(keyword.value)
+                keyword.arg: _literal(keyword.value, constants)
                 for keyword in node.keywords
                 if keyword.arg is not None
             }

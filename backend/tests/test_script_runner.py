@@ -20,6 +20,7 @@ def test_list_scripts_discovers_visible_parameters():
     assert like_script.profile_required is True
     assert "cdp_url" not in like_params
     assert like_params["count"].value_type == "integer"
+    assert like_params["count"].default == 10
     assert like_params["dry_run"].kind == "flag"
 
     comment_script = runner.get_script("facebook_comment_feed")
