@@ -73,6 +73,42 @@ export interface SystemStatus {
   profiles_total: number;
 }
 
+export interface ScriptParameter {
+  name: string;
+  flags: string[];
+  kind: "positional" | "option" | "flag";
+  required: boolean;
+  default: string | number | boolean | null;
+  help: string | null;
+  choices: string[] | null;
+  value_type: "string" | "integer" | "number" | "boolean" | "path";
+}
+
+export interface ScriptDefinition {
+  id: string;
+  filename: string;
+  name: string;
+  description: string | null;
+  parameters: ScriptParameter[];
+  profile_required: boolean;
+}
+
+export interface ScriptRun {
+  id: string;
+  script_id: string;
+  script_name: string;
+  profile_id: string;
+  profile_name: string | null;
+  status: "running" | "succeeded" | "failed" | "stopped";
+  started_at: number;
+  finished_at: number | null;
+  exit_code: number | null;
+  command: string[];
+  log: string;
+}
+
+export type ScriptArguments = Record<string, string | number | boolean | null>;
+
 class ApiError extends Error {
   constructor(
     public status: number,
@@ -155,4 +191,19 @@ export const api = {
 
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
+
+  listScripts: () => request<ScriptDefinition[]>("/api/scripts"),
+
+  listScriptRuns: () => request<ScriptRun[]>("/api/scripts/runs"),
+
+  getScriptRun: (id: string) => request<ScriptRun>(`/api/scripts/runs/${id}`),
+
+  runScript: (scriptId: string, profileId: string, args: ScriptArguments) =>
+    request<ScriptRun>(`/api/scripts/${scriptId}/runs`, {
+      method: "POST",
+      body: JSON.stringify({ profile_id: profileId, arguments: args }),
+    }),
+
+  stopScriptRun: (id: string) =>
+    request<ScriptRun>(`/api/scripts/runs/${id}/stop`, { method: "POST" }),
 };

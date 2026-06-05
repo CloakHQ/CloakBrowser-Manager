@@ -116,6 +116,51 @@ describe("api.getClipboard", () => {
   });
 });
 
+// ── scripts ────────────────────────────────────────────────────────────────
+
+describe("api.listScripts", () => {
+  it("returns script definitions", async () => {
+    const scripts = [{ id: "facebook_like_feed", name: "Facebook Like Feed" }];
+    mockFetch.mockResolvedValueOnce(jsonResponse(scripts));
+    const result = await api.listScripts();
+    expect(result).toEqual(scripts);
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/scripts");
+  });
+});
+
+describe("api.runScript", () => {
+  it("sends profile and script arguments", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "run-1", status: "running" }));
+    await api.runScript("facebook_like_feed", "profile-1", { count: 2, dry_run: true });
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/scripts/facebook_like_feed/runs");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(options.body)).toEqual({
+      profile_id: "profile-1",
+      arguments: { count: 2, dry_run: true },
+    });
+  });
+});
+
+describe("api.getScriptRun", () => {
+  it("returns script run state", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "run-1", log: "ok" }));
+    const result = await api.getScriptRun("run-1");
+    expect(result.log).toBe("ok");
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/scripts/runs/run-1");
+  });
+});
+
+describe("api.stopScriptRun", () => {
+  it("posts to stop endpoint", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "run-1", status: "stopped" }));
+    await api.stopScriptRun("run-1");
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/scripts/runs/run-1/stop");
+    expect(options.method).toBe("POST");
+  });
+});
+
 // ── Error handling ──────────────────────────────────────────────────────────
 
 describe("error handling", () => {

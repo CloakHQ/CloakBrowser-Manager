@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
+import { Lock, PanelLeftClose, PanelLeft, Terminal } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { api, setOnUnauthorized, type ProfileCreateData } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
@@ -8,9 +8,10 @@ import { ProfileViewer } from "./components/ProfileViewer";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { LoginPage } from "./components/LoginPage";
+import { ScriptRunnerPanel } from "./components/ScriptRunnerPanel";
 
 type AuthState = "checking" | "required" | "ok" | "error";
-type View = "empty" | "create" | "edit" | "view";
+type View = "empty" | "create" | "edit" | "view" | "scripts";
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -107,6 +108,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     setView("create");
   }, []);
 
+  const handleScripts = useCallback(() => {
+    setView("scripts");
+  }, []);
+
   const handleCreate = useCallback(async (data: ProfileCreateData) => {
     const profile = await create(data);
     if (profile) {
@@ -159,8 +164,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           <ProfileList
             profiles={profiles}
             selectedId={selectedId}
+            scriptsSelected={view === "scripts"}
             onSelect={handleSelect}
             onNew={handleNew}
+            onScripts={handleScripts}
           />
         </div>
       )}
@@ -177,7 +184,12 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             >
               {sidebarOpen ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeft className="h-4 w-4" />}
             </button>
-            {selected && (
+            {view === "scripts" ? (
+              <div className="flex items-center gap-2">
+                <Terminal className="h-4 w-4 text-accent" />
+                <span className="text-sm font-medium">Scripts</span>
+              </div>
+            ) : selected && (
               <div className="flex items-center gap-2">
                 <StatusIndicator status={selected.status} size="md" />
                 <span className="text-sm font-medium">{selected.name}</span>
@@ -250,6 +262,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               clipboardSync={selected.clipboard_sync}
               onDisconnect={handleVncDisconnect}
             />
+          )}
+
+          {view === "scripts" && (
+            <ScriptRunnerPanel profiles={profiles} selectedProfileId={selectedId} />
           )}
         </div>
       </div>

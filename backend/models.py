@@ -132,3 +132,42 @@ class ClipboardRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     token: str
+
+
+class ScriptParameterResponse(BaseModel):
+    name: str
+    flags: list[str]
+    kind: Literal["positional", "option", "flag"]
+    required: bool
+    default: str | int | float | bool | None = None
+    help: str | None = None
+    choices: list[str] | None = None
+    value_type: Literal["string", "integer", "number", "boolean", "path"] = "string"
+
+
+class ScriptResponse(BaseModel):
+    id: str
+    filename: str
+    name: str
+    description: str | None = None
+    parameters: list[ScriptParameterResponse] = Field(default_factory=list)
+    profile_required: bool
+
+
+class ScriptRunRequest(BaseModel):
+    profile_id: str
+    arguments: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class ScriptRunResponse(BaseModel):
+    id: str
+    script_id: str
+    script_name: str
+    profile_id: str
+    profile_name: str | None = None
+    status: Literal["running", "succeeded", "failed", "stopped"]
+    started_at: float
+    finished_at: float | None = None
+    exit_code: int | None = None
+    command: list[str] = Field(default_factory=list)
+    log: str = ""

@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Running CloakBrowser profile id.",
     )
     parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="Direct CDP URL. Overrides --host and --profile-id when set.",
+    )
+    parser.add_argument(
         "--count",
         type=int,
         default=DEFAULT_COUNT,
@@ -179,7 +184,7 @@ def main() -> int:
     seen_action_keys: set[str] = set()
     liked = 0
     scrolls = 0
-    url = cdp_url(args.host, args.profile_id)
+    url = args.cdp_url or cdp_url(args.host, args.profile_id)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(url)

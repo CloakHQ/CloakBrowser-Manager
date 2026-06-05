@@ -1,4 +1,4 @@
-import { Plus, Search, Monitor } from "lucide-react";
+import { Plus, Search, Monitor, Terminal } from "lucide-react";
 import { useState } from "react";
 import type { Profile } from "../lib/api";
 import { StatusIndicator } from "./StatusIndicator";
@@ -6,11 +6,20 @@ import { StatusIndicator } from "./StatusIndicator";
 interface ProfileListProps {
   profiles: Profile[];
   selectedId: string | null;
+  scriptsSelected: boolean;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onScripts: () => void;
 }
 
-export function ProfileList({ profiles, selectedId, onSelect, onNew }: ProfileListProps) {
+export function ProfileList({
+  profiles,
+  selectedId,
+  scriptsSelected,
+  onSelect,
+  onNew,
+  onScripts,
+}: ProfileListProps) {
   const [search, setSearch] = useState("");
 
   const filtered = profiles.filter((p) =>
@@ -93,7 +102,16 @@ export function ProfileList({ profiles, selectedId, onSelect, onNew }: ProfileLi
       </div>
 
       {/* New profile button */}
-      <div className="p-3 border-t border-border">
+      <div className="p-3 border-t border-border space-y-2">
+        <button
+          onClick={onScripts}
+          className={`btn-secondary w-full flex items-center justify-center gap-1.5 ${
+            scriptsSelected ? "bg-surface-4" : ""
+          }`}
+        >
+          <Terminal className="h-3.5 w-3.5" />
+          <span>Scripts</span>
+        </button>
         <button onClick={onNew} className="btn-secondary w-full flex items-center justify-center gap-1.5">
           <Plus className="h-3.5 w-3.5" />
           <span>New Profile</span>

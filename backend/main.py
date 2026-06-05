@@ -34,9 +34,13 @@ from .models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ScriptResponse,
+    ScriptRunRequest,
+    ScriptRunResponse,
     StatusResponse,
     TagResponse,
 )
+from .script_runner import ScriptRunner
 
 logger = logging.getLogger("cloakbrowser.manager")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -175,6 +179,7 @@ class AuthMiddleware:
 
 # Singleton browser manager
 browser_mgr = BrowserManager()
+script_mgr = ScriptRunner()
 
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
@@ -577,6 +582,96 @@ async def get_system_status():
         binary_version=CHROMIUM_VERSION,
         profiles_total=len(profiles),
     )
+
+
+# ── Script Runner ───────────────────────────────────────────────────────────
+
+
+def _script_response(script) -> ScriptResponse:
+    return ScriptResponse(
+        id=script.id,
+        filename=script.filename,
+        name=script.name,
+        description=script.description,
+        parameters=[param.__dict__ for param in script.parameters],
+        profile_required=script.profile_required,
+    )
+
+
+def _script_run_response(run) -> ScriptRunResponse:
+    return ScriptRunResponse(
+        id=run.id,
+        script_id=run.script_id,
+        script_name=run.script_name,
+        profile_id=run.profile_id,
+        profile_name=run.profile_name,
+        status=run.status,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        exit_code=run.exit_code,
+        command=run.command,
+        log=run.log,
+    )
+
+
+def _manager_host(request: Request) -> str:
+    scheme = "https" if _is_https(request) else request.url.scheme
+    host = request.headers.get("host", "localhost:8080")
+    return f"{scheme}://{host}"
+
+
+@app.get("/api/scripts", response_model=list[ScriptResponse])
+async def list_scripts():
+    return [_script_response(script) for script in script_mgr.list_scripts()]
+
+
+@app.get("/api/scripts/runs", response_model=list[ScriptRunResponse])
+async def list_script_runs():
+    runs = sorted(script_mgr.runs.values(), key=lambda run: run.started_at, reverse=True)
+    return [_script_run_response(run) for run in runs[:25]]
+
+
+@app.get("/api/scripts/runs/{run_id}", response_model=ScriptRunResponse)
+async def get_script_run(run_id: str):
+    run = script_mgr.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Script run not found")
+    return _script_run_response(run)
+
+
+@app.post("/api/scripts/runs/{run_id}/stop", response_model=ScriptRunResponse)
+async def stop_script_run(run_id: str):
+    run = await script_mgr.stop_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Script run not found")
+    return _script_run_response(run)
+
+
+@app.post("/api/scripts/{script_id}/runs", response_model=ScriptRunResponse, status_code=201)
+async def start_script_run(script_id: str, req: ScriptRunRequest, request: Request):
+    profile = db.get_profile(req.profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    running = browser_mgr.running.get(req.profile_id)
+    if not running:
+        raise HTTPException(status_code=409, detail="Profile must be running to run scripts")
+
+    try:
+        run = await script_mgr.start_run(
+            script_id=script_id,
+            profile_id=req.profile_id,
+            profile_name=profile.get("name"),
+            cdp_port=running.cdp_port,
+            manager_host=_manager_host(request),
+            arguments=req.arguments,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Script not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return _script_run_response(run)
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────
