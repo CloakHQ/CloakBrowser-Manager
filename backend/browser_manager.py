@@ -12,11 +12,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cloakbrowser.browser as cloakbrowser_browser
 from cloakbrowser import launch_persistent_context_async
 
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
+
+# CloakBrowser's current Linux binary advertises HTTP proxy inline auth support,
+# but Chromium rejects `--proxy-server=http://user:pass@host:port` here with
+# net::ERR_NO_SUPPORTED_PROXIES. Force the Playwright proxy-auth path instead.
+cloakbrowser_browser._supports_http_proxy_inline_auth = lambda: False
 
 
 def _normalize_proxy(raw: str) -> str:
