@@ -241,16 +241,16 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
   }
 
   return (
-    <div className="relative h-full flex flex-col">
+    <div className="relative h-full flex flex-col overflow-hidden">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border">
+      <div className="relative z-20 shrink-0 flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border pointer-events-auto">
         <div className="flex items-center gap-2">
           <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-yellow-400 animate-pulse"}`} />
           <span className="text-xs text-gray-400">
             {connected ? "Connected" : "Connecting..."}
           </span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="relative z-20 flex items-center gap-1 pointer-events-auto">
           {cdpUrl && (
             <button
               onClick={() => {
@@ -287,7 +287,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       {/* VNC canvas container */}
       <div
         ref={containerRef}
-        className="flex-1 bg-black overflow-hidden"
+        className="relative z-0 flex-1 bg-black overflow-hidden"
         style={{ minHeight: 0 }}
       />
     </div>
