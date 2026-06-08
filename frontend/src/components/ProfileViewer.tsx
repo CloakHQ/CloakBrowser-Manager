@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ClipboardCopy, Code2, Maximize2, Minimize2 } from "lucide-react";
 import { api } from "../lib/api";
+import { copyText } from "../lib/clipboard";
 
 interface ProfileViewerProps {
   profileId: string;
@@ -253,8 +254,8 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           {cdpUrl && (
             <button
               onClick={() => {
-                const base = `${window.location.protocol}//${window.location.host}${cdpUrl}`;
-                navigator.clipboard?.writeText(base).then(() => {
+                const base = new URL(cdpUrl, window.location.origin).toString();
+                copyText(base).then(() => {
                   setCdpCopied(true);
                   setTimeout(() => setCdpCopied(false), 2000);
                 }).catch((err) => console.warn("[cdp] copy failed:", err));
