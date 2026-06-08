@@ -145,7 +145,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       const text = e.detail?.text;
       console.log("[clipboard] VNC→Host event fired, text:", text?.substring(0, 50), "len:", text?.length);
       if (text) {
-        navigator.clipboard.writeText(text).then(() => {
+        copyText(text).then(() => {
           console.log("[clipboard] writeText success");
         }).catch((err) => {
           console.warn("[clipboard] writeText failed:", err);
@@ -176,7 +176,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
         if (text && text !== lastText) {
           lastText = text;
           console.log("[clipboard] poll: new VNC clipboard:", text.substring(0, 50), "len:", text.length);
-          await navigator.clipboard.writeText(text).catch((err) =>
+          await copyText(text).catch((err) =>
             console.warn("[clipboard] poll writeText failed:", err)
           );
         }
