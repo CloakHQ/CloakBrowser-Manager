@@ -236,17 +236,45 @@ class BrowserManager:
             # Inject clipboard listener: captures copied text on every page
             # so the GET /clipboard endpoint can read it via page.evaluate()
             _clipboard_init_js = """
-                window.__clipboardText = '';
-                document.addEventListener('copy', () => {
+                window.__clipboardText = window.__clipboardText || '';
+
+                window.__setClipboardText = (value) => {
+                    if (typeof value === 'string' && value) {
+                        window.__clipboardText = value;
+                    }
+                };
+
+                document.addEventListener('copy', (event) => {
+                    const eventText = event?.clipboardData?.getData?.('text/plain');
+                    if (eventText) {
+                        window.__setClipboardText(eventText);
+                        return;
+                    }
+
                     const sel = window.getSelection();
-                    if (sel) window.__clipboardText = sel.toString();
+                    if (sel) window.__setClipboardText(sel.toString());
                 });
+
                 document.addEventListener('keydown', (e) => {
                     if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.altKey && !e.shiftKey) {
                         const sel = window.getSelection();
-                        if (sel && sel.toString()) window.__clipboardText = sel.toString();
+                        if (sel && sel.toString()) window.__setClipboardText(sel.toString());
                     }
                 });
+
+                if (navigator.clipboard && !navigator.clipboard.__cloakbrowserPatchedWriteText) {
+                    const originalWriteText = navigator.clipboard.writeText?.bind(navigator.clipboard);
+                    if (originalWriteText) {
+                        navigator.clipboard.writeText = async (text) => {
+                            window.__setClipboardText(text);
+                            return originalWriteText(text);
+                        };
+                        Object.defineProperty(navigator.clipboard, '__cloakbrowserPatchedWriteText', {
+                            value: true,
+                            configurable: true,
+                        });
+                    }
+                }
             """
             await context.add_init_script(_clipboard_init_js)
             # Also inject into already-open pages (about:blank created before init_script)
