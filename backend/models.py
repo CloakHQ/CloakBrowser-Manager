@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 class ProfileCreate(BaseModel):
     name: str
     fingerprint_seed: int | None = None  # random if not set
+    fingerprint_rotation_interval: int = 0  # minutes; 0 = disabled
     proxy: str | None = None  # "http://user:pass@host:port" or null
     timezone: str | None = None  # "America/New_York"
     locale: str | None = None  # "en-US"
@@ -35,6 +36,7 @@ class ProfileCreate(BaseModel):
 class ProfileUpdate(BaseModel):
     name: str | None = None
     fingerprint_seed: int | None = None
+    fingerprint_rotation_interval: int | None = None
     proxy: str | None = Field(default=None)
     timezone: str | None = Field(default=None)
     locale: str | None = Field(default=None)
@@ -71,6 +73,7 @@ class ProfileResponse(BaseModel):
     id: str
     name: str
     fingerprint_seed: int
+    fingerprint_rotation_interval: int = 0
     proxy: str | None = None
     timezone: str | None = None
     locale: str | None = None

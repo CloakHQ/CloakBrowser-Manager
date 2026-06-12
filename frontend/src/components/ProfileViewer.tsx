@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ClipboardCopy, Code2, Maximize2, Minimize2 } from "lucide-react";
 import { api } from "../lib/api";
+import { copyText } from "../lib/clipboard";
 
 interface ProfileViewerProps {
   profileId: string;
@@ -144,7 +145,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       const text = e.detail?.text;
       console.log("[clipboard] VNC→Host event fired, text:", text?.substring(0, 50), "len:", text?.length);
       if (text) {
-        navigator.clipboard.writeText(text).then(() => {
+        copyText(text).then(() => {
           console.log("[clipboard] writeText success");
         }).catch((err) => {
           console.warn("[clipboard] writeText failed:", err);
@@ -175,7 +176,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
         if (text && text !== lastText) {
           lastText = text;
           console.log("[clipboard] poll: new VNC clipboard:", text.substring(0, 50), "len:", text.length);
-          await navigator.clipboard.writeText(text).catch((err) =>
+          await copyText(text).catch((err) =>
             console.warn("[clipboard] poll writeText failed:", err)
           );
         }
@@ -240,21 +241,21 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
   }
 
   return (
-    <div className="relative h-full flex flex-col">
+    <div className="relative h-full flex flex-col overflow-hidden">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border">
+      <div className="relative z-20 shrink-0 flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border pointer-events-auto">
         <div className="flex items-center gap-2">
           <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-yellow-400 animate-pulse"}`} />
           <span className="text-xs text-gray-400">
             {connected ? "Connected" : "Connecting..."}
           </span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="relative z-20 flex items-center gap-1 pointer-events-auto">
           {cdpUrl && (
             <button
               onClick={() => {
-                const base = `${window.location.protocol}//${window.location.host}${cdpUrl}`;
-                navigator.clipboard?.writeText(base).then(() => {
+                const base = new URL(cdpUrl, window.location.origin).toString();
+                copyText(base).then(() => {
                   setCdpCopied(true);
                   setTimeout(() => setCdpCopied(false), 2000);
                 }).catch((err) => console.warn("[cdp] copy failed:", err));
@@ -286,7 +287,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       {/* VNC canvas container */}
       <div
         ref={containerRef}
-        className="flex-1 bg-black overflow-hidden"
+        className="relative z-0 flex-1 bg-black overflow-hidden"
         style={{ minHeight: 0 }}
       />
     </div>

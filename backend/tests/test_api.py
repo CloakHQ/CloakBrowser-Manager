@@ -296,7 +296,7 @@ def test_get_clipboard_from_page(app_client: TestClient):
 
     # Mock page with clipboard text
     mock_page = AsyncMock()
-    mock_page.evaluate = AsyncMock(return_value="copied text")
+    mock_page.evaluate = AsyncMock(side_effect=["", "copied text"])
 
     mock_context = MagicMock()
     mock_context.pages = [mock_page]
@@ -312,6 +312,31 @@ def test_get_clipboard_from_page(app_client: TestClient):
     assert resp.json()["text"] == "copied text"
 
     # Cleanup
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_clipboard_prefers_navigator_clipboard_read_text(app_client: TestClient):
+    """Copy buttons often call navigator.clipboard.writeText() without a selection."""
+    create = app_client.post("/api/profiles", json={"name": "ClipReadButton"})
+    pid = create.json()["id"]
+
+    mock_page = AsyncMock()
+    mock_page.evaluate = AsyncMock(side_effect=["button copied text"])
+
+    mock_context = MagicMock()
+    mock_context.pages = [mock_page]
+
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.display = 100
+    mock_running.cdp_port = 5100
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    resp = app_client.get(f"/api/profiles/{pid}/clipboard")
+    assert resp.status_code == 200
+    assert resp.json()["text"] == "button copied text"
+    assert mock_page.evaluate.await_count == 1
+
     main.browser_mgr.running.pop(pid, None)
 
 

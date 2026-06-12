@@ -630,14 +630,26 @@ async def get_clipboard(profile_id: str):
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
 
-    # Read Chrome's current text selection via Playwright.
-    # Chrome's native copy (via VNC Ctrl+C) doesn't write to X11 clipboard
-    # and doesn't fire DOM events, so we read the visible selection instead.
-    # The init script also captures copy events when they do fire.
+    # Read Chrome's clipboard via Playwright/CDP when possible.
+    # If the page wrote to navigator.clipboard.writeText(), this sees the real
+    # browser clipboard even when there is no visible selection.
+    # The init script also captures copy events and patched writeText() calls.
     # Check all pages — user may have copied in any tab
     try:
         for page in running.context.pages:
             try:
+                text = await page.evaluate("""
+                    async () => {
+                        try {
+                            return await navigator.clipboard.readText();
+                        } catch {
+                            return '';
+                        }
+                    }
+                """)
+                if text:
+                    return {"text": text[:_CLIPBOARD_MAX_READ]}
+
                 text = await page.evaluate("window.__clipboardText || ''")
                 if text:
                     return {"text": text[:_CLIPBOARD_MAX_READ]}

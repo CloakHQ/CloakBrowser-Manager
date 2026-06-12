@@ -104,6 +104,27 @@ docker compose up --build
 - ~2 GB disk (image + binary)
 - ~512 MB RAM per running profile
 
+## Profile crash auto-heal (custom fork)
+
+This fork includes a host-side watchdog example under `ops/watchdog/`.
+
+Why: built-in `auto_launch=true` runs only when the manager process starts. If the manager stays healthy but a single browser/profile crashes and falls back to `stopped`, upstream startup auto-launch does not bring it back.
+
+What the watchdog does:
+- polls `/api/profiles`
+- finds profiles with `auto_launch=true` and `status != running`
+- POSTs `/api/profiles/<id>/launch`
+- intended to run under host `systemd`
+
+Files:
+- `ops/watchdog/cloakbrowser_watchdog.py`
+- `ops/watchdog/cloakbrowser-watchdog.service`
+- `ops/watchdog/README.md`
+
+Important caveat:
+- if you want a profile to stay down intentionally, set `auto_launch=false` first
+- otherwise the watchdog will relaunch it within ~15 seconds
+
 ## Updating
 
 Pull the latest image and restart:
