@@ -6,6 +6,7 @@ export interface Profile {
   id: string;
   name: string;
   fingerprint_seed: number;
+  fingerprint_rotation_interval: number;
   proxy: string | null;
   timezone: string | null;
   locale: string | null;
@@ -37,6 +38,7 @@ export interface Profile {
 export interface ProfileCreateData {
   name: string;
   fingerprint_seed?: number | null;
+  fingerprint_rotation_interval?: number;
   proxy?: string | null;
   timezone?: string | null;
   locale?: string | null;
@@ -82,7 +84,6 @@ class ApiError extends Error {
   }
 }
 
-// Global 401 callback — set by App to trigger login page on auth failure
 let _onUnauthorized: (() => void) | null = null;
 export function setOnUnauthorized(cb: (() => void) | null) {
   _onUnauthorized = cb;

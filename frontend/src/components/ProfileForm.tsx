@@ -1,9 +1,9 @@
-import { Save, Trash2, X } from "lucide-react";
+import { Save, Trash2, X, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { Profile, ProfileCreateData } from "../lib/api";
 
 interface ProfileFormProps {
-  profile: Profile | null; // null = create mode
+  profile: Profile | null;
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
   onCancel: () => void;
@@ -19,14 +19,14 @@ const RESOLUTION_PRESETS: Record<string, { width: number; height: number }> = {
 };
 
 const TAG_COLORS = [
-  "#6366f1", // indigo
-  "#22c55e", // green
-  "#f59e0b", // amber
-  "#ef4444", // red
-  "#06b6d4", // cyan
-  "#a855f7", // purple
-  "#f97316", // orange
-  "#ec4899", // pink
+  "#6366f1",
+  "#22c55e",
+  "#f59e0b",
+  "#ef4444",
+  "#06b6d4",
+  "#a855f7",
+  "#f97316",
+  "#ec4899",
 ];
 
 const GPU_PRESETS: Record<string, { vendor: string; renderer: string }> = {
@@ -66,6 +66,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     geoip: false,
     clipboard_sync: true,
     auto_launch: false,
+    fingerprint_rotation_interval: 0,
     launch_args: [],
     tags: [],
   });
@@ -81,6 +82,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
       setForm({
         name: profile.name,
         fingerprint_seed: profile.fingerprint_seed,
+        fingerprint_rotation_interval: profile.fingerprint_rotation_interval,
         proxy: profile.proxy,
         timezone: profile.timezone,
         locale: profile.locale,
@@ -245,26 +247,20 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                   title="Randomize seed"
                 >
                   <svg className="h-5 w-5" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
-                    {/* Right face - lightest */}
                     <polygon points="28,10 16,16 16,28 28,22" fill="currentColor" opacity="0.06" />
                     <polygon points="28,10 16,16 16,28 28,22" />
-                    {/* Left face - medium shade */}
                     <polygon points="4,10 16,16 16,28 4,22" fill="currentColor" opacity="0.2" />
                     <polygon points="4,10 16,16 16,28 4,22" />
-                    {/* Top face - brightest */}
                     <polygon points="16,3 28,10 16,16 4,10" fill="currentColor" opacity="0.1" />
                     <polygon points="16,3 28,10 16,16 4,10" />
-                    {/* Dots on top face (3 - diagonal) */}
                     <circle cx="11.5" cy="8.5" r="1" fill="currentColor" opacity="0.7" />
                     <circle cx="16" cy="9.5" r="1" fill="currentColor" opacity="0.7" />
                     <circle cx="20.5" cy="10.5" r="1" fill="currentColor" opacity="0.7" />
-                    {/* Dots on left face (5 - dice pattern) */}
                     <circle cx="7.5" cy="14" r="0.9" fill="currentColor" opacity="0.6" />
                     <circle cx="12.5" cy="16.5" r="0.9" fill="currentColor" opacity="0.6" />
                     <circle cx="10" cy="19" r="0.9" fill="currentColor" opacity="0.6" />
                     <circle cx="7.5" cy="22" r="0.9" fill="currentColor" opacity="0.6" />
                     <circle cx="12.5" cy="24.5" r="0.9" fill="currentColor" opacity="0.6" />
-                    {/* Dots on right face (2 - diagonal) */}
                     <circle cx="20" cy="15" r="0.9" fill="currentColor" opacity="0.5" />
                     <circle cx="24" cy="20" r="0.9" fill="currentColor" opacity="0.5" />
                   </svg>
@@ -454,6 +450,27 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               />
               Launch automatically when container starts
             </label>
+            <div>
+              <label className="label">
+                <div className="flex items-center gap-1.5">
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Fingerprint Rotation Interval (minutes)
+                </div>
+              </label>
+              <input
+                className="input"
+                type="number"
+                min="0"
+                value={form.fingerprint_rotation_interval ?? 0}
+                onChange={(e) => set("fingerprint_rotation_interval", Math.max(0, Number(e.target.value)))}
+                placeholder="0 = disabled"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                {form.fingerprint_rotation_interval && form.fingerprint_rotation_interval > 0
+                  ? `Browser will restart every ${form.fingerprint_rotation_interval} minute${form.fingerprint_rotation_interval > 1 ? 's' : ''} with a new random fingerprint`
+                  : "Set to 0 to keep a fixed fingerprint seed"}
+              </p>
+            </div>
             <div>
               <label className="label">Color Scheme</label>
               <select

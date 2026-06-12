@@ -1,5 +1,3 @@
-"""SQLite database operations for browser profiles."""
-
 from __future__ import annotations
 
 import datetime
@@ -35,6 +33,7 @@ def init_db():
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 fingerprint_seed INTEGER NOT NULL,
+                fingerprint_rotation_interval INTEGER DEFAULT 0,
                 proxy TEXT,
                 timezone TEXT,
                 locale TEXT,
@@ -67,17 +66,16 @@ def init_db():
         """)
         conn.commit()
 
-        # Migrations for existing databases
         cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
-        if "clipboard_sync" not in cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN clipboard_sync BOOLEAN DEFAULT 1")
-            conn.commit()
-        if "launch_args" not in cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN launch_args TEXT DEFAULT '[]'")
-            conn.commit()
-        if "auto_launch" not in cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN auto_launch BOOLEAN DEFAULT 0")
-            conn.commit()
+        for col, default in [
+            ("clipboard_sync", "1"),
+            ("launch_args", "'[]'"),
+            ("auto_launch", "0"),
+            ("fingerprint_rotation_interval", "0"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE profiles ADD COLUMN {col} INTEGER DEFAULT {default}")
+                conn.commit()
 
 
 def _now() -> str:
@@ -98,14 +96,16 @@ def create_profile(
     with get_db() as conn:
         conn.execute(
             """INSERT INTO profiles (
-                id, name, fingerprint_seed, proxy, timezone, locale, platform,
+                id, name, fingerprint_seed, fingerprint_rotation_interval,
+                proxy, timezone, locale, platform,
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
                 clipboard_sync, auto_launch, color_scheme, launch_args, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
+                fields.get("fingerprint_rotation_interval", 0),
                 fields.get("proxy"),
                 fields.get("timezone"),
                 fields.get("locale"),
@@ -135,7 +135,7 @@ def create_profile(
             )
         conn.commit()
 
-    return get_profile(profile_id)  # type: ignore[return-value]
+    return get_profile(profile_id)
 
 
 def get_profile(profile_id: str) -> dict[str, Any] | None:
@@ -176,15 +176,14 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
 
     tags = fields.pop("tags", None)
 
-    # Only update fields that were explicitly provided
     update_cols = []
     update_vals = []
-    # Pre-serialize launch_args to JSON before the generic update loop
     if "launch_args" in fields:
         fields["launch_args"] = json.dumps(fields["launch_args"] or [])
 
     for col in (
-        "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
+        "name", "fingerprint_seed", "fingerprint_rotation_interval",
+        "proxy", "timezone", "locale", "platform",
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
         "clipboard_sync", "auto_launch", "color_scheme", "launch_args", "notes",
