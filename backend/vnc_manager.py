@@ -1,12 +1,18 @@
-"""KasmVNC display allocation and lifecycle management."""
+"""KasmVNC display allocation and lifecycle management.
+
+On platforms without KasmVNC (Windows, macOS without XQuartz), VNC is
+unavailable — browsers open natively in their own window instead.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass
 
 logger = logging.getLogger("cloakbrowser.manager.vnc")
 
@@ -18,6 +24,11 @@ class VNCInstance:
     process: subprocess.Popen | None = None
 
 
+def _xvnc_available() -> bool:
+    """Check if KasmVNC (Xvnc) is installed and runnable."""
+    return shutil.which("Xvnc") is not None
+
+
 class VNCManager:
     BASE_DISPLAY = 100
     BASE_WS_PORT = 6100
@@ -25,9 +36,24 @@ class VNCManager:
     def __init__(self):
         self._allocated: dict[int, VNCInstance] = {}
         self._lock = asyncio.Lock()
+        self._available: bool | None = None  # cached after first check
+
+    @property
+    def available(self) -> bool:
+        """Whether KasmVNC is available on this system."""
+        if self._available is None:
+            self._available = _xvnc_available()
+        return self._available
 
     async def allocate(self) -> tuple[int, int]:
-        """Returns (display_number, ws_port) for a new profile."""
+        """Returns (display_number, ws_port) for a new profile.
+
+        When VNC is unavailable, returns (0, 0) — the caller should
+        skip VNC setup and let the browser open natively.
+        """
+        if not self.available:
+            return 0, 0
+
         async with self._lock:
             display = self.BASE_DISPLAY
             while display in self._allocated:
@@ -42,12 +68,18 @@ class VNCManager:
         ws_port: int,
         width: int = 1920,
         height: int = 1080,
-    ) -> subprocess.Popen:
-        """Start Xvnc (KasmVNC) on the given display."""
+    ) -> subprocess.Popen | None:
+        """Start Xvnc (KasmVNC) on the given display.
+
+        Returns None when VNC is unavailable (caller should skip VNC).
+        """
+        if not self.available or display == 0:
+            logger.info("VNC unavailable — browser will open natively on desktop")
+            return None
+
         xvnc_bin = shutil.which("Xvnc") or "Xvnc"
 
         # KasmVNC requires -httpd to enable the WebSocket handler on the websocket port.
-        # Without it, the port accepts TCP but won't do WebSocket upgrade.
         httpd_dir = "/usr/share/kasmvnc/www"
 
         cmd = [
@@ -59,12 +91,13 @@ class VNCManager:
             "-depth", "24",
             "-SecurityTypes", "None",
             "-DisableBasicAuth",
-            "-interface", "127.0.0.1",  # internal only, proxied by FastAPI
+            "-interface", "127.0.0.1",
             "-AlwaysShared",
             "-httpd", httpd_dir,
         ]
 
-        log_path = f"/tmp/xvnc-{display}.log"
+        import tempfile
+        log_path = os.path.join(tempfile.gettempdir(), f"xvnc-{display}.log")
         logger.info("Starting Xvnc on :%d (ws_port=%d) log=%s", display, ws_port, log_path)
 
         log_file = open(log_path, "w")
@@ -73,7 +106,7 @@ class VNCManager:
             stdout=log_file,
             stderr=log_file,
         )
-        log_file.close()  # Popen inherited the fd, parent doesn't need it
+        log_file.close()
 
         # Wait a moment for Xvnc to initialize
         await asyncio.sleep(0.5)
@@ -95,6 +128,9 @@ class VNCManager:
 
     async def stop_vnc(self, display: int):
         """Kill Xvnc for given display and release allocation."""
+        if display == 0:
+            return
+
         async with self._lock:
             instance = self._allocated.pop(display, None)
 
@@ -118,6 +154,20 @@ class VNCManager:
 
     async def cleanup_stale(self):
         """Kill orphan Xvnc processes from previous runs."""
+        if not self.available:
+            return
+
+        if sys.platform == "win32":
+            # On Windows, use taskkill to clean up leftover Xvnc if somehow present
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "Xvnc.exe"],
+                    capture_output=True,
+                )
+            except FileNotFoundError:
+                pass
+            return
+
         try:
             result = subprocess.run(
                 ["pkill", "-f", r"Xvnc :[0-9]"],

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -174,14 +175,9 @@ class BrowserManager:
             self._launching.add(profile_id)
 
         display, ws_port = await self.vnc.allocate()
+        vnc_available = self.vnc.available
 
-        try:
-            cdp_port = self._allocate_cdp_port()
-        except ValueError:
-            async with self._lock:
-                self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
-            raise
+        cdp_port = self._allocate_cdp_port()
 
         # Clean stale Chromium lock files (left by previous container crashes)
         user_data_dir = Path(profile["user_data_dir"])
@@ -193,27 +189,32 @@ class BrowserManager:
         _init_profile_defaults(user_data_dir)
 
         try:
-            # Start KasmVNC on the allocated display
-            await self.vnc.start_vnc(
-                display,
-                ws_port,
-                width=profile.get("screen_width", 1920),
-                height=profile.get("screen_height", 1080),
-            )
+            # Start KasmVNC on the allocated display (if available)
+            if vnc_available:
+                await self.vnc.start_vnc(
+                    display,
+                    ws_port,
+                    width=profile.get("screen_width", 1920),
+                    height=profile.get("screen_height", 1080),
+                )
 
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
-            # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
+            # Normalize proxy format
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
                 _validate_proxy(proxy)
 
-            # Launch CloakBrowser on that display
-            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation
+            # Build env: on VNC, set DISPLAY; on native desktop, don't
+            launch_env = {**os.environ}
+            if vnc_available:
+                launch_env["DISPLAY"] = f":{display}"
+
+            # Launch CloakBrowser
             context = await launch_persistent_context_async(
                 user_data_dir=profile["user_data_dir"],
                 headless=bool(profile.get("headless", False)),
@@ -230,7 +231,7 @@ class BrowserManager:
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
                 },
-                env={**os.environ, "DISPLAY": f":{display}"},
+                env=launch_env,
             )
 
             # Inject clipboard listener: captures copied text on every page
@@ -380,9 +381,12 @@ class BrowserManager:
         """Build extra Chromium args from profile fingerprint settings."""
         args: list[str] = [
             "--disable-infobars",
-            "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
-            "--use-angle=swiftshader",  # software GL for VNC (no GPU in container)
+            "--test-type",
         ]
+        # Only use software GL when running via VNC (no GPU in container).
+        # On native desktop (Windows/macOS), hardware GL is available.
+        if self.vnc.available:
+            args.append("--use-angle=swiftshader")
 
         seed = profile.get("fingerprint_seed")
         if seed is not None:

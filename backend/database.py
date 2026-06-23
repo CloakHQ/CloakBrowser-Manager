@@ -4,14 +4,28 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import random
 import sqlite3
+import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("/data")
+
+
+def _get_data_dir() -> Path:
+    """Platform-appropriate data directory."""
+    if os.environ.get("CLOAKBROWSER_DATA_DIR"):
+        return Path(os.environ["CLOAKBROWSER_DATA_DIR"])
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return base / "cloakbrowser-manager"
+    return Path("/data")
+
+
+DATA_DIR = _get_data_dir()
 DB_PATH = DATA_DIR / "profiles.db"
 
 
