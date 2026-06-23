@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ClipboardCopy, Code2, Maximize2, Minimize2 } from "lucide-react";
+import { ClipboardCopy, Code2, Maximize2, Minimize2, Monitor } from "lucide-react";
 import { api } from "../lib/api";
 
 interface ProfileViewerProps {
@@ -20,6 +20,7 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
   const [fullscreen, setFullscreen] = useState(false);
   const [clipboardSync, setClipboardSync] = useState(initialClipboardSync);
   const [cdpCopied, setCdpCopied] = useState(false);
+  const [nativeDesktop, setNativeDesktop] = useState(false);
 
   useEffect(() => {
     let rfb: any = null;
@@ -48,10 +49,15 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           if (!cancelled) setConnected(true);
         });
 
-        rfb.addEventListener("disconnect", () => {
+        rfb.addEventListener("disconnect", (e: any) => {
           if (!cancelled) {
             setConnected(false);
-            onDisconnect();
+            // Check if VNC is unavailable (native desktop mode)
+            if (e.detail?.code === 4005) {
+              setNativeDesktop(true);
+            } else {
+              onDisconnect();
+            }
           }
         });
 
@@ -227,6 +233,46 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     container.addEventListener("wheel", handleWheel, { passive: false });
     return () => container.removeEventListener("wheel", handleWheel);
   }, []);
+
+  if (nativeDesktop) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center px-6">
+          <Monitor className="h-12 w-12 text-accent mx-auto mb-4" />
+          <p className="text-gray-300 text-sm font-medium mb-2">Browser running on your desktop</p>
+          <p className="text-gray-500 text-xs mb-4">
+            The browser window is open directly on your desktop — no VNC viewer needed.
+          </p>
+          {cdpUrl && (
+            <div className="mb-4">
+              <button
+                onClick={() => {
+                  const base = `${window.location.protocol}//${window.location.host}${cdpUrl}`;
+                  navigator.clipboard?.writeText(base).then(() => {
+                    setCdpCopied(true);
+                    setTimeout(() => setCdpCopied(false), 2000);
+                  }).catch(() => {});
+                }}
+                className="text-xs text-accent hover:underline flex items-center gap-1 mx-auto"
+              >
+                <Code2 className="h-3 w-3" />
+                {cdpCopied ? "CDP URL copied!" : "Copy CDP URL"}
+              </button>
+            </div>
+          )}
+          <button
+            onClick={() => {
+              setNativeDesktop(false);
+              onDisconnect();
+            }}
+            className="text-xs text-gray-400 hover:text-gray-200 underline"
+          >
+            Back to profile
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (error) {
     return (

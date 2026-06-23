@@ -589,10 +589,19 @@ _xclip_procs: dict[int, asyncio.subprocess.Process] = {}
 
 @app.post("/api/profiles/{profile_id}/clipboard")
 async def set_clipboard(profile_id: str, body: ClipboardRequest):
-    """Push text into the VNC session's X clipboard via xclip."""
+    """Push text into the VNC session's X clipboard via xclip.
+
+    On Windows / native desktop, clipboard push is not supported
+    (xclip is Linux-only). Returns success anyway so the frontend
+    doesn't error.
+    """
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+
+    if not browser_mgr.vnc.available or running.display == 0:
+        # Native desktop mode — clipboard is handled by the OS directly
+        return {"ok": True, "native": True}
 
     import os
 
@@ -647,7 +656,10 @@ async def get_clipboard(profile_id: str):
     except Exception as exc:
         logger.debug("Playwright clipboard read failed: %s", exc)
 
-    # Fallback: xclip for non-Chrome clipboard owners
+    # Fallback: xclip for non-Chrome clipboard owners (Linux/VNC only)
+    if not browser_mgr.vnc.available or running.display == 0:
+        return {"text": ""}
+
     import os
 
     env = {**os.environ, "DISPLAY": f":{running.display}"}
@@ -676,13 +688,21 @@ async def get_clipboard(profile_id: str):
 
 @app.websocket("/api/profiles/{profile_id}/vnc")
 async def vnc_proxy(websocket: WebSocket, profile_id: str):
-    """Proxy WebSocket frames between the frontend and a profile's KasmVNC."""
+    """Proxy WebSocket frames between the frontend and a profile's KasmVNC.
+
+    When VNC is unavailable (native desktop mode), reject the connection
+    so the frontend can show a "browser on desktop" view.
+    """
     if not await _check_websocket_origin(websocket):
         return
 
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
+        return
+
+    if not browser_mgr.vnc.available or running.ws_port == 0:
+        await websocket.close(code=4005, reason="VNC unavailable — browser running on desktop")
         return
 
     # Accept with client's requested subprotocol (if any) — RFC 6455 requires
@@ -816,8 +836,8 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
             )
 
             # Dump Xvnc log on disconnect
-            import os
-            xvnc_log = f"/tmp/xvnc-{running.display}.log"
+            import tempfile
+            xvnc_log = os.path.join(tempfile.gettempdir(), f"xvnc-{running.display}.log")
             if os.path.exists(xvnc_log):
                 with open(xvnc_log) as f:
                     log_content = f.read()
