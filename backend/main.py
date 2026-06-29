@@ -47,11 +47,12 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 # Optional authentication via AUTH_TOKEN env var.
 # If not set, all routes are open (local dev). If set, all /api/* routes
-# (except /api/auth/* and /api/status) require Bearer token or cookie.
+# (except /api/auth/status, /api/auth/login and /api/health) require Bearer
+# token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
-_AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
+_AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/health"})
 
 
 def _check_auth(scope: Scope) -> bool:
@@ -565,6 +566,16 @@ async def get_profile_status(profile_id: str):
 
 
 # ── System Status ─────────────────────────────────────────────────────────────
+
+
+@app.get("/api/health")
+async def health_check():
+    """Unauthenticated liveness probe for the Docker healthcheck.
+
+    Intentionally returns no system details; see /api/status (auth-gated)
+    for running counts and versions.
+    """
+    return {"status": "ok"}
 
 
 @app.get("/api/status", response_model=StatusResponse)

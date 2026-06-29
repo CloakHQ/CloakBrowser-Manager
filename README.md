@@ -173,7 +173,7 @@ When `AUTH_TOKEN` is set:
 - The web UI shows a login page. Enter the token to unlock.
 - API consumers pass the token via `Authorization: Bearer <token>` header.
 - VNC WebSocket connections are authenticated via the login cookie.
-- The `/api/status` endpoint remains unauthenticated (for Docker healthcheck).
+- The `/api/health` endpoint remains unauthenticated (for Docker healthcheck); it exposes no system details. The `/api/status` endpoint (running counts, version) now requires authentication.
 
 > **Note**: The auth token is transmitted in cleartext over HTTP. If you expose the Manager to the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, Traefik).
 
