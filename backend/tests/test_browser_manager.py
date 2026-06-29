@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import socket
+from unittest.mock import AsyncMock, MagicMock
 
 from backend.browser_manager import (
     BASE_CDP_PORT,
@@ -174,6 +175,55 @@ def test_launch_args_none_no_effect():
     base_count = len(args)
     args += profile.get("launch_args") or []
     assert len(args) == base_count
+
+
+# ── VNC browser window bounds ─────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_fit_window_to_vnc_moves_oversized_window_back_inside_framebuffer():
+    mgr = BrowserManager()
+    page = MagicMock()
+    session = MagicMock()
+    session.send = AsyncMock(
+        side_effect=[
+            {
+                "windowId": 123,
+                "bounds": {
+                    "left": 10,
+                    "top": 10,
+                    "width": 1928,
+                    "height": 1078,
+                    "windowState": "normal",
+                },
+            },
+            {
+                "windowId": 123,
+                "bounds": {
+                    "left": 0,
+                    "top": 0,
+                    "width": 1919,
+                    "height": 1079,
+                    "windowState": "normal",
+                },
+            },
+        ]
+    )
+    context = MagicMock()
+    context.pages = [page]
+    context.new_cdp_session = AsyncMock(return_value=session)
+
+    await mgr._fit_window_to_vnc(context, width=1920, height=1080)
+
+    context.new_cdp_session.assert_awaited_once_with(page)
+    session.send.assert_any_await("Browser.getWindowForTarget")
+    session.send.assert_any_await(
+        "Browser.setWindowBounds",
+        {
+            "windowId": 123,
+            "bounds": {"left": 0, "top": 0, "width": 1920, "height": 1080},
+        },
+    )
 
 
 # ── _allocate_cdp_port ───────────────────────────────────────────────────────

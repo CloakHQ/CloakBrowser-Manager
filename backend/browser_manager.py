@@ -233,6 +233,12 @@ class BrowserManager:
                 env={**os.environ, "DISPLAY": f":{display}"},
             )
 
+            await self._fit_window_to_vnc(
+                context,
+                width=profile.get("screen_width", 1920),
+                height=profile.get("screen_height", 1080),
+            )
+
             # Inject clipboard listener: captures copied text on every page
             # so the GET /clipboard endpoint can read it via page.evaluate()
             _clipboard_init_js = """
@@ -338,6 +344,45 @@ class BrowserManager:
     async def cleanup_stale(self):
         """Kill orphan processes from previous container runs."""
         await self.vnc.cleanup_stale()
+
+    async def _fit_window_to_vnc(self, context: Any, width: int, height: int) -> None:
+        """Keep the native browser window inside the VNC framebuffer."""
+        if not getattr(context, "pages", None):
+            logger.debug("Skipping VNC window fit: no pages available")
+            return
+
+        try:
+            session = await context.new_cdp_session(context.pages[0])
+            result = await session.send("Browser.getWindowForTarget")
+            bounds = result.get("bounds", {})
+            left = int(bounds.get("left", 0))
+            top = int(bounds.get("top", 0))
+            current_width = int(bounds.get("width", width))
+            current_height = int(bounds.get("height", height))
+
+            overflows = (
+                left != 0
+                or top != 0
+                or left + current_width > width
+                or top + current_height > height
+            )
+            if not overflows:
+                return
+
+            await session.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": result["windowId"],
+                    "bounds": {"left": 0, "top": 0, "width": width, "height": height},
+                },
+            )
+            logger.info(
+                "Adjusted browser window to fit VNC framebuffer %dx%d",
+                width,
+                height,
+            )
+        except Exception as exc:
+            logger.warning("Failed to adjust browser window bounds: %s", exc)
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
