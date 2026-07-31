@@ -1,8 +1,9 @@
 import { Play, Square, Loader2 } from "lucide-react";
 import { useState } from "react";
+import type { ProfileLifecycle } from "../lib/api";
 
 interface LaunchButtonProps {
-  status: "running" | "stopped";
+  status: ProfileLifecycle;
   onLaunch: () => Promise<void>;
   onStop: () => Promise<void>;
 }
@@ -29,7 +30,9 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
     }
   };
 
-  if (loading) {
+  // "starting" = the backend is already bringing this profile up (container
+  // restart / auto-launch queue). Launching again would just 409.
+  if (loading || status === "starting") {
     return (
       <button disabled className="btn-secondary opacity-60 cursor-not-allowed flex items-center gap-1.5">
         <Loader2 className="h-3.5 w-3.5 animate-spin" />

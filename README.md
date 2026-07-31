@@ -60,18 +60,61 @@ Each CloakBrowser profile generates a completely different device identity. To t
 - **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
-- **In-browser viewing** — interact with launched browsers via noVNC, directly in the web GUI
+- **In-browser viewing** — interact with launched browsers via KasmVNC's native web client, directly in the web GUI (JPEG/WebP + optional H.264/H.265/AV1 streaming)
 - **Playwright/Puppeteer API** — connect to any running profile programmatically via CDP, while still watching it live in the browser
 - **Optional authentication** — protect the web UI and API with a single token, or run wide open locally
 - **Powered by CloakBrowser** — 32 source-level C++ patches, passes Cloudflare Turnstile, 0.9 reCAPTCHA v3 score
 
 ## Stack
 
-- **Backend**: FastAPI (Python)
+- **Backend**: FastAPI (Python) — control plane only (profiles, lifecycle, auth, CDP proxy)
 - **Frontend**: React + Tailwind CSS
-- **Browser viewer**: noVNC (WebSocket-based VNC client)
+- **Browser viewer**: KasmVNC 1.5 native web client (matched server/client release)
+- **Data plane**: nginx — proxies the KasmVNC HTTP/WebSocket path directly; no framebuffer bytes pass through Python
 - **Database**: SQLite
 - **Browser engine**: [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) (stealth Chromium binary)
+
+## Architecture
+
+```
+CloakBrowser/Chromium
+  → KasmVNC 1.5 Xvnc (virtual X11 display, loopback-only WebSocket/HTTP)
+  → nginx :8080
+      ├── /api/*, SPA      → FastAPI (control plane, 127.0.0.1:8081)
+      └── /viewer/<token>/* → that profile's KasmVNC port (auth_request-gated)
+  → your browser (React SPA + native KasmVNC client in an iframe)
+```
+
+- The native KasmVNC client and server come from the **same pinned 1.5.0 package** — no protocol translation anywhere (the old noVNC compatibility bridge is gone).
+- Viewer access uses short-lived, per-profile opaque tokens issued by `POST /api/profiles/<id>/viewer-token`; nginx validates every viewer request (page, assets, WebSocket upgrade) through FastAPI's `/api/viewer-auth`. Kasm ports never leave loopback.
+- The Manager owns a reconnect state machine (backoff + jitter, offline/visibility handling, session-status classification). A viewer disconnect never stops the browser — reconnecting returns you to the same running session.
+- Server-authoritative encoding policy: 30 FPS cap, dynamic JPEG/WebP quality, video-mode downscale under motion, bounded encoder threads. Clients cannot override server encoding settings.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
+| `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
+| `KASM_RECT_THREADS` | `2` | Encoder compression threads per profile (`0` = auto/all cores — risky with many profiles) |
+| `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
+| `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI |
+
+### GPU acceleration (optional)
+
+Pass the host GPU into the container to enable KasmVNC DRI3 screen capture and VAAPI H.264/H.265/AV1 streaming encode (AMD/Intel open-source drivers; closed-source NVIDIA does not support DRI3):
+
+```bash
+docker run --device /dev/dri:/dev/dri -p 8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
+```
+
+With Compose, GPU passthrough is an opt-in overlay (Docker refuses to create a container when a mapped device node is missing, so the default file stays GPU-free):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+Without a GPU everything still works (software encoding).
 
 ## Development
 
@@ -172,7 +215,7 @@ When `AUTH_TOKEN` is set:
 
 - The web UI shows a login page. Enter the token to unlock.
 - API consumers pass the token via `Authorization: Bearer <token>` header.
-- VNC WebSocket connections are authenticated via the login cookie.
+- Viewer page + WebSocket connections are authorized through short-lived per-profile viewer tokens issued after login.
 - The `/api/status` endpoint remains unauthenticated (for Docker healthcheck).
 
 > **Note**: The auth token is transmitted in cleartext over HTTP. If you expose the Manager to the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, Traefik).

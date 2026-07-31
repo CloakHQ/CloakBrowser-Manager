@@ -1,9 +1,28 @@
 services:
   manager:
     build: .
+    # The entrypoint exits if nginx or uvicorn dies; this is what turns that
+    # into recovery instead of a permanently broken container.
+    restart: unless-stopped
+    # The entrypoint waits for uvicorn's lifespan to close every browser and
+    # Xvnc before stopping nginx. Docker's 10s default would SIGKILL PID 1
+    # mid-cleanup with more than a couple of profiles running, leaving exactly
+    # the unclean Chromium shutdown (and restore prompts) that ordering avoids.
+    stop_grace_period: 60s
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - ~/.cloakbrowser-manager:/data
     environment:
+      # Bare names pass the host value through when set and are ignored when
+      # not. Without these the tuning knobs the README documents have no effect
+      # under Compose — they only reached the container via `docker run -e`.
       - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - KASM_QUALITY_PRESET
+      - KASM_RECT_THREADS
+      - KASM_HW3D
+      - KASM_DRINODE
+    # GPU passthrough is opt-in — Docker hard-fails container creation when a
+    # `devices:` source path is missing, so mapping /dev/dri here would break
+    # every GPU-less host. Enable it with the override file instead:
+    #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d

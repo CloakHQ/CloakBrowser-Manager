@@ -93,13 +93,17 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  /** bumped on relaunch to remount the viewer with a fresh session. */
+  const [viewerEpoch, setViewerEpoch] = useState(0);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
 
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
     const profile = profiles.find((p) => p.id === id);
-    setView(profile?.status === "running" ? "view" : "edit");
+    // "starting" opens the viewer too — its state machine waits the
+    // profile out instead of showing a form for a session about to appear.
+    setView(profile && profile.status !== "stopped" ? "view" : "edit");
   }, [profiles]);
 
   const handleNew = useCallback(() => {
@@ -130,7 +134,14 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const handleLaunch = useCallback(async () => {
     if (!selectedId) return;
     const result = await launch(selectedId);
-    if (result) setView("view");
+    if (result) {
+      // Force a fresh viewer. Dropping the status gate on the render below
+      // means the component is NOT remounted by a relaunch, so a viewer
+      // sitting on "Browser session ended" would keep showing that overlay
+      // over a dead token and the launch would read as a failure.
+      setViewerEpoch((n) => n + 1);
+      setView("view");
+    }
   }, [selectedId, launch]);
 
   const handleStop = useCallback(async () => {
@@ -139,7 +150,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     setView("edit");
   }, [selectedId, stop]);
 
-  const handleVncDisconnect = useCallback(() => {
+  // Only terminal session end navigates away — transient network drops are
+  // handled by the viewer's own reconnect state machine while the view stays.
+  const handleSessionEnded = useCallback(() => {
     setView("edit");
   }, []);
 
@@ -242,13 +255,17 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             />
           )}
 
-          {view === "view" && selected && selected.status === "running" && (
+          {/* No status guard: the viewer owns its own terminal state. Gating on
+              the 3s profile poll would unmount it the instant the backend
+              reports "stopped", destroying the "Session ended" overlay (and the
+              only in-place way back) before the user ever sees it. */}
+          {view === "view" && selected && (
             <ProfileViewer
-              key={selected.id}
+              key={`${selected.id}:${viewerEpoch}`}
               profileId={selected.id}
               cdpUrl={selected.cdp_url}
               clipboardSync={selected.clipboard_sync}
-              onDisconnect={handleVncDisconnect}
+              onSessionEnded={handleSessionEnded}
             />
           )}
         </div>

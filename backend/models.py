@@ -100,7 +100,7 @@ class ProfileResponse(BaseModel):
     created_at: str
     updated_at: str
     tags: list[TagResponse] = []
-    status: str = "stopped"  # "running" | "stopped"
+    status: str = "stopped"  # "running" | "starting" | "stopped"
     vnc_ws_port: int | None = None
     cdp_url: str | None = None
 
@@ -120,10 +120,18 @@ class StatusResponse(BaseModel):
 
 
 class ProfileStatusResponse(BaseModel):
-    status: str  # "running" | "stopped"
+    status: str  # "running" | "starting" | "stopped"
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None
+    xvnc_alive: bool | None = None  # null when stopped
+    browser_alive: bool | None = None  # null when stopped
+
+
+class ViewerTokenResponse(BaseModel):
+    token: str
+    viewer_url: str
+    expires_in: int
 
 
 class ClipboardRequest(BaseModel):

@@ -17,6 +17,7 @@ frontend/dist/
 
 # Deploy
 deploy.sh
+.env
 
 # Claude Code
 .claude/
@@ -24,3 +25,7 @@ CLAUDE.md
 publish-docker.sh
 .beads
 debug
+
+# Agent scratch
+tmp/
+trash/

@@ -32,12 +32,41 @@ RUN echo "deb http://deb.debian.org/debian trixie contrib" >> /etc/apt/sources.l
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 
-# Install KasmVNC (auto-selects amd64 or arm64 based on build platform)
-ARG TARGETARCH
-RUN wget -q https://github.com/kasmtech/KasmVNC/releases/download/v1.3.3/kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb \
-    && apt-get update && apt-get install -y -f ./kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb \
-    && rm kasmvncserver_bookworm_1.3.3_${TARGETARCH}.deb \
+# nginx data plane + VA-API (AMD/Intel) + FFmpeg runtime libs for KasmVNC 1.5
+# in-band H.264/H.265/AV1 video streaming (dlopen'd at runtime; JPEG/WebP
+# fallback if absent)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx \
+    libva2 libva-drm2 mesa-va-drivers vainfo \
+    libavcodec61 libavformat61 libavutil59 libswscale8 \
     && rm -rf /var/lib/apt/lists/*
+
+# KasmVNC dlopens UNVERSIONED FFmpeg names (libavcodec.so etc.) which Debian
+# ships only in -dev packages — symlink them to the installed runtime libs.
+# Multi-arch safe: paths come from ldconfig, not hardcoded.
+RUN set -e; \
+    for lib in libavcodec libavformat libavutil libswscale; do \
+        target="$(ldconfig -p | grep -m1 "${lib}\.so\.[0-9]" | awk '{print $NF}')"; \
+        test -n "$target"; \
+        ln -sf "$target" "$(dirname "$target")/${lib}.so"; \
+    done; \
+    ldconfig
+
+# Install KasmVNC 1.5.0 (auto-selects amd64 or arm64 based on build platform),
+# SHA256-verified — build fails on mismatch
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) KASM_SHA256=80b241de7dfe53bba2b7e1cc5ac8c5246d72271efa16be2d4f76607f30fab1c4 ;; \
+        arm64) KASM_SHA256=fbb11589958a2acccd2d67f67944be79ac1e8e3a1d6172c0e6db6dc59e55a919 ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && wget -q https://github.com/kasmtech/KasmVNC/releases/download/v1.5.0/kasmvncserver_trixie_1.5.0_${TARGETARCH}.deb \
+    && echo "${KASM_SHA256}  kasmvncserver_trixie_1.5.0_${TARGETARCH}.deb" | sha256sum -c - \
+    && apt-get update && apt-get install -y -f ./kasmvncserver_trixie_1.5.0_${TARGETARCH}.deb \
+    && rm kasmvncserver_trixie_1.5.0_${TARGETARCH}.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/nginx.conf /etc/nginx/nginx.conf
 
 WORKDIR /app
 

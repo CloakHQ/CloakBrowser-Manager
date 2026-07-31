@@ -13,6 +13,7 @@ from backend.models import (
     StatusResponse,
     TagCreate,
     TagResponse,
+    ViewerTokenResponse,
 )
 
 
@@ -173,6 +174,28 @@ def test_profile_status_response_cdp_url():
 def test_profile_status_response_cdp_url_stopped():
     r = ProfileStatusResponse(status="stopped")
     assert r.cdp_url is None
+
+
+def test_profile_status_response_alive_defaults_null():
+    r = ProfileStatusResponse(status="stopped")
+    assert r.xvnc_alive is None
+    assert r.browser_alive is None
+
+
+def test_profile_status_response_alive_fields():
+    r = ProfileStatusResponse(status="running", xvnc_alive=True, browser_alive=False)
+    assert r.xvnc_alive is True
+    assert r.browser_alive is False
+
+
+# ── ViewerTokenResponse ──────────────────────────────────────────────────────
+
+
+def test_viewer_token_response():
+    r = ViewerTokenResponse(token="abc123", viewer_url="/viewer/abc123/", expires_in=300)
+    assert r.token == "abc123"
+    assert r.viewer_url == "/viewer/abc123/"
+    assert r.expires_in == 300
 
 
 # ── ProfileResponse ────────────────────────────────────────────────────────

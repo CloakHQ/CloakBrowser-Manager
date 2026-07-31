@@ -2,6 +2,10 @@
  * API client for CloakBrowser Manager backend.
  */
 
+/** Backend lifecycle state. "starting" = launch in flight (container
+ *  restart / auto-launch queue) — transient, never terminal. */
+export type ProfileLifecycle = "running" | "starting" | "stopped";
+
 export interface Profile {
   id: string;
   name: string;
@@ -29,7 +33,7 @@ export interface Profile {
   created_at: string;
   updated_at: string;
   tags: { tag: string; color: string | null }[];
-  status: "running" | "stopped";
+  status: ProfileLifecycle;
   vnc_ws_port: number | null;
   cdp_url: string | null;
 }
@@ -73,6 +77,18 @@ export interface SystemStatus {
   profiles_total: number;
 }
 
+export interface ViewerToken {
+  token: string;
+  viewer_url: string;
+  expires_in: number;
+}
+
+export interface ProfileStatus {
+  status: ProfileLifecycle;
+  xvnc_alive: boolean | null;
+  browser_alive: boolean | null;
+}
+
 class ApiError extends Error {
   constructor(
     public status: number,
@@ -88,12 +104,40 @@ export function setOnUnauthorized(cb: (() => void) | null) {
   _onUnauthorized = cb;
 }
 
+/**
+ * No browser applies a default fetch timeout. A connection that opens but never
+ * responds (a middlebox or tunnel dropping a half-open socket) hangs until the
+ * OS retransmit cap — minutes. The viewer's reconnect machine awaits these
+ * calls and serialises on them, so one stalled request stops automatic recovery
+ * for that entire window. Bound them instead: an abort surfaces as a rejection,
+ * which the state machine already handles by backing off and retrying.
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
+/**
+ * Lifecycle mutations legitimately run long and must NOT share the short
+ * budget: the backend allows a launch 60s (Xvnc readiness alone is 15s before
+ * Chromium even starts), stop closes a context plus up to 10s of Xvnc
+ * teardown, and delete rmtree's a profile directory that can be hundreds of
+ * MB. Aborting those client-side reports a failure for an operation the server
+ * completes anyway — and the next click then answers 409.
+ */
+const MUTATION_TIMEOUT_MS = 120_000;
+
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  // AbortSignal.timeout is unavailable in some test/older environments.
+  return typeof AbortSignal !== "undefined" && "timeout" in AbortSignal
+    ? AbortSignal.timeout(ms)
+    : undefined;
+}
+
 async function request<T>(
   path: string,
   options?: RequestInit,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<T> {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
+    signal: timeoutSignal(timeoutMs),
     ...options,
   });
   if (!res.ok) {
@@ -137,13 +181,19 @@ export const api = {
     }),
 
   deleteProfile: (id: string) =>
-    request<{ ok: boolean }>(`/api/profiles/${id}`, { method: "DELETE" }),
+    request<{ ok: boolean }>(
+      `/api/profiles/${id}`, { method: "DELETE" }, MUTATION_TIMEOUT_MS,
+    ),
 
   launchProfile: (id: string) =>
-    request<LaunchResult>(`/api/profiles/${id}/launch`, { method: "POST" }),
+    request<LaunchResult>(
+      `/api/profiles/${id}/launch`, { method: "POST" }, MUTATION_TIMEOUT_MS,
+    ),
 
   stopProfile: (id: string) =>
-    request<{ ok: boolean }>(`/api/profiles/${id}/stop`, { method: "POST" }),
+    request<{ ok: boolean }>(
+      `/api/profiles/${id}/stop`, { method: "POST" }, MUTATION_TIMEOUT_MS,
+    ),
 
   getStatus: () => request<SystemStatus>("/api/status"),
 
@@ -155,4 +205,12 @@ export const api = {
 
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
+
+  createViewerToken: (id: string) =>
+    request<ViewerToken>(`/api/profiles/${id}/viewer-token`, { method: "POST" }),
+
+  profileStatus: (id: string) =>
+    request<ProfileStatus>(`/api/profiles/${id}/status`),
 };
+
+export { ApiError };

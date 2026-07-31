@@ -1,0 +1,14 @@
+# GPU passthrough overlay — opt in only if the host actually has /dev/dri.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Enables KasmVNC DRI3 screen capture (-hw3d) and VAAPI H.264/H.265/AV1
+# streaming encode on AMD/Intel open-source drivers. Closed-source NVIDIA does
+# NOT support DRI3; the manager auto-detects that and stays on software encode.
+#
+# Docker fails container creation outright when a mapped device node does not
+# exist, which is why this lives outside the default compose file.
+services:
+  manager:
+    devices:
+      - "/dev/dri:/dev/dri"
