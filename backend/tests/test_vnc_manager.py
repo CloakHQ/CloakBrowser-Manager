@@ -235,8 +235,8 @@ def test_get_liveness_stopped():
     }
 
 
-def test_browser_alive_probes_the_cdp_port():
-    """A live CDP listener means the Chromium process is up."""
+def test_browser_alive_falls_back_to_the_port_without_a_recorded_process():
+    """No proc recorded (unreachable in production) -> the port is all we have."""
     import socket as socket_mod
     from backend.browser_manager import BrowserManager, RunningProfile
     from unittest.mock import MagicMock
@@ -250,6 +250,7 @@ def test_browser_alive_probes_the_cdp_port():
         mgr.running["abc"] = RunningProfile(
             profile_id="abc", context=MagicMock(), display=100, ws_port=6100, cdp_port=port,
         )
+        assert mgr.running["abc"].proc is None
         assert mgr.get_liveness("abc")["browser_alive"] is True
     finally:
         listener.close()
@@ -257,6 +258,77 @@ def test_browser_alive_probes_the_cdp_port():
     # port gone -> the browser is gone. context.pages could never report this:
     # Playwright implements it as a local list copy that cannot raise.
     assert mgr.get_liveness("abc")["browser_alive"] is False
+
+
+def _live_browser_process(cdp_port: int, pid: int | None = None, starttime=None):
+    """A BrowserProcess describing this test process (which is genuinely alive)."""
+    import os as os_mod
+    from backend.browser_manager import BrowserProcess, _proc_stat
+
+    me = os_mod.getpid()
+    stat = _proc_stat(me)
+    assert stat is not None
+    return BrowserProcess(
+        pid=me if pid is None else pid,
+        starttime=stat[2] if starttime is None else starttime,
+        user_data_dir="/data/profiles/abc",
+        cdp_port=cdp_port,
+    )
+
+
+def test_browser_alive_reports_dead_when_the_cdp_port_was_recycled():
+    """The harmful direction: something else on our old port is not our browser.
+
+    A false ALIVE keeps the viewer out of its browser-dead classification, so
+    it burns the whole MAX_ALIVE_RECONNECTS budget minting viewer tokens for a
+    Chromium that no longer exists.
+    """
+    import socket as socket_mod
+    from backend.browser_manager import BrowserManager, RunningProfile
+    from unittest.mock import MagicMock
+
+    listener = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        mgr = BrowserManager()
+        # our pid, but a starttime that is not ours: the textbook recycled pid
+        mgr.running["abc"] = RunningProfile(
+            profile_id="abc", context=MagicMock(), display=100, ws_port=6100,
+            cdp_port=port, proc=_live_browser_process(port, starttime=1),
+        )
+        assert _port_is_listening_helper(port) is True
+        assert mgr.get_liveness("abc")["browser_alive"] is False
+    finally:
+        listener.close()
+
+
+def test_browser_alive_reports_alive_before_the_port_is_up():
+    """A live process with nothing listening yet is starting, not dead."""
+    import socket as socket_mod
+    from backend.browser_manager import BrowserManager, RunningProfile
+    from unittest.mock import MagicMock
+
+    # a port nobody is listening on
+    probe = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+
+    mgr = BrowserManager()
+    mgr.running["abc"] = RunningProfile(
+        profile_id="abc", context=MagicMock(), display=100, ws_port=6100,
+        cdp_port=closed_port, proc=_live_browser_process(closed_port),
+    )
+    assert _port_is_listening_helper(closed_port) is False
+    assert mgr.get_liveness("abc")["browser_alive"] is True
+
+
+def _port_is_listening_helper(port: int) -> bool:
+    from backend.browser_manager import _port_is_listening
+
+    return _port_is_listening(port)
 
 
 # ── quality presets ──────────────────────────────────────────────────────────

@@ -1175,10 +1175,12 @@ class BrowserManager:
     async def get_liveness_async(self, profile_id: str) -> dict[str, Any]:
         """get_liveness() with the blocking probes off the event loop.
 
-        _browser_alive() opens a TCP connection; on loopback that is normally
-        instantaneous, but "normally" is not "always" and this runs in a request
-        handler on the single event loop that also serves nginx's viewer
-        auth_request subrequests.
+        These are filesystem and socket probes, not awaits: _browser_alive()
+        reads /proc (and still opens a TCP connection on its no-proc fallback),
+        and the Xvnc check probes its own process. On loopback and procfs that
+        is normally instantaneous, but "normally" is not "always" and this runs
+        in a request handler on the single event loop that also serves nginx's
+        viewer auth_request subrequests.
 
         Everything reachable from here must be read-only with respect to
         BrowserManager's dicts. The process probes it performs (Popen.poll,
@@ -1212,22 +1214,39 @@ class BrowserManager:
 
     @staticmethod
     def _browser_alive(running: RunningProfile) -> bool:
-        """Whether Chromium is still up, via its DevTools listener.
+        """Whether THIS Chromium — not merely something on its port — is up.
 
         Contract: this distinguishes DEAD from NOT-DEAD, not healthy from
-        hung. A SIGSTOPped Chromium still completes the TCP handshake from the
-        kernel's accept backlog, so it reports alive — verified.
+        hung. A SIGSTOPped Chromium is still a live process, so it reports
+        alive — verified.
 
-        `context.pages` is not usable here for a different reason than the
-        obvious one: Playwright implements it as `self._pages.copy()`, a local
-        list that is only updated when the DRIVER delivers a page-close event.
-        It empties correctly on a real crash, but it lies exactly when the
-        driver is unreachable — which is when liveness matters. The CDP port is
-        bound by the Chromium process and dies with it, so a loopback connect
-        is the more honest signal. Cheap either way: sub-millisecond when up,
-        immediate ECONNREFUSED when not.
+        Identity, not a port probe. A CDP port is an ordinary ephemeral port:
+        once our Chromium dies the kernel is free to hand it to anything, and
+        the manager itself rotates these ports across relaunches, so "something
+        is listening there" and "our browser is running" are different claims.
+        Answering the first when asked the second is a false ALIVE, which is
+        the harmful direction — the viewer never classifies browser-dead and
+        instead burns its whole MAX_ALIVE_RECONNECTS budget minting tokens
+        against a browser that no longer exists.
+
+        (pid, starttime) cannot be recycled that way, and process_is_alive
+        counts a zombie as dead — which matters here because PID 1 in this
+        container is the entrypoint shell and does not reap adopted children,
+        so a killed Chromium can sit in state 'Z' indefinitely.
+
+        `context.pages` is not usable for a different reason than the obvious
+        one: Playwright implements it as `self._pages.copy()`, a local list
+        only updated when the DRIVER delivers a page-close event. It empties
+        correctly on a real crash, but lies exactly when the driver is
+        unreachable — which is when liveness matters.
         """
-        return _port_is_listening(running.cdp_port)
+        if running.proc is None:
+            # Unreachable for a registered profile: launch fails closed when
+            # discovery returns None, which is what lets the teardown guard
+            # release on evidence. Kept because the field is Optional and a
+            # port probe is a better answer than asserting.
+            return _port_is_listening(running.cdp_port)
+        return process_is_alive(running.proc)
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown.
