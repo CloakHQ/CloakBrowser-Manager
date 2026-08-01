@@ -30,6 +30,10 @@ const mockApi = api as {
 };
 
 const ALIVE = { status: "running", xvnc_alive: true, browser_alive: true };
+const XVNC_DEAD = { status: "running", xvnc_alive: false, browser_alive: true };
+const BROWSER_DEAD = { status: "running", xvnc_alive: true, browser_alive: false };
+const STOPPED = { status: "stopped", xvnc_alive: null, browser_alive: null };
+const STOPPING = { status: "stopping", xvnc_alive: null, browser_alive: null };
 const TOK1 = { token: "tok-1", viewer_url: "/viewer/tok-1/", expires_in: 300 };
 const TOK2 = { token: "tok-2", viewer_url: "/viewer/tok-2/", expires_in: 300 };
 
@@ -48,6 +52,15 @@ function sendMessage(data: unknown, source: unknown = fakeContentWindow) {
 
 function sendConnectionState(value: string) {
   sendMessage({ action: "connection_state", value });
+}
+
+/**
+ * The incoming document's boot marker. The real client posts it exactly once
+ * per document, strictly before it can connect, and it is what hands the
+ * document gate over — a re-pointed iframe is ignored until it arrives.
+ */
+function bootDocument() {
+  sendConnectionState("init");
 }
 
 function setVisibility(value: string) {
@@ -163,7 +176,11 @@ describe("initial connect", () => {
     mockApi.createViewerToken.mockRejectedValue(new ApiError(401, "Unauthorized"));
     const { result } = setup();
     await flush();
-    expect(result.current.state).toBe("connecting");
+    // Terminal rather than a frozen "Connecting…": every timer is cleared by
+    // the halt, so a non-terminal state here renders no overlay, no button and
+    // has nothing left that could ever move it.
+    expect(result.current.state).toBe("fatal");
+    expect(result.current.endReason).toBe("Your session expired — sign in again");
     await advance(60_000);
     expect(mockApi.createViewerToken).toHaveBeenCalledTimes(1);
     expect(mockApi.profileStatus).not.toHaveBeenCalled();
@@ -227,6 +244,7 @@ describe("reconnect flow", () => {
     expect(result.current.state).toBe("connecting");
     expect(result.current.iframeSrc).toContain("tok-2");
 
+    act(() => bootDocument());
     act(() => sendConnectionState("connected"));
     expect(result.current.state).toBe("connected");
     expect(result.current.attempt).toBe(0);
@@ -395,8 +413,15 @@ describe("reconnect flow", () => {
     expect(result.current.attempt).toBe(1);
     expect(result.current.iframeSrc).toContain("tok-2");
 
-    // once the new document commits, its reports count again
+    // the load event is NOT the handover: it fires after subresources, so the
+    // outgoing document can still be posting when it lands
     act(() => result.current.handleIframeLoad());
+    act(() => sendConnectionState("disconnected"));
+    expect(result.current.state).toBe("connecting");
+    expect(result.current.attempt).toBe(1);
+
+    // the incoming document's own boot marker is
+    act(() => bootDocument());
     act(() => sendConnectionState("disconnected"));
     expect(result.current.state).toBe("reconnecting");
     expect(result.current.attempt).toBe(2);
@@ -407,7 +432,6 @@ describe("reconnect flow", () => {
     // Two xvnc-dead verdicts, then the CLIENT reconnects on its own (no probe
     // in between, so nothing else resets the counter). A later unrelated drop
     // must not have its first probe treated as the third in a row.
-    const XVNC_DEAD = { status: "running", xvnc_alive: false, browser_alive: true };
     mockApi.profileStatus.mockResolvedValue(XVNC_DEAD);
     const { result } = await reachConnected();
 
@@ -453,6 +477,7 @@ describe("reconnect flow", () => {
     act(() => sendConnectionState("disconnected"));
     mockApi.createViewerToken.mockResolvedValueOnce(TOK2);
     await advance(250);
+    act(() => bootDocument());
     act(() => sendConnectionState("connected"));
     expect(result.current.state).toBe("connected");
 
@@ -1051,5 +1076,533 @@ describe("debug log", () => {
       "connected->reconnecting",
     ]);
     expect(result.current.debugLog.every((e) => typeof e.at === "number")).toBe(true);
+  });
+});
+
+// ── document identity gate ──────────────────────────────────────────────────
+
+describe("document gate", () => {
+  async function reachConnected() {
+    const view = setup();
+    await flush();
+    act(() => bootDocument());
+    act(() => sendConnectionState("connected"));
+    return view;
+  }
+
+  /** connected → real drop → probe → fresh token: two live documents, one WindowProxy. */
+  async function reachHandover() {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = await reachConnected();
+    act(() => sendConnectionState("disconnected"));
+    mockApi.createViewerToken.mockResolvedValueOnce(TOK2);
+    await advance(250);
+    expect(view.result.current.state).toBe("connecting");
+    expect(view.result.current.iframeSrc).toContain("tok-2");
+    return view;
+  }
+
+  it("accepts the first document's reports before any init", async () => {
+    // Nothing else can be posting yet, so there is no ambiguity to resolve —
+    // and gating the very first load would mean a client that never reaches
+    // "init" could never connect at all.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("ignores a 'connected' from the outgoing document until the incoming one boots", async () => {
+    const { result } = await reachHandover();
+    const tokens = mockApi.createViewerToken.mock.calls.length;
+
+    // the outgoing document's own 2s retry succeeds one beat too late
+    act(() => sendConnectionState("connected"));
+    expect(result.current.state).toBe("connecting");
+
+    // ...and its unload then posts the matching close, which used to abort the
+    // cycle that was about to succeed and mint yet another token
+    act(() => sendConnectionState("disconnected"));
+    expect(result.current.state).toBe("connecting");
+    expect(result.current.attempt).toBe(1);
+    expect(mockApi.createViewerToken.mock.calls.length).toBe(tokens);
+
+    // the replacement boots: its reports count from here
+    act(() => bootDocument());
+    act(() => sendConnectionState("connected"));
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("accepts noVNC_initialized as the handover too", async () => {
+    const { result } = await reachHandover();
+    act(() => sendMessage({ action: "noVNC_initialized", value: null }));
+    act(() => sendConnectionState("connected"));
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("ignores a stale idle_session_timeout from the outgoing document", async () => {
+    const { result } = await reachHandover();
+    act(() => sendMessage({ action: "idle_session_timeout", value: "Idle" }));
+    expect(result.current.state).toBe("connecting");
+    expect(result.current.attempt).toBe(1);
+
+    // the live document's idle report is still acted on
+    act(() => bootDocument());
+    act(() => sendMessage({ action: "idle_session_timeout", value: "Idle" }));
+    expect(result.current.state).toBe("reconnecting");
+    expect(result.current.attempt).toBe(2);
+  });
+
+  it("keeps the attempt counter monotonic across a stale connected/disconnected pair", async () => {
+    // Support reads this number off the overlay; a message from a document we
+    // are in the middle of replacing must not reset it to 0.
+    const { result } = await reachHandover();
+    expect(result.current.attempt).toBe(1);
+    act(() => sendConnectionState("connected"));
+    expect(result.current.attempt).toBe(1);
+    act(() => sendConnectionState("disconnected"));
+    expect(result.current.attempt).toBe(1);
+    expect(result.current.debugLog.map((e) => `${e.from}->${e.to}`)).toEqual([
+      "idle->connecting",
+      "connecting->connected",
+      "connected->reconnecting",
+      "reconnecting->connecting",
+    ]);
+  });
+
+  it("a flapping outgoing document cannot defeat the data-plane budget", async () => {
+    // Every accepted stale 'connected' used to reset aliveReconnects, so
+    // MAX_ALIVE_RECONNECTS (10) was unreachable: an unbounded loop minting a
+    // viewer token per lap that never reached a terminal state.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = await reachConnected();
+    act(() => sendConnectionState("disconnected"));
+
+    for (let i = 0; i < 60 && result.current.state !== "session-ended"; i++) {
+      await advance(15_000); // backoff/probe → alive → fresh token
+      await advance(15_000); // connect watchdog
+      act(() => sendConnectionState("connected"));
+      act(() => sendConnectionState("disconnected"));
+    }
+
+    expect(result.current.state).toBe("session-ended");
+    expect(result.current.endReason).toContain("Can't reach this browser session");
+    expect(mockApi.createViewerToken.mock.calls.length).toBeLessThanOrEqual(12);
+  });
+});
+
+// ── classification ──────────────────────────────────────────────────────────
+
+describe("classification", () => {
+  async function reachReconnecting() {
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    return view;
+  }
+
+  it("profile stopping → session-ended with the shutting-down reason", async () => {
+    mockApi.profileStatus.mockResolvedValue(STOPPING);
+    const { result } = await reachReconnecting();
+
+    await advance(250);
+    expect(result.current.state).toBe("session-ended");
+    expect(result.current.endReason).toBe("Browser session is shutting down");
+
+    await advance(120_000);
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("never treats 'stopping' as transient", async () => {
+    // Routing it to the "starting" branch spins forever by construction: that
+    // branch has no failure budget and only a user action ends a teardown.
+    // Meanwhile /viewer-token 404s and /viewer-auth 403s for this profile, so
+    // there is no path from here back to a usable session.
+    mockApi.profileStatus.mockResolvedValue(STOPPING);
+    const { result } = await reachReconnecting();
+
+    await advance(250);
+    await advance(1_000);
+    await advance(2_000);
+    expect(result.current.state).not.toBe("reconnecting");
+    expect(result.current.state).toBe("session-ended");
+  });
+
+  it("resume probe that finds the profile stopping ends the session", async () => {
+    mockApi.profileStatus.mockResolvedValue(STOPPING);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(view.result.current.state).toBe("session-ended");
+    expect(view.result.current.endReason).toBe("Browser session is shutting down");
+  });
+
+  it("running but browser dead → escalates with the browser message", async () => {
+    mockApi.profileStatus.mockResolvedValue(BROWSER_DEAD);
+    const { result } = await reachReconnecting();
+
+    await advance(250); // probe 1
+    expect(result.current.state).toBe("reconnecting");
+    await advance(1_000); // probe 2
+    expect(result.current.state).toBe("reconnecting");
+    await advance(2_000); // probe 3 → escalate
+    expect(result.current.state).toBe("session-ended");
+    expect(result.current.endReason).toBe("Browser process stopped");
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it("alternating xvnc-dead / browser-dead still escalates", async () => {
+    // A dying box answers these alternately (the browser check is a real CDP
+    // round-trip that times out intermittently). A per-class counter resets on
+    // every flip, so the escalation was unreachable and no other budget
+    // applies to these verdicts — the machine retried for the life of the tab.
+    let flip = false;
+    mockApi.profileStatus.mockImplementation(async () => {
+      flip = !flip;
+      return flip ? XVNC_DEAD : BROWSER_DEAD;
+    });
+    const { result } = await reachReconnecting();
+
+    for (let i = 0; i < 20 && result.current.state !== "session-ended"; i++) {
+      await advance(20_000);
+    }
+    expect(result.current.state).toBe("session-ended");
+    expect(["Display server stopped", "Browser process stopped"]).toContain(
+      result.current.endReason,
+    );
+  });
+});
+
+// ── escape hatches and failure bounds ───────────────────────────────────────
+
+describe("escape hatches", () => {
+  async function reachStalledReconnect() {
+    mockApi.profileStatus.mockReturnValue(new Promise(() => {})); // never settles
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    return view;
+  }
+
+  it("keeps the degraded button visible across a manual retry", async () => {
+    // The click used to destroy the only affordance "reconnecting" has:
+    // clearAllTimers() plus degraded = false, and armDegradedTimer is reached
+    // only from scheduleReconnect — which an outstanding probe never reaches.
+    const { result } = await reachStalledReconnect();
+    await advance(60_000);
+    expect(result.current.degraded).toBe(true);
+
+    await act(async () => {
+      result.current.reconnectNow();
+    });
+    expect(result.current.degraded).toBe(true);
+
+    await advance(600_000);
+    expect(result.current.state).toBe("reconnecting");
+    expect(result.current.degraded).toBe(true);
+  });
+
+  it("a probe started by reconnectNow gets its own degraded deadline", async () => {
+    const { result } = await reachStalledReconnect();
+    await advance(10_000); // probe outstanding, not degraded yet
+    expect(result.current.degraded).toBe(false);
+
+    await act(async () => {
+      result.current.reconnectNow();
+    });
+    expect(result.current.degraded).toBe(false);
+
+    await advance(60_000);
+    expect(result.current.state).toBe("reconnecting");
+    expect(result.current.degraded).toBe(true);
+  });
+
+  it("exposes that a probe is in flight while the countdown is blank", async () => {
+    // nextRetryAt is null for the whole probe (up to the 15s abort budget), so
+    // the overlay drops its countdown and renders nothing in its place.
+    let resolveProbe: (v: unknown) => void = () => {};
+    mockApi.profileStatus.mockReturnValue(
+      new Promise((r) => {
+        resolveProbe = r;
+      }),
+    );
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    expect(view.result.current.probing).toBe(false);
+
+    await advance(250); // retry fires → probe starts
+    expect(view.result.current.nextRetryAt).toBeNull();
+    expect(view.result.current.probing).toBe(true);
+
+    // ...and it clears again as soon as the probe has produced a decision
+    await act(async () => {
+      resolveProbe(XVNC_DEAD);
+    });
+    expect(view.result.current.probing).toBe(false);
+    expect(view.result.current.nextRetryAt).not.toBeNull();
+  });
+
+  it("escalates after repeated total loss of the control plane", async () => {
+    // One failure is no evidence (the viewer socket never touches FastAPI),
+    // but nothing bounded the run: a dead uplink that fires no "offline" event
+    // left the machine on a green dot, failing every heartbeat in silence.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    mockApi.profileStatus.mockRejectedValue(new TypeError("Failed to fetch"));
+    await advance(45_000);
+    expect(result.current.state).toBe("connected");
+    await advance(45_000);
+    expect(result.current.state).toBe("connected");
+    await advance(45_000);
+    expect(result.current.state).toBe("reconnecting");
+  });
+
+  it("does not escalate when a failed heartbeat is followed by a good one", async () => {
+    // Guards the counter against being implemented as "escalate on any failure".
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    for (let i = 0; i < 4; i++) {
+      mockApi.profileStatus.mockRejectedValueOnce(new ApiError(502, "Bad Gateway"));
+      await advance(45_000);
+      expect(result.current.state).toBe("connected");
+      await advance(45_000); // a good probe resets the streak
+      expect(result.current.state).toBe("connected");
+    }
+  });
+
+  it("a halted session is not restarted by a tab switch or an online event", async () => {
+    mockApi.createViewerToken.mockRejectedValue(new ApiError(401, "Unauthorized"));
+    mockApi.profileStatus.mockRejectedValue(new ApiError(401, "Unauthorized"));
+    const { result } = setup();
+    await flush();
+    expect(mockApi.createViewerToken).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await advance(60_000);
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await advance(60_000);
+
+    expect(mockApi.createViewerToken).toHaveBeenCalledTimes(1);
+    expect(mockApi.profileStatus).not.toHaveBeenCalled();
+    expect(result.current.state).toBe("fatal");
+  });
+
+  it("an online burst does not restart a connect that has only just started", async () => {
+    // Each restart minted a token, reloaded the whole client and re-armed the
+    // watchdog, so a connect could never finish while the events kept coming.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    expect(result.current.state).toBe("connecting");
+
+    await act(async () => {
+      for (let i = 0; i < 20; i++) window.dispatchEvent(new Event("online"));
+    });
+    expect(mockApi.createViewerToken.mock.calls.length).toBeLessThanOrEqual(2);
+
+    // ...but a connect that has been sitting there does get restarted
+    mockApi.createViewerToken.mockResolvedValueOnce(TOK2);
+    await advance(5_000);
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(result.current.iframeSrc).toContain("tok-2");
+  });
+
+  it("a superseded probe's tail does not discard its replacement's verdict", async () => {
+    // The abandoned probe re-arms "so a consumed retry always has a successor"
+    // — but that bumps `generation`, which makes the live replacement stale and
+    // throws away the connect() it was about to run.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+
+    let resolveFirst: (v: unknown) => void = () => {};
+    mockApi.profileStatus.mockReturnValueOnce(
+      new Promise((r) => {
+        resolveFirst = r;
+      }),
+    );
+    await advance(250); // probe 1 starts and hangs
+
+    let resolveSecond: (v: unknown) => void = () => {};
+    mockApi.profileStatus.mockReturnValueOnce(
+      new Promise((r) => {
+        resolveSecond = r;
+      }),
+    );
+    await act(async () => {
+      view.result.current.reconnectNow(); // probe 2 starts and hangs
+    });
+
+    await act(async () => {
+      resolveFirst(ALIVE); // the abandoned probe finally answers
+    });
+    mockApi.createViewerToken.mockResolvedValueOnce(TOK2);
+    await act(async () => {
+      resolveSecond(ALIVE);
+    });
+
+    expect(view.result.current.state).toBe("connecting");
+    expect(view.result.current.iframeSrc).toContain("tok-2");
+  });
+});
+
+// ── client self-reconnect grace window ──────────────────────────────────────
+
+describe("client self-reconnect grace", () => {
+  async function reachConnected() {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    return view;
+  }
+
+  it("takes over when the client's own retry does not recover", async () => {
+    const { result } = await reachConnected();
+    act(() => sendConnectionState("reconnecting"));
+    expect(result.current.state).toBe("connected"); // client owns it for now
+
+    await advance(12_000); // CLIENT_RECONNECT_GRACE_MS
+    expect(result.current.state).toBe("reconnecting");
+    expect(result.current.debugLog.at(-1)?.reason).toBe(
+      "client self-reconnect did not recover",
+    );
+  });
+
+  it("stands down when the client recovers inside the grace window", async () => {
+    const { result } = await reachConnected();
+    const tokens = mockApi.createViewerToken.mock.calls.length;
+
+    act(() => sendConnectionState("reconnecting"));
+    await advance(5_000);
+    act(() => sendConnectionState("connected")); // same document, no new init
+    expect(result.current.state).toBe("connected");
+    expect(result.current.attempt).toBe(0);
+
+    // the takeover timer must be disarmed, not merely outrun
+    await advance(30_000);
+    expect(result.current.state).toBe("connected");
+    expect(mockApi.createViewerToken.mock.calls.length).toBe(tokens);
+  });
+});
+
+// ── state-machine invariant ─────────────────────────────────────────────────
+
+describe("liveness invariant", () => {
+  /**
+   * No non-terminal state may be reachable with nothing armed and nothing for
+   * the user to click. Terminal states are exempt: ProfileViewer renders their
+   * endReason with "Try again" (reconnectNow) and "Back to profile".
+   */
+  function assertHasAWayOut(state: string, degraded: boolean, endReason: string | null) {
+    if (state === "session-ended" || state === "fatal") {
+      expect(endReason).not.toBeNull();
+      return;
+    }
+    expect(state).not.toBe("idle"); // only pre-start(); unreachable afterwards
+    expect(vi.getTimerCount() > 0 || degraded).toBe(true);
+  }
+
+  const check = (r: { current: { state: string; degraded: boolean; endReason: string | null } }) =>
+    assertHasAWayOut(r.current.state, r.current.degraded, r.current.endReason);
+
+  it("connecting, connected and reconnecting always have a live timer", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    expect(result.current.state).toBe("connecting"); // watchdog
+    check(result);
+
+    act(() => sendConnectionState("connected")); // heartbeat + stable timer
+    expect(result.current.state).toBe("connected");
+    check(result);
+
+    act(() => sendConnectionState("disconnected")); // retry + degraded timers
+    expect(result.current.state).toBe("reconnecting");
+    check(result);
+
+    await advance(30_000); // through a probe/connect cycle
+    check(result);
+  });
+
+  it("reconnecting has a way out with a probe outstanding, before and after a manual retry", async () => {
+    mockApi.profileStatus.mockReturnValue(new Promise(() => {}));
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    await advance(250); // probe started, nothing else scheduled but the deadline
+    check(result);
+
+    await advance(60_000); // deadline fires → the button is the way out
+    expect(result.current.degraded).toBe(true);
+    check(result);
+
+    await act(async () => {
+      result.current.reconnectNow();
+    });
+    check(result);
+    await advance(600_000);
+    check(result);
+  });
+
+  it("offline reconnecting keeps the slow re-check armed", async () => {
+    const nav = navigator as unknown as { onLine: boolean };
+    const realOnLine = Object.getOwnPropertyDescriptor(Navigator.prototype, "onLine");
+    Object.defineProperty(nav, "onLine", { value: false, configurable: true });
+    try {
+      mockApi.profileStatus.mockResolvedValue(ALIVE);
+      const { result } = setup();
+      await flush();
+      act(() => sendConnectionState("connected"));
+      act(() => sendConnectionState("disconnected"));
+      expect(result.current.offline).toBe(true);
+      expect(result.current.nextRetryAt).toBeNull();
+      check(result);
+    } finally {
+      if (realOnLine) Object.defineProperty(Navigator.prototype, "onLine", realOnLine);
+      Object.defineProperty(nav, "onLine", { value: true, configurable: true });
+    }
+  });
+
+  it("terminal states always carry a message for their overlay", async () => {
+    mockApi.profileStatus.mockResolvedValue(STOPPED);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    await advance(250);
+    expect(result.current.state).toBe("session-ended");
+    check(result);
+
+    mockApi.createViewerToken.mockRejectedValue(new ApiError(400, "Bad Request"));
+    await act(async () => {
+      result.current.reconnectNow();
+    });
+    expect(result.current.state).toBe("fatal");
+    check(result);
   });
 });
