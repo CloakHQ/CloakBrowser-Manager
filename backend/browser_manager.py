@@ -26,6 +26,132 @@ class ProfileAlreadyRunning(RuntimeError):
     """A launch lost the race to another launch (or to a delete in progress)."""
 
 
+# Chromium's GL backend. SwiftShader (CPU) is the correct default: the base
+# image has no GPU, and a headed Chromium that cannot reach one draws nothing at
+# all unless it is told to rasterise in software.
+#
+# --use-angle=swiftshader alone is NOT interchangeable with "no GPU flags". With
+# it removed on a GPU-less box Chromium probes for a GL driver, fails, and falls
+# back anyway — but only after a multi-second GPU-process crash-and-retry cycle
+# that shows up as a blank viewer, so the flag stays the explicit default.
+_GPU_MODE_SWIFTSHADER = "swiftshader"
+_GPU_MODE_NVIDIA = "nvidia"
+
+# Presence of the NVIDIA control device is the detection signal. It is created
+# by the NVIDIA container runtime as part of the same injection that supplies
+# libEGL_nvidia/libnvidia-encode, so it is true exactly when the GPU is actually
+# reachable from inside the container — unlike a host-level nvidia-smi check, or
+# probing /dev/dri (which exists on any host with an integrated GPU and says
+# nothing about which vendor drives it).
+_NVIDIA_CONTROL_DEVICE = "/dev/nvidiactl"
+
+# Chromium 146 flags for the NVIDIA path. Deliberately short — every one is here
+# for a reason that was MEASURED on an RTX 3080 Ti under KasmVNC's Xvnc, because
+# the failure mode of a wrong GL flag is silent (SwiftShader or llvmpipe, with
+# the GPU attached and idle) rather than loud.
+#
+#   --use-gl=angle --use-angle=vulkan
+#       The backend that actually reaches the GPU for a HEADED browser here.
+#       ANGLE's Vulkan backend does not need the X server to expose a
+#       GPU-capable GLX/EGL, which is the whole problem under Xvnc: the closed
+#       NVIDIA driver has no DRI3 and no NV-GLX there.
+#
+#       This is NOT the gl-egl pairing that CloakBrowser PR #476 landed, and
+#       the difference is the point. Measured, same host, same X server:
+#         gl-egl, as-is        -> ANGLE (Mesa, llvmpipe ...)      SOFTWARE
+#         gl-egl + NVIDIA ICD  -> ANGLE (NVIDIA ... RTX 3080 Ti)
+#                                 but webgl=enabled_readback and
+#                                 gpu_compositing=DISABLED_SOFTWARE
+#         vulkan               -> ANGLE (NVIDIA, Vulkan 1.4.312 ...)
+#                                 webgl=enabled, gpu_compositing=ENABLED,
+#                                 rasterization=enabled_force, webgpu=enabled
+#       So gl-egl either lands on llvmpipe or wins the renderer and then loses
+#       the compositor to a readback path; Vulkan is the only one of the three
+#       that gets both. PR #476 concluded headed sessions stay software-rendered
+#       under a virtual X server — that holds for the EGL path it changed, and
+#       is what --use-angle=vulkan gets past.
+#
+#       --use-gl=egl is not an option at all: it is DEPRECATED in modern
+#       Chromium and silently DISABLES WebGL rather than enabling the GPU, which
+#       is the defect PR #476 exists to fix. It reads like the right flag, so it
+#       has its own regression test.
+#   --enable-gpu-rasterization
+#       Rasterise on the GPU, not just composite there. Measured as
+#       rasterization=enabled_force; without it tile raster stays on the CPU,
+#       which is most of the win on a page that is not WebGL.
+#   --ignore-gpu-blocklist
+#       Chromium blocklists drivers it cannot identify, and an X server it does
+#       not recognise is a reliable way to land on that path.
+#
+# Not included, and why: --disable-gpu-sandbox is unnecessary because the
+# stealth defaults already pass --no-sandbox; --disable-gpu-driver-bug-workarounds
+# turns off correctness fixes for a benchmark number nobody is reading here.
+#
+# Fingerprinting is unaffected, which was checked rather than assumed: with
+# these flags JS still reads the SPOOFED renderer (measured: a page asking for
+# UNMASKED_RENDERER_WEBGL got "NVIDIA GeForce RTX 5080 Laptop GPU ... 565.77" on
+# a host whose real GPU is a 3080 Ti on driver 580.173.02).
+_NVIDIA_GPU_FLAGS = (
+    "--use-gl=angle",
+    "--use-angle=vulkan",
+    "--enable-gpu-rasterization",
+    "--ignore-gpu-blocklist",
+)
+
+# Insurance for the fallback, not the primary path. If Vulkan is unavailable
+# (older driver, missing /etc/vulkan/icd.d/nvidia_icd.json) ANGLE falls back to
+# its GL/EGL backend, and there the GLVND loader picks a vendor from
+# /usr/share/glvnd/egl_vendor.d — where Mesa's 50_mesa.json sits next to the
+# injected 10_nvidia.json. Measured: left to itself it chose Mesa and bound
+# llvmpipe. Pinning the NVIDIA manifest makes the degraded path "GPU with
+# readback" instead of "silently on the CPU". Ignored entirely when Vulkan works.
+_NVIDIA_GPU_ENV = {
+    "__EGL_VENDOR_LIBRARY_FILENAMES": "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+}
+
+
+def _chrome_gpu_mode() -> str:
+    """Resolve CHROME_GPU_ACCEL (auto/1/true/yes/nvidia/0/false/no) to a mode."""
+    raw = os.environ.get("CHROME_GPU_ACCEL", "auto").strip().lower()
+    if raw in ("0", "false", "no", "off", _GPU_MODE_SWIFTSHADER):
+        logger.info("Chromium GPU acceleration disabled (CHROME_GPU_ACCEL=%s)", raw)
+        return _GPU_MODE_SWIFTSHADER
+    if raw in ("1", "true", "yes", "on", _GPU_MODE_NVIDIA):
+        # Forced: no device check. Someone who passes the GPU in a way this
+        # detection does not recognise should still be able to say so.
+        logger.info("Chromium NVIDIA GPU acceleration forced (CHROME_GPU_ACCEL=%s)", raw)
+        return _GPU_MODE_NVIDIA
+    if raw != "auto":
+        # An unrecognised value used to be impossible to notice: it would fall
+        # through to whichever branch happened to be last.
+        logger.warning("Unknown CHROME_GPU_ACCEL=%r, falling back to 'auto'", raw)
+    if os.path.exists(_NVIDIA_CONTROL_DEVICE):
+        logger.info(
+            "Chromium NVIDIA GPU acceleration enabled (auto: %s present)",
+            _NVIDIA_CONTROL_DEVICE,
+        )
+        return _GPU_MODE_NVIDIA
+    logger.info(
+        "Chromium GPU acceleration off (auto: no %s, so no GPU was passed in)",
+        _NVIDIA_CONTROL_DEVICE,
+    )
+    return _GPU_MODE_SWIFTSHADER
+
+
+def _chrome_gpu_flags() -> list[str]:
+    """Chromium GL flags for the resolved GPU mode."""
+    if _chrome_gpu_mode() == _GPU_MODE_NVIDIA:
+        return list(_NVIDIA_GPU_FLAGS)
+    return ["--use-angle=swiftshader"]
+
+
+def _chrome_gpu_env() -> dict[str, str]:
+    """Environment overlay for the resolved GPU mode (see _NVIDIA_GPU_ENV)."""
+    if _chrome_gpu_mode() == _GPU_MODE_NVIDIA:
+        return dict(_NVIDIA_GPU_ENV)
+    return {}
+
+
 def _normalize_proxy(raw: str) -> str:
     """Convert common proxy formats to http://user:pass@host:port.
 
@@ -646,8 +772,11 @@ class BrowserManager:
                 },
                 # No DISPLAY for headless: there is no X server, and passing
                 # a dead one makes Chromium retry an X connection it cannot make.
-                env=({**os.environ, "DISPLAY": f":{display}"}
-                     if display is not None else dict(os.environ)),
+                # _chrome_gpu_env() only pins the EGL vendor for the GPU
+                # fallback path — see _NVIDIA_GPU_ENV.
+                env=({**os.environ, **_chrome_gpu_env(), "DISPLAY": f":{display}"}
+                     if display is not None
+                     else {**os.environ, **_chrome_gpu_env()}),
             )
 
             # Give the claim the identity it was missing. Discovery is the only
@@ -1327,8 +1456,12 @@ class BrowserManager:
         args: list[str] = [
             "--disable-infobars",
             "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
-            "--use-angle=swiftshader",  # software GL for VNC (no GPU in container)
         ]
+        # SwiftShader unless a GPU was actually passed into the container —
+        # see _chrome_gpu_flags. These come first so a profile's own
+        # launch_args can still override them (the launcher deduplicates by
+        # flag key, last writer wins).
+        args += _chrome_gpu_flags()
 
         seed = profile.get("fingerprint_seed")
         if seed is not None:

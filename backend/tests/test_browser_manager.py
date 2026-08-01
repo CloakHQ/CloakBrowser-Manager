@@ -102,11 +102,121 @@ def test_validate_no_port():
 _mgr = BrowserManager()
 
 
-def test_build_args_always_includes_base():
+def test_build_args_always_includes_base(monkeypatch: pytest.MonkeyPatch):
+    # Pin the GL backend explicitly. Left on 'auto' this assertion depends on
+    # whether the machine running the tests happens to have /dev/nvidiactl —
+    # it passes on CI and fails on any developer box with an NVIDIA GPU.
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
     args = _mgr._build_fingerprint_args({})
     assert "--disable-infobars" in args
     assert "--test-type" in args
     assert "--use-angle=swiftshader" in args
+
+
+def test_build_args_uses_gpu_flags_when_enabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "nvidia")
+    args = _mgr._build_fingerprint_args({})
+    assert "--use-angle=vulkan" in args
+    assert "--use-gl=angle" in args
+    # Chromium takes the LAST --use-angle, so emitting both would make the
+    # backend depend on argv order.
+    assert "--use-angle=swiftshader" not in args
+
+
+def test_gpu_env_only_set_in_gpu_mode(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
+    assert bm._chrome_gpu_env() == {}
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "nvidia")
+    assert bm._chrome_gpu_env()["__EGL_VENDOR_LIBRARY_FILENAMES"].endswith(
+        "10_nvidia.json"
+    )
+
+
+# ── _chrome_gpu_mode / _chrome_gpu_flags ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "swiftshader"])
+def test_gpu_mode_disabled_values(monkeypatch: pytest.MonkeyPatch, value: str):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", value)
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_SWIFTSHADER
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "nvidia"])
+def test_gpu_mode_forced_values_skip_device_detection(
+    monkeypatch: pytest.MonkeyPatch, value: str,
+):
+    """Forcing must not consult the device node.
+
+    A GPU can be passed in ways this detection does not recognise, and an
+    operator who says "yes, it is there" should not be overruled by it.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", value)
+    monkeypatch.setattr(bm.os.path, "exists", lambda _: False)
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_NVIDIA
+
+
+def test_gpu_mode_auto_detects_nvidia_device(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "auto")
+    monkeypatch.setattr(
+        bm.os.path, "exists", lambda p: p == bm._NVIDIA_CONTROL_DEVICE,
+    )
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_NVIDIA
+
+
+def test_gpu_mode_auto_without_device_stays_software(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "auto")
+    monkeypatch.setattr(bm.os.path, "exists", lambda _: False)
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_SWIFTSHADER
+    assert bm._chrome_gpu_flags() == ["--use-angle=swiftshader"]
+
+
+def test_gpu_mode_defaults_to_auto_when_unset(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CHROME_GPU_ACCEL", raising=False)
+    monkeypatch.setattr(bm.os.path, "exists", lambda _: False)
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_SWIFTSHADER
+
+
+def test_gpu_mode_unknown_value_warns_and_falls_back_to_auto(
+    monkeypatch: pytest.MonkeyPatch, caplog,
+):
+    """A typo must not silently pick a branch.
+
+    'auto' is the safe landing spot: it still enables the GPU when one is
+    actually present, so a misspelling degrades to detection rather than to a
+    hard software fallback the operator did not ask for.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "nvida")
+    monkeypatch.setattr(
+        bm.os.path, "exists", lambda p: p == bm._NVIDIA_CONTROL_DEVICE,
+    )
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.browser"):
+        assert bm._chrome_gpu_mode() == bm._GPU_MODE_NVIDIA
+    assert "Unknown CHROME_GPU_ACCEL" in caplog.text
+
+
+def test_nvidia_flags_never_include_the_deprecated_use_gl_egl():
+    """--use-gl=egl silently DISABLES WebGL on modern Chromium.
+
+    It reads like the flag that turns on EGL, which is why it keeps coming
+    back; CloakBrowser PR #476 exists because of it.
+    """
+    flags = list(bm._NVIDIA_GPU_FLAGS)
+    assert "--use-gl=egl" not in flags
+    assert "--use-gl=angle" in flags
+
+
+def test_nvidia_backend_is_vulkan_not_gl_egl():
+    """gl-egl is the SOFTWARE path here, despite looking like the GPU one.
+
+    Measured headed on KasmVNC's Xvnc, same host: --use-angle=gl-egl binds
+    "ANGLE (Mesa, llvmpipe)" because NVIDIA's EGL declines the X11 platform on
+    an X server it does not drive and GLVND falls through to Mesa. Pinning the
+    NVIDIA EGL manifest recovers the renderer but leaves
+    gpu_compositing=disabled_software. Only the Vulkan backend gets both, so
+    this asserts the distinction rather than merely "some GPU flag is present".
+    """
+    assert "--use-angle=vulkan" in bm._NVIDIA_GPU_FLAGS
+    assert "--use-angle=gl-egl" not in bm._NVIDIA_GPU_FLAGS
 
 
 def test_build_args_seed():
@@ -144,10 +254,16 @@ def test_build_args_screen():
     assert "--fingerprint-screen-height=1440" in args
 
 
-def test_build_args_empty_profile():
+def test_build_args_empty_profile(monkeypatch: pytest.MonkeyPatch):
+    """An empty profile contributes nothing beyond the base args.
+
+    The GL backend is pinned because it is no longer a fixed single flag —
+    on 'auto' the count varies with whether the host running the tests has an
+    NVIDIA device, which is not something this test is trying to assert.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
     args = _mgr._build_fingerprint_args({})
-    # Only the 3 base args
-    assert len(args) == 3
+    assert args == ["--disable-infobars", "--test-type", "--use-angle=swiftshader"]
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────
