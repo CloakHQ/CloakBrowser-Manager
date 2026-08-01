@@ -489,6 +489,46 @@ def test_viewer_auth_success(app_client: TestClient):
     main.browser_mgr.running.pop(pid, None)
 
 
+def test_viewer_auth_rejects_a_token_from_a_previous_launch(app_client: TestClient):
+    """A token whose epoch does not match the live session is refused.
+
+    Unreachable over HTTP as the code stands — every teardown path revokes
+    before `running` can be replaced (see
+    test_teardown_revokes_before_the_profile_can_be_relaunched). This exercises
+    the guard directly, because the whole point of keeping it is to catch a
+    future reorder of that ordering: without it a surviving token would be
+    handed the NEW session's upstream and the NEW display's credentials.
+    """
+    create = app_client.post("/api/profiles", json={"name": "ViewerStale"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)  # session_epoch == "epoch-under-test"
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-from-a-dead-launch")
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Viewer token is stale"
+    # and nginx is told nothing it could route on
+    assert "X-Viewer-Upstream" not in resp.headers
+
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_auth_rejects_a_token_for_a_different_ws_port(app_client: TestClient):
+    """The second assertion, which cannot fire on its own but must still hold."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerPort"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)  # ws_port == 6100
+    token = main.viewer_tokens.issue(pid, 6199, session_epoch="epoch-under-test")
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 403
+    assert "X-Viewer-Upstream" not in resp.headers
+
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
 def test_viewer_auth_injects_kasm_basic_auth(app_client: TestClient, monkeypatch):
     """When per-display Kasm credentials exist, viewer-auth hands them to nginx."""
     create = app_client.post("/api/profiles", json={"name": "ViewerAuth"})

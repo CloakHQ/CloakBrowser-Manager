@@ -578,10 +578,23 @@ async def viewer_auth(request: Request):
     # live display. If a token ever outlives a relaunch, mixing the two would
     # point nginx at a stale port while handing it valid-looking auth for a
     # different display.
-    # The epoch, not the port, is what makes this check real: allocate()
-    # gap-fills from BASE_DISPLAY up, so a stop+relaunch of the same profile
-    # deterministically returns the identical display and ws_port and the port
-    # comparison alone can never fire. It is kept as a cheap second assertion.
+    #
+    # Be clear about what this is: NEITHER comparison can fire today. Every
+    # path that clears `running` — stop(), _on_browser_closed() and DELETE —
+    # revokes the profile's tokens first, so a token that reaches here always
+    # belongs to the session currently in `running` and validate() has already
+    # rejected the rest. That ordering is the real defence, and it is pinned by
+    # test_teardown_revokes_before_the_profile_can_be_relaunched.
+    #
+    # It is kept because it is the only thing standing between a future reorder
+    # of that ordering and cross-session authorization: a surviving token would
+    # otherwise be handed the NEW session's upstream and the NEW display's
+    # credentials. This turns that into a clean 403 instead.
+    #
+    # The epoch is what does the work; the port is a free second assertion that
+    # cannot fire on its own, because allocate() gap-fills from BASE_DISPLAY up
+    # and a stop+relaunch of the same profile deterministically returns the
+    # identical display and ws_port.
     if session.session_epoch != running.session_epoch or session.ws_port != running.ws_port:
         logger.info("Viewer token for profile %s predates a relaunch", session.profile_id)
         raise HTTPException(status_code=403, detail="Viewer token is stale")

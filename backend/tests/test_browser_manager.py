@@ -488,6 +488,64 @@ async def test_close_context_bounded_does_not_trust_is_closed(monkeypatch):
     assert await bm._close_context_bounded(context, "p1") is False
 
 
+# ── viewer-token revocation ordering ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["stop", "closed"])
+async def test_teardown_revokes_before_the_profile_can_be_relaunched(monkeypatch, path):
+    """No teardown may leave a live token behind once `running` is clear.
+
+    This is the premise that makes /api/viewer-auth's epoch check unreachable,
+    and it is the property that actually protects the session: a token that
+    outlived its launch would be authorized against the NEXT one, handed that
+    session's upstream port and that display's Kasm credentials.
+
+    Asserted at the moment of removal, not afterwards, because "revoked
+    eventually" is not the same guarantee — a launch racing into the gap is
+    precisely the case the epoch check exists to backstop.
+    """
+    from backend.viewer_tokens import viewer_tokens
+
+    mgr = BrowserManager()
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.close = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    running = bm.RunningProfile(
+        profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+    )
+    mgr.running["p1"] = running
+    token = viewer_tokens.issue("p1", 6100, session_epoch=running.session_epoch)
+    assert viewer_tokens.validate(token) is not None
+
+    # Record whether the profile was still registered when revocation ran, so a
+    # future reorder that revokes too late is caught here rather than in prod.
+    observed: list[bool] = []
+    real_revoke = viewer_tokens.revoke_profile
+
+    def spy(profile_id: str) -> None:
+        observed.append(profile_id in mgr.running)
+        real_revoke(profile_id)
+
+    monkeypatch.setattr(viewer_tokens, "revoke_profile", spy)
+
+    try:
+        if path == "stop":
+            await mgr.stop("p1")
+        else:
+            await mgr._on_browser_closed("p1", context)
+
+        assert observed, "teardown did not revoke this profile's viewer tokens"
+        assert observed[-1] is False, "revoked while still registered as running"
+        assert "p1" not in mgr.running
+        assert viewer_tokens.validate(token) is None
+    finally:
+        monkeypatch.setattr(viewer_tokens, "revoke_profile", real_revoke)
+        viewer_tokens.revoke_profile("p1")
+
+
 # ── cleanup_all / auto_launch_all ────────────────────────────────────────────
 
 
