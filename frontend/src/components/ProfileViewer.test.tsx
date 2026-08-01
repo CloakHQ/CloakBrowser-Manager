@@ -106,6 +106,87 @@ describe("ProfileViewer", () => {
     expect(container.querySelector("iframe")).toBeInTheDocument();
   });
 
+  it("offers Reconnect now once the reconnect loop has been degraded for 60s", async () => {
+    // The reconnecting overlay covers the frame and swallows pointer input, so
+    // this button is the ONLY manual escape from a non-terminal reconnect
+    // loop. The hook's `degraded` flag is tested at the hook level; what is
+    // tested here is that the component actually renders the escape hatch it
+    // gates, and that pressing it mints a new token instead of just clearing
+    // the overlay.
+    vi.useFakeTimers();
+    mockApi.profileStatus.mockReturnValue(new Promise(() => {})); // never settles
+    const { container } = render(
+      <ProfileViewer
+        profileId="p1"
+        cdpUrl={null}
+        clipboardSync={false}
+        onSessionEnded={() => {}}
+      />,
+    );
+    await act(async () => {});
+
+    const iframe = container.querySelector("iframe")!;
+    const send = (value: string) => {
+      const ev = new Event("message");
+      Object.defineProperty(ev, "data", {
+        value: { action: "connection_state", value },
+      });
+      Object.defineProperty(ev, "source", { value: iframe.contentWindow });
+      window.dispatchEvent(ev);
+    };
+
+    act(() => send("connected"));
+    act(() => send("disconnected"));
+    expect(screen.queryByText("Reconnect now")).not.toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByText("Still trying…")).toBeInTheDocument();
+    const button = screen.getByText("Reconnect now");
+
+    // The stuck probe is what left the user here; let the replacement one
+    // answer so the click has an observable end-to-end effect.
+    const tokensBefore = mockApi.createViewerToken.mock.calls.length;
+    mockApi.profileStatus.mockResolvedValue({
+      status: "running",
+      xvnc_alive: true,
+      browser_alive: true,
+    });
+    await act(async () => {
+      button.click();
+    });
+    await act(async () => {});
+    expect(mockApi.createViewerToken.mock.calls.length).toBe(tokensBefore + 1);
+  });
+
+  it("swallows wheel events over the display surface (issue #186)", async () => {
+    // The iframe consumes wheel over the canvas, but the surrounding surface
+    // does not: without a non-passive preventDefault a wheel gesture near the
+    // edges scrolls the page behind the viewer and, on horizontal wheels,
+    // triggers browser back-navigation out of the session entirely.
+    const { container } = render(
+      <ProfileViewer
+        profileId="p1"
+        cdpUrl={null}
+        clipboardSync={false}
+        onSessionEnded={() => {}}
+      />,
+    );
+    await act(async () => {});
+
+    const surface = container.querySelector("iframe")!.parentElement!;
+    const event = new WheelEvent("wheel", {
+      cancelable: true,
+      bubbles: true,
+      deltaX: -120,
+    });
+    act(() => {
+      surface.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+  });
+
   it("shows the session-ended overlay and wires the back button", async () => {
     vi.useFakeTimers();
     mockApi.profileStatus.mockResolvedValue({

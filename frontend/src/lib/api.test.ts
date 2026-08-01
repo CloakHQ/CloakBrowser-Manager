@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { api } from "./api";
+import { api, ApiError, setOnUnauthorized, PROFILE_LIFECYCLES } from "./api";
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -60,14 +60,76 @@ describe("api.listProfiles", () => {
     expect(list).toBeLessThanOrEqual(15_000); // recovery-path reads stay tight
   });
 
-  it("bounds every request so a stalled connection cannot hang forever", async () => {
-    // The viewer's reconnect machine serialises on these calls; an unbounded
-    // fetch turns "the server stopped answering" into "recovery stops".
-    mockFetch.mockResolvedValueOnce(jsonResponse([]));
-    await api.listProfiles();
-    const init = mockFetch.mock.calls[0][1] as RequestInit;
-    expect(init.signal).toBeInstanceOf(AbortSignal);
-    expect(init.signal!.aborted).toBe(false);
+});
+
+// ── request bounding ────────────────────────────────────────────────────────
+
+/**
+ * Every exported api method with arguments good enough to reach fetch(). Typed
+ * as a Record over `keyof typeof api` so a new endpoint is a compile error here
+ * — the previous version of the bounding test below exercised `listProfiles`
+ * alone, which meant `createViewerToken` and `profileStatus` (the two calls the
+ * reconnect machine actually serialises on) could be made unbounded with the
+ * whole suite green.
+ */
+const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
+  authStatus: [],
+  login: ["tok"],
+  logout: [],
+  listProfiles: [],
+  getProfile: ["p1"],
+  createProfile: [{ name: "New" }],
+  updateProfile: ["p1", { name: "New" }],
+  deleteProfile: ["p1"],
+  launchProfile: ["p1"],
+  stopProfile: ["p1"],
+  getStatus: [],
+  setClipboard: ["p1", "hello"],
+  getClipboard: ["p1"],
+  createViewerToken: ["p1"],
+  profileStatus: ["p1"],
+};
+
+describe("request bounding", () => {
+  it("covers every exported api method", () => {
+    // The Record type catches an endpoint added to api.ts; this catches one
+    // deleted from api.ts but left in the table (which would silently stop
+    // testing nothing at all).
+    expect(Object.keys(CALL_ARGS).sort()).toEqual(Object.keys(api).sort());
+  });
+
+  it.each(Object.keys(CALL_ARGS) as (keyof typeof api)[])(
+    "api.%s bounds its request so a stalled connection cannot hang forever",
+    async (name) => {
+      // No browser applies a default fetch timeout, and `request()` builds its
+      // init as `{ signal: timeoutSignal(...), ...options }` — so any method
+      // whose own options carry a `signal` key silently wins the spread and
+      // becomes unbounded. The viewer's reconnect machine awaits
+      // createViewerToken and profileStatus inside its in-flight guard, so one
+      // unbounded call turns "the server stopped answering" into "recovery
+      // stops" for the OS retransmit window (minutes).
+      mockFetch.mockResolvedValueOnce(jsonResponse({}));
+      await (api[name] as (...args: unknown[]) => Promise<unknown>)(...CALL_ARGS[name]);
+      const init = mockFetch.mock.calls[0][1] as RequestInit;
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(init.signal!.aborted).toBe(false);
+    },
+  );
+});
+
+// ── lifecycle union ─────────────────────────────────────────────────────────
+
+describe("ProfileLifecycle", () => {
+  it("pins the lifecycle set to exactly the four backend states", () => {
+    // Changing this list is a tsc error in all three Record<ProfileLifecycle,…>
+    // consumers (App's VIEW_ON_SELECT, LaunchButton's BUSY_LABEL,
+    // StatusIndicator's DOT_CLASS) AND a failure here, so a new backend state
+    // cannot land as a silent fall-through the way "stopping" would have:
+    // an enabled "Launch" that 409s, a grey "stopped" dot, and the viewer
+    // opening on a profile whose /viewer-token 404s.
+    expect([...PROFILE_LIFECYCLES]).toEqual([
+      "running", "starting", "stopping", "stopped",
+    ]);
   });
 });
 
@@ -176,5 +238,43 @@ describe("error handling", () => {
       json: () => Promise.reject(new Error("not json")),
     });
     await expect(api.getStatus()).rejects.toThrow("Internal Server Error");
+  });
+
+  it("routes a 401 to the global unauthorized handler as well as the caller", async () => {
+    // Without this wiring an expired AUTH_TOKEN cookie leaves the user on a
+    // dead dashboard: the ApiError still reaches the caller (isAuthError in
+    // useViewerSession matches on status alone), so nothing throws — App just
+    // never learns to swap in the LoginPage and every poll 401s forever.
+    const onUnauthorized = vi.fn();
+    setOnUnauthorized(onUnauthorized);
+    try {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        json: () => Promise.resolve({ detail: "Unauthorized" }),
+      });
+      const err = await api.profileStatus("p1").catch((e) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.status).toBe(401);
+      expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    } finally {
+      setOnUnauthorized(null);
+    }
+  });
+
+  it("still rejects with ApiError(401) when no unauthorized handler is registered", async () => {
+    // The handler is null between App mounts (and in every other consumer of
+    // api.ts); the 401 must not become a different error class there.
+    setOnUnauthorized(null);
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+      json: () => Promise.resolve({ detail: "Unauthorized" }),
+    });
+    const err = await api.profileStatus("p1").catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(401);
   });
 });

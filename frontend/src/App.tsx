@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
-import { api, setOnUnauthorized, type ProfileCreateData } from "./lib/api";
+import { api, setOnUnauthorized, type ProfileCreateData, type ProfileLifecycle } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -11,6 +11,23 @@ import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
 type View = "empty" | "create" | "edit" | "view";
+
+/**
+ * Which pane selecting a profile opens. A Record over the whole lifecycle union
+ * rather than a `!== "stopped"` test, so a new backend state has to be routed
+ * deliberately instead of defaulting into the viewer.
+ *   running/starting → the viewer: "starting" has a session on the way and the
+ *     reconnect machine waits it out rather than showing a form for it.
+ *   stopping → the FORM. The manager has already dropped the profile out of
+ *     `running`, so /viewer-token 404s: mounting the viewer would only render
+ *     "Browser session ended" a moment later.
+ */
+const VIEW_ON_SELECT: Record<ProfileLifecycle, View> = {
+  running: "view",
+  starting: "view",
+  stopping: "edit",
+  stopped: "edit",
+};
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -101,9 +118,12 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
     const profile = profiles.find((p) => p.id === id);
-    // "starting" opens the viewer too — its state machine waits the
-    // profile out instead of showing a form for a session about to appear.
-    setView(profile && profile.status !== "stopped" ? "view" : "edit");
+    if (!profile) return setView("edit");
+    // Headless first, before lifecycle: such a profile allocates no display
+    // and no Xvnc, so /viewer-token answers 409 and the viewer could only ever
+    // render its "Connection failed" overlay for a browser that is running
+    // perfectly well. CDP is the handle on a headless profile, not the viewer.
+    setView(profile.headless ? "edit" : VIEW_ON_SELECT[profile.status]);
   }, [profiles]);
 
   const handleNew = useCallback(() => {
@@ -134,6 +154,11 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const handleLaunch = useCallback(async () => {
     if (!selectedId) return;
     const result = await launch(selectedId);
+    if (result && selected?.headless) {
+      // Launched, but there is nothing to view — stay on the form.
+      setView("edit");
+      return;
+    }
     if (result) {
       // Force a fresh viewer. Dropping the status gate on the render below
       // means the component is NOT remounted by a relaunch, so a viewer
@@ -142,8 +167,12 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
       setViewerEpoch((n) => n + 1);
       setView("view");
     }
-  }, [selectedId, launch]);
+  }, [selectedId, launch, selected?.headless]);
 
+  // Explicit Stop navigates away rather than letting the viewer reach its
+  // "Browser session ended" overlay: the user asked for this, so the overlay
+  // would be telling them something they just did. The overlay is for the
+  // cases they did NOT ask for — a crash, an external stop, a dead display.
   const handleStop = useCallback(async () => {
     if (!selectedId) return;
     await stop(selectedId);

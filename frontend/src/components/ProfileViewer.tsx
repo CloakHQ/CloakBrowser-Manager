@@ -150,7 +150,12 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           />
         )}
 
-        {/* Reconnecting: dim the last frame, keep the iframe mounted */}
+        {/* Reconnecting: keep the iframe mounted so the client can recover in
+            place. NOTE the overlay dims a BLANK pane, not the last frame —
+            measured: the embedded KasmVNC client destroys its framebuffer
+            canvas on disconnect, so there is nothing left underneath. Keeping
+            the iframe still matters (a remount would drop the session), the
+            visual just is not a frozen screenshot. */}
         {session.state === "reconnecting" && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/60 px-4 text-center">
             {session.offline ? (

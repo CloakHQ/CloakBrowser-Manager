@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, act, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import App from "./App";
+import type { ProfileLifecycle } from "./lib/api";
 
 vi.mock("./lib/api", () => {
   class ApiError extends Error {
@@ -31,7 +32,7 @@ import { api } from "./lib/api";
 
 const mockApi = api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 
-function profile(status: "running" | "stopped") {
+function profile(status: ProfileLifecycle) {
   return {
     id: "p1",
     name: "Test Profile",
@@ -90,6 +91,58 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+});
+
+describe("selecting a profile routes to the pane that can actually work", () => {
+  it("opens the viewer for a running profile", async () => {
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.getByTitle("Browser session")).toBeInTheDocument();
+  });
+
+  it("opens the viewer for a starting profile and waits it out", async () => {
+    mockApi.listProfiles.mockResolvedValue([profile("starting")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.getByTitle("Browser session")).toBeInTheDocument();
+  });
+
+  it("opens the form, not the viewer, for a stopping profile", async () => {
+    // Teardown is in flight: the manager has already dropped the profile out
+    // of `running`, so /viewer-token 404s. Routing here into the viewer mounts
+    // a session only to replace it with "Browser session ended" one round-trip
+    // later — and burns a token request doing it.
+    mockApi.listProfiles.mockResolvedValue([profile("stopping")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.queryByTitle("Browser session")).not.toBeInTheDocument();
+    expect(mockApi.createViewerToken).not.toHaveBeenCalled();
+    expect(screen.getByText("Save")).toBeInTheDocument();
+  });
+
+  it("opens the form for a stopped profile", async () => {
+    mockApi.listProfiles.mockResolvedValue([profile("stopped")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.queryByTitle("Browser session")).not.toBeInTheDocument();
+    expect(screen.getByText("Save")).toBeInTheDocument();
+  });
 });
 
 describe("viewer lifecycle vs the 3s profile poll", () => {
@@ -186,5 +239,42 @@ describe("viewer lifecycle vs the 3s profile poll", () => {
     expect(screen.queryByText("Browser session ended")).not.toBeInTheDocument();
     expect(mockApi.createViewerToken).toHaveBeenCalledTimes(2);
     expect((screen.getByTitle("Browser session") as HTMLIFrameElement).src).toContain("tok-2");
+  });
+});
+
+describe("headless profiles have no viewer", () => {
+  it("selecting a RUNNING headless profile opens the form, not the viewer", async () => {
+    // A headless profile allocates no display and no Xvnc, so /viewer-token
+    // answers 409 and the viewer could only ever render "Connection failed"
+    // for a browser that is running perfectly well.
+    mockApi.listProfiles.mockResolvedValue([
+      { ...profile("running"), headless: true },
+    ]);
+    render(<App />);
+    await flush();
+
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+
+    expect(screen.queryByTitle("Browser session")).not.toBeInTheDocument();
+    expect(mockApi.createViewerToken).not.toHaveBeenCalled();
+  });
+
+  it("a headed running profile still opens the viewer", async () => {
+    mockApi.listProfiles.mockResolvedValue([
+      { ...profile("running"), headless: false },
+    ]);
+    render(<App />);
+    await flush();
+
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+
+    expect(screen.getByTitle("Browser session")).toBeInTheDocument();
+    expect(mockApi.createViewerToken).toHaveBeenCalledWith("p1");
   });
 });

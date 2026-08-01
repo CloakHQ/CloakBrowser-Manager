@@ -454,6 +454,22 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               />
               Launch automatically when container starts
             </label>
+            {/* The form has always SUBMITTED headless; it just never rendered a
+                control for it, so the option was unreachable from the UI. */}
+            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.headless ?? false}
+                onChange={(e) => set("headless", e.target.checked)}
+                className="rounded border-border bg-surface-2"
+              />
+              <span>
+                Headless
+                <span className="block text-xs text-gray-500">
+                  No display and no viewer — drive it over CDP. Uses no Xvnc.
+                </span>
+              </span>
+            </label>
             <div>
               <label className="label">Color Scheme</label>
               <select

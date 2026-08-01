@@ -2,9 +2,35 @@
  * API client for CloakBrowser Manager backend.
  */
 
-/** Backend lifecycle state. "starting" = launch in flight (container
- *  restart / auto-launch queue) — transient, never terminal. */
-export type ProfileLifecycle = "running" | "starting" | "stopped";
+/** Backend lifecycle state.
+ *  running  = a live RunningProfile exists; xvnc_alive/browser_alive carry the
+ *             real probe results.
+ *  starting = launch in flight or queued behind auto-launch (container
+ *             restart / auto-launch queue) — transient, never terminal.
+ *  stopping = teardown in progress; the browser is being closed and
+ *             launch/stop are refused with 409 until it completes. The manager
+ *             has already dropped the profile out of `running`, so
+ *             /viewer-token 404s and /api/viewer-auth 403s: transient for the
+ *             profile, but NOT recoverable for an open viewer session.
+ *  stopped  = nothing held for this profile.
+ *  ProfileStatus.xvnc_alive/browser_alive are null for "stopping" exactly as
+ *  they are for "stopped" — there is no RunningProfile left to probe.
+ *
+ *  Declared as a runtime tuple, not a bare union, so the set is assertable in a
+ *  test: tsconfig excludes *.test.ts from `tsc`, so a type-only pin would never
+ *  actually be checked. Adding a value here is a compile error in every
+ *  Record<ProfileLifecycle, …> consumer (App's VIEW_ON_SELECT,
+ *  LaunchButton's BUSY_LABEL, StatusIndicator's DOT_CLASS) — which is the
+ *  point: the previous three-value union was compile-checked in exactly one of
+ *  them, so "stopping" would have fallen through to an enabled Launch button
+ *  and a viewer opened on a profile whose /viewer-token 404s. */
+export const PROFILE_LIFECYCLES = [
+  "running",
+  "starting",
+  "stopping",
+  "stopped",
+] as const;
+export type ProfileLifecycle = (typeof PROFILE_LIFECYCLES)[number];
 
 export interface Profile {
   id: string;
@@ -66,8 +92,9 @@ export interface ProfileCreateData {
 export interface LaunchResult {
   profile_id: string;
   status: string;
-  vnc_ws_port: number;
-  display: string;
+  /** null for a headless profile: it allocates no display and no Xvnc. */
+  vnc_ws_port: number | null;
+  display: string | null;
   cdp_url: string | null;
 }
 
