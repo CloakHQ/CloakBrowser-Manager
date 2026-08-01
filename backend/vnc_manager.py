@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes.util
 import logging
 import os
 import secrets
@@ -198,19 +199,114 @@ ENCODING_POLICIES = (ENCODING_POLICY_SERVER, ENCODING_POLICY_VIDEO)
 # policy stays opt-in because of limit (1) above — the preset stops binding —
 # not because the codec is unpredictable.
 _VIDEO_CODEC_DEFAULT = "h264"
-# Xkasmvnc(1) 1.5.0: "Supported options: auto, h264, h264_vaapi, h265,
-# h265_vaapi, av1, av1_vaapi". "auto" is deliberately NOT in this set — see above.
+# Xkasmvnc(1) 1.5.0 documents only half of this: "Supported options: auto, h264,
+# h264_vaapi, h265, h265_vaapi, av1, av1_vaapi". "auto" is deliberately NOT in
+# this set — see above. The *_nvenc names are missing from -help but ARE
+# implemented, and the omission is a documentation bug, not a capability one:
+#   - the shipped 1.5.0 binary's string table carries one contiguous run
+#     h264 / h264_vaapi / h264_nvenc / h265 / h265_vaapi / h265_nvenc / hevc /
+#     hevc_vaapi / hevc_nvenc / av1_vaapi / av1_nvenc / auto, i.e. the nvenc
+#     names sit in the same table the documented ones are parsed from;
+#   - it instantiates rfb::FFMPEGHWEncoder<(AVHWDeviceType)2, (AVPixelFormat)117>
+#     next to the <3, 44> one. FFmpeg's AVHWDeviceType 2 is CUDA (3 is VAAPI) and
+#     pixel format 117 is AV_PIX_FMT_CUDA (44 is AV_PIX_FMT_VAAPI), so the NVENC
+#     encoder is compiled in, not merely named;
+#   - the 1.5.0 release notes say so outright ("Hardware acceleration uses VAAPI
+#     (Intel/AMD) and NVENC (NVIDIA)") even though -help was never updated.
+# Each name below was then confirmed live on an RTX 3080 Ti rather than inferred
+# — every one reaches the probe and is echoed back by it:
+#     EncoderProbe: Available encoders: h264_nvenc hevc_nvenc libx264 libx265
+#     VNCServerST: Hardware video encoding acceleration capability: h264_nvenc
+# h265_nvenc is accepted and normalised to hevc_nvenc by the parser.
+#
+# av1_nvenc parses but is GPU-generation-gated: on Ampere it probes and fails
+# with "Provided device doesn't support required NVENC features" (AV1 encode
+# starts at Ada), leaving "capability: none". It stays in the set because it is
+# a valid name on newer hardware, and the failure is already visible in the log.
 _VIDEO_CODECS_ALLOWED = frozenset({
-    "h264", "h264_vaapi", "h265", "h265_vaapi", "av1", "av1_vaapi",
+    "h264", "h264_vaapi", "h264_nvenc",
+    "h265", "h265_vaapi", "h265_nvenc",
+    "hevc_nvenc",
+    "av1", "av1_vaapi", "av1_nvenc",
 })
+
+# The subset above that needs the NVIDIA userspace encode library. FFmpeg's
+# nvenc wrapper dlopen()s libnvidia-encode.so.1 (and libcuda.so.1) at probe
+# time, and neither ships in the image — both are injected by the NVIDIA
+# container runtime.
+_NVENC_CODECS = frozenset({"h264_nvenc", "h265_nvenc", "hevc_nvenc", "av1_nvenc"})
+
+
+def _nvenc_runtime_available() -> bool:
+    """Whether libnvidia-encode.so.1 is loadable in this container."""
+    return ctypes.util.find_library("nvidia-encode") is not None
+
+
+def _video_codec_list(raw: str, codec: str) -> str:
+    """Validate a comma-separated KASM_VIDEO_CODEC, preserving order.
+
+    Unknown entries are dropped rather than failing the whole list, matching
+    what Xvnc itself does with them ("Unknown codec %s skipped"). If nothing
+    survives we fall back to the default instead of handing Xvnc an empty
+    -videoCodec, which it would read as "no video mode at all".
+    """
+    seen: list[str] = []
+    unknown: list[str] = []
+    for entry in (part.strip() for part in codec.split(",")):
+        if not entry:
+            continue
+        if entry not in _VIDEO_CODECS_ALLOWED:
+            # "auto" is refused here for the same reason it is refused alone:
+            # it widens the probe and hands encoder choice back to the client.
+            unknown.append(entry)
+            continue
+        if entry not in seen:
+            seen.append(entry)
+    if unknown:
+        logger.warning(
+            "Ignoring unusable KASM_VIDEO_CODEC entries %s (accepted: %s)",
+            ", ".join(repr(u) for u in unknown), ", ".join(sorted(_VIDEO_CODECS_ALLOWED)),
+        )
+    if not seen:
+        logger.warning(
+            "No usable codec in KASM_VIDEO_CODEC=%r, using %r",
+            raw, _VIDEO_CODEC_DEFAULT,
+        )
+        return _VIDEO_CODEC_DEFAULT
+    if any(c in _NVENC_CODECS for c in seen) and not _nvenc_runtime_available():
+        logger.warning(
+            "KASM_VIDEO_CODEC=%s asks for NVENC, but libnvidia-encode.so.1 is "
+            "not loadable in this container — those entries will probe out and "
+            "KasmVNC will use the first of the remaining ones it can open. "
+            "Attach the GPU (`--gpus all`, or the docker-compose.nvidia.yml "
+            "overlay) with NVIDIA_DRIVER_CAPABILITIES including 'video'.",
+            ",".join(seen),
+        )
+    return ",".join(seen)
 
 
 def _video_codec() -> str:
-    """Encoder(s) offered under the `video` policy, from KASM_VIDEO_CODEC."""
+    """Encoder(s) offered under the `video` policy, from KASM_VIDEO_CODEC.
+
+    Accepts a comma-separated list, because -videoCodec does: vncExtInit.cc
+    splits on commas and silently drops entries it does not recognise. That
+    makes "h264_nvenc,h264" the natural way to ask for "NVENC, or software
+    H.264 if this host has no usable encoder" — and validating the whole string
+    as one name would reject it as unknown and quietly substitute plain h264,
+    turning a request FOR hardware encoding into a guarantee against it.
+
+    The list is an availability fallback, NOT a preference order: KasmVNC
+    filters its own hardcoded candidate order (h264_nvenc > hevc_nvenc >
+    av1_nvenc > h264_vaapi > ... > libx264 > libx265) by the requested set, so
+    "h265_nvenc,h264_nvenc" and "h264_nvenc,h265_nvenc" both select h264_nvenc.
+    To pin H.265 you must pass h265_nvenc alone.
+    """
     raw = os.environ.get("KASM_VIDEO_CODEC")
     if raw is None:
         return _VIDEO_CODEC_DEFAULT
     codec = raw.strip().lower()
+    if "," in codec:
+        return _video_codec_list(raw, codec)
     if codec == "auto":
         logger.warning(
             "KASM_VIDEO_CODEC=auto is refused: it lets the client select a "
@@ -225,6 +321,24 @@ def _video_codec() -> str:
             raw, ", ".join(sorted(_VIDEO_CODECS_ALLOWED)), _VIDEO_CODEC_DEFAULT,
         )
         return _VIDEO_CODEC_DEFAULT
+    # Pass the codec through either way — Xvnc degrades gracefully here (the
+    # probe drops it, "Hardware video encoding acceleration capability: none"
+    # is logged and the session serves Tight), so substituting a different
+    # codec would only hide the operator's actual request. But that one INFO
+    # line is the ONLY evidence, it comes from a different process, and it says
+    # nothing about *why* — which is how "I enabled NVENC" and "I am silently
+    # encoding on the CPU" end up looking identical from the manager's side.
+    if codec in _NVENC_CODECS and not _nvenc_runtime_available():
+        logger.warning(
+            "KASM_VIDEO_CODEC=%s needs NVENC, but libnvidia-encode.so.1 is not "
+            "loadable in this container — FFmpeg's nvenc probe will fail and "
+            "KasmVNC will fall back to software encoding. The library is "
+            "injected by the NVIDIA container runtime, not installed in the "
+            "image: run with the GPU attached (`--gpus all`, or the "
+            "docker-compose.nvidia.yml overlay) and with "
+            "NVIDIA_DRIVER_CAPABILITIES including 'video'.",
+            codec,
+        )
     return codec
 
 
@@ -286,6 +400,62 @@ def _encoding_flags(policy: str) -> list[str]:
         "to swap which half you get."
     )
     return ["-IgnoreClientSettingsKasm"]
+
+
+# Streaming-mode pseudo-encodings, from the shipped client bundle
+# (www/assets/ui-*.js: pseudoEncodingStreamingMode*). The client sends one of
+# these to tell the server which encoder to run.
+_STREAM_MODE_BY_CODEC = {
+    "h264": -1027,        # AVCSW
+    "h264_vaapi": -1028,  # AVCVAAPI
+    "h264_nvenc": -1029,  # AVCNVENC
+    "h265": -1032,        # HEVCSW
+    "h265_vaapi": -1033,  # HEVCVAAPI
+    "h265_nvenc": -1034,  # HEVCNVENC
+    "hevc_nvenc": -1034,
+    "av1": -1037,         # AV1SW
+    "av1_vaapi": -1038,   # AV1VAAPI
+    "av1_nvenc": -1039,   # AV1NVENC
+}
+
+
+def viewer_stream_mode_preference() -> str | None:
+    """`kasmvnc_mode_preference` for the viewer URL, or None to leave it alone.
+
+    Returned ONLY when an NVENC codec is configured, because that is the one
+    case the shipped client cannot resolve by itself. Its auto-selection list is
+    hardcoded to the VAAPI and software variants:
+
+        const JA = [AVCVAAPI, AVCSW, HEVCVAAPI, HEVCSW]
+
+    and getBestStreamingMode() intersects that list with what the server
+    advertises. No *_nvenc pseudo-encoding is in it, so when the server offers
+    only NVENC the intersection is empty and the client silently settles on
+    pseudoEncodingStreamingModeJpegWebp (-1025) — i.e. no video codec at all.
+    Measured exactly that: Xvnc logging "Hardware video encoding acceleration
+    capability: h264_nvenc" while every rect went out as Tight/WebP and the GPU
+    encoder sat at 0%. Forcing -1029 on the same setup moved all 1445 frames
+    onto FFMPEGHWEncoder (AV_PIX_FMT_CUDA) with "Total: 0 rects, 0 pixels" left
+    on the Tight path and one active NVENC session at 24fps.
+
+    Deliberately NOT returned for VAAPI/software codecs even though the mapping
+    exists for them. forcedCodecs is consulted BEFORE the client's
+    `fallback_image_mode` branch, so forcing a mode also disables its "drop to
+    image mode after an encoding error" recovery. The client already selects
+    those codecs correctly on its own, so forcing them would trade a working
+    safety net for nothing.
+
+    Multiple codecs map to a '|'-separated list, which the client treats as a
+    preference order filtered by availability — so "h264_nvenc,h264" keeps its
+    software fallback rather than pinning the session to NVENC.
+    """
+    if _encoding_policy_name() != ENCODING_POLICY_VIDEO:
+        return None
+    codecs = [c for c in _video_codec().split(",") if c]
+    if not any(c in _NVENC_CODECS for c in codecs):
+        return None
+    modes = [str(_STREAM_MODE_BY_CODEC[c]) for c in codecs if c in _STREAM_MODE_BY_CODEC]
+    return "|".join(modes) or None
 
 
 def _dri_driver(node: str) -> str | None:

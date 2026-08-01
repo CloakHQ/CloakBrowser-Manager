@@ -469,6 +469,151 @@ def test_known_codecs_pass_through(monkeypatch: pytest.MonkeyPatch, codec: str):
     assert vnc_manager._video_codec() == codec
 
 
+@pytest.mark.parametrize(
+    "codec", ["h264_nvenc", "h265_nvenc", "hevc_nvenc", "av1_nvenc"],
+)
+def test_nvenc_codecs_pass_through(monkeypatch: pytest.MonkeyPatch, codec: str):
+    """The *_nvenc names are absent from `Xvnc -help` but ARE accepted.
+
+    Confirmed live against the shipped 1.5.0 binary on an RTX 3080 Ti rather
+    than inferred from the string table: each name reaches the probe and is
+    echoed back by it, e.g. `-videoCodec h264_nvenc` logs
+
+        EncoderProbe: Using CLI-specified video codecs (supported subset): h264_nvenc
+        VNCServerST: Hardware video encoding acceleration capability: h264_nvenc
+
+    and h265_nvenc is accepted and normalised by the parser to hevc_nvenc. So
+    rejecting them as "unknown" would refuse a working configuration on the
+    strength of an out-of-date help string.
+    """
+    monkeypatch.setenv("KASM_VIDEO_CODEC", codec)
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: True)
+    assert vnc_manager._video_codec() == codec
+
+
+def test_nvenc_without_the_driver_library_warns_but_still_passes_through(
+    monkeypatch: pytest.MonkeyPatch, caplog,
+):
+    """Warn, do not substitute.
+
+    Xvnc degrades gracefully on its own (the probe drops the codec and logs
+    "Hardware video encoding acceleration capability: none"), so swapping in a
+    different codec here would hide what the operator actually asked for. But
+    that single INFO line comes from another process and does not say why —
+    which is how "NVENC is on" and "everything is being encoded on the CPU"
+    become indistinguishable from the manager's side.
+    """
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_nvenc")
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: False)
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        assert vnc_manager._video_codec() == "h264_nvenc"
+    assert "libnvidia-encode.so.1" in caplog.text
+
+
+def test_codec_list_is_passed_through(monkeypatch: pytest.MonkeyPatch):
+    """A comma list is how you ask for "NVENC, else software H.264".
+
+    Rejecting it as one unknown name would silently substitute plain h264 —
+    turning a request for hardware encoding into a guarantee against it.
+    """
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_nvenc,h264")
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: True)
+    assert vnc_manager._video_codec() == "h264_nvenc,h264"
+
+
+def test_codec_list_drops_unknown_entries_but_keeps_the_rest(
+    monkeypatch: pytest.MonkeyPatch, caplog,
+):
+    monkeypatch.setenv("KASM_VIDEO_CODEC", " h264_nvenc , vp9 , h264 ")
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: True)
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        assert vnc_manager._video_codec() == "h264_nvenc,h264"
+    assert "vp9" in caplog.text
+
+
+def test_codec_list_with_nothing_usable_falls_back(
+    monkeypatch: pytest.MonkeyPatch, caplog,
+):
+    """Never hand Xvnc an empty -videoCodec: it reads that as no video mode."""
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "vp9,theora")
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        assert vnc_manager._video_codec() == "h264"
+    assert "No usable codec" in caplog.text
+
+
+def test_codec_list_refuses_auto_among_entries(monkeypatch: pytest.MonkeyPatch):
+    """'auto' must not sneak in via a list — it re-widens the probe."""
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_nvenc,auto")
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: True)
+    assert vnc_manager._video_codec() == "h264_nvenc"
+
+
+def test_codec_list_deduplicates(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264,h264")
+    assert vnc_manager._video_codec() == "h264"
+
+
+def test_stream_mode_forced_only_for_nvenc(monkeypatch: pytest.MonkeyPatch):
+    """The client cannot auto-select NVENC, so the server has to name it.
+
+    getBestStreamingMode() intersects what the server advertises with a
+    hardcoded list of VAAPI/software pseudo-encodings; no *_nvenc value is in
+    it, so an NVENC-only server leaves the client on JPEG/WebP with the GPU
+    encoder idle. Measured before the fix, on a working NVENC setup.
+    """
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "video")
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_nvenc")
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: True)
+    assert vnc_manager.viewer_stream_mode_preference() == "-1029"
+
+
+def test_stream_mode_list_preserves_the_software_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """'|' is a preference order the client filters by availability."""
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "video")
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_nvenc,h264")
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", lambda: True)
+    assert vnc_manager.viewer_stream_mode_preference() == "-1029|-1027"
+
+
+@pytest.mark.parametrize("codec", ["h264", "h264_vaapi", "h265_vaapi"])
+def test_stream_mode_not_forced_for_codecs_the_client_can_pick(
+    monkeypatch: pytest.MonkeyPatch, codec: str,
+):
+    """Forcing a mode also disables the client's image-mode error recovery.
+
+    forcedCodecs is consulted before the `fallback_image_mode` branch, so
+    pinning a codec the client already selects correctly would trade a working
+    safety net for nothing.
+    """
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "video")
+    monkeypatch.setenv("KASM_VIDEO_CODEC", codec)
+    assert vnc_manager.viewer_stream_mode_preference() is None
+
+
+def test_stream_mode_absent_under_the_server_authoritative_policy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """No codec is negotiated at all there, so naming one would be a lie."""
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "server-authoritative")
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_nvenc")
+    assert vnc_manager.viewer_stream_mode_preference() is None
+
+
+def test_non_nvenc_codec_does_not_probe_for_the_nvidia_library(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Only the NVENC names should trigger the NVENC availability check."""
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "h264_vaapi")
+
+    def _boom() -> bool:
+        raise AssertionError("_nvenc_runtime_available called for a VAAPI codec")
+
+    monkeypatch.setattr(vnc_manager, "_nvenc_runtime_available", _boom)
+    assert vnc_manager._video_codec() == "h264_vaapi"
+
+
 def test_unknown_codec_falls_back(monkeypatch: pytest.MonkeyPatch, caplog):
     monkeypatch.setenv("KASM_VIDEO_CODEC", "vp9")
     with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
