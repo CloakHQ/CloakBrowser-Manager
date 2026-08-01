@@ -88,6 +88,7 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   getClipboard: ["p1"],
   createViewerToken: ["p1"],
   profileStatus: ["p1"],
+  viewerAttached: ["p1"],
 };
 
 describe("request bounding", () => {

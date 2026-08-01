@@ -17,6 +17,7 @@ vi.mock("../lib/api", () => {
     api: {
       createViewerToken: vi.fn(),
       profileStatus: vi.fn(),
+      viewerAttached: vi.fn(),
     },
     ApiError,
   };
@@ -27,7 +28,12 @@ import { api, ApiError } from "../lib/api";
 const mockApi = api as {
   createViewerToken: ReturnType<typeof vi.fn>;
   profileStatus: ReturnType<typeof vi.fn>;
+  viewerAttached: ReturnType<typeof vi.fn>;
 };
+
+const ATTACHED = { viewer_attached: true, clients: 1 };
+const DETACHED = { viewer_attached: false, clients: 0 };
+const ATTACH_UNKNOWN = { viewer_attached: null, clients: null };
 
 const ALIVE = { status: "running", xvnc_alive: true, browser_alive: true };
 const XVNC_DEAD = { status: "running", xvnc_alive: false, browser_alive: true };
@@ -97,7 +103,11 @@ beforeEach(() => {
   vi.useFakeTimers();
   mockApi.createViewerToken.mockReset();
   mockApi.profileStatus.mockReset();
+  mockApi.viewerAttached.mockReset();
   mockApi.createViewerToken.mockResolvedValue(TOK1);
+  // Default: a viewer IS attached. Tests that care override it. Without a
+  // default the attach probe rejects on undefined and every heartbeat logs.
+  mockApi.viewerAttached.mockResolvedValue(ATTACHED);
   setVisibility("visible");
 });
 
@@ -1115,6 +1125,114 @@ describe("connectivity signals", () => {
     expect(mockApi.profileStatus).toHaveBeenCalledTimes(2);
     // ...and it re-establishes rather than trusting the process verdict
     expect(view.result.current.state).toBe("reconnecting");
+  });
+
+  // ── half-open viewer socket (/viewer-attached) ────────────────────────────
+  //
+  // /status only proves the PROCESSES are up. These cover the one signal that
+  // can see the socket itself.
+
+  /** connected, with the attach baseline earned (one true reading). */
+  async function reachAttached() {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    await advance(45_000); // heartbeat: /status alive + attached
+    expect(view.result.current.state).toBe("connected");
+    return view;
+  }
+
+  it("re-establishes when the viewer socket has gone away under a live profile", async () => {
+    const view = await reachAttached();
+
+    mockApi.viewerAttached.mockResolvedValue(DETACHED);
+    await advance(45_000);
+    // one reading is not enough: the entry is absent for a beat after connect
+    expect(view.result.current.state).toBe("connected");
+    await advance(45_000);
+    expect(view.result.current.state).toBe("reconnecting");
+  });
+
+  it("never acts on a detached reading without a confirmed attach first", async () => {
+    // Where the server has no apimessager the map is never written and the
+    // probe answers false forever. Acted on blindly that kills every healthy
+    // session on a fixed beat, so no baseline must mean no action, ever.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    mockApi.viewerAttached.mockResolvedValue(DETACHED);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    for (let i = 0; i < 10; i++) await advance(45_000);
+    expect(mockApi.viewerAttached.mock.calls.length).toBeGreaterThanOrEqual(10);
+    expect(view.result.current.state).toBe("connected");
+  });
+
+  it("an indeterminate attach probe is not evidence of a dead socket", async () => {
+    const view = await reachAttached();
+
+    mockApi.viewerAttached.mockResolvedValue(ATTACH_UNKNOWN);
+    for (let i = 0; i < 6; i++) await advance(45_000);
+    expect(view.result.current.state).toBe("connected");
+  });
+
+  it("a failing attach probe leaves a healthy session alone indefinitely", async () => {
+    // NOTE on the budget: checkViewerAttached deliberately does not touch
+    // connectedProbeFailures, but that cannot be asserted from the outside —
+    // the attach probe only runs when /status SUCCEEDED, and success zeroes
+    // that counter on the line above. So the two can never interleave and no
+    // test can distinguish the two implementations. What is observable, and
+    // what matters, is that an attach probe which never answers is not by
+    // itself allowed to disturb the session.
+    const view = await reachAttached();
+
+    mockApi.viewerAttached.mockRejectedValue(new ApiError(502, "Bad Gateway"));
+    for (let i = 0; i < 6; i++) await advance(45_000);
+    expect(view.result.current.state).toBe("connected");
+  });
+
+  it("an attached reading resets a partial detached streak", async () => {
+    const view = await reachAttached();
+
+    mockApi.viewerAttached.mockResolvedValueOnce(DETACHED);
+    await advance(45_000);
+    expect(view.result.current.state).toBe("connected");
+    await advance(45_000); // back to the ATTACHED default — streak resets
+    mockApi.viewerAttached.mockResolvedValueOnce(DETACHED);
+    await advance(45_000);
+    expect(view.result.current.state).toBe("connected");
+  });
+
+  it("the attach baseline is re-earned per connection", async () => {
+    // A reconnect is a new socket. Carrying the old baseline over would let the
+    // very first detached readings of a fresh connection — the ones taken
+    // before its entry exists — end it.
+    const view = await reachAttached();
+
+    act(() => sendConnectionState("disconnected"));
+    expect(view.result.current.state).toBe("reconnecting");
+    await advance(1_000);
+    act(() => bootDocument());
+    act(() => sendConnectionState("connected"));
+    expect(view.result.current.state).toBe("connected");
+
+    mockApi.viewerAttached.mockResolvedValue(DETACHED);
+    for (let i = 0; i < 6; i++) await advance(45_000);
+    expect(view.result.current.state).toBe("connected");
+  });
+
+  it("does not run an attach probe when the profile itself is not alive", async () => {
+    // The /status verdict is authoritative and already acted on; a second
+    // round-trip against a dying profile buys nothing.
+    mockApi.profileStatus.mockResolvedValue(STOPPED);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    await advance(45_000);
+    expect(view.result.current.state).toBe("session-ended");
+    expect(mockApi.viewerAttached).not.toHaveBeenCalled();
   });
 
   it("resume probe that finds the profile stopped ends the session", async () => {

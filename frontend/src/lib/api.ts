@@ -116,6 +116,17 @@ export interface ProfileStatus {
   browser_alive: boolean | null;
 }
 
+export interface ViewerAttached {
+  /**
+   * Whether a viewer WebSocket is attached, or null if the probe could not
+   * answer. null is NOT "no viewer" — a stats-endpoint hiccup must never be
+   * mistaken for a dead socket.
+   */
+  viewer_attached: boolean | null;
+  /** attached endpoints (-AlwaysShared can exceed 1), null if indeterminate. */
+  clients: number | null;
+}
+
 class ApiError extends Error {
   constructor(
     public status: number,
@@ -238,6 +249,9 @@ export const api = {
 
   profileStatus: (id: string) =>
     request<ProfileStatus>(`/api/profiles/${id}/status`),
+
+  viewerAttached: (id: string) =>
+    request<ViewerAttached>(`/api/profiles/${id}/viewer-attached`),
 };
 
 export { ApiError };

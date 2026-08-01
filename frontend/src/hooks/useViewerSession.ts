@@ -160,6 +160,23 @@ const CONNECTED_HEARTBEAT_MS = 45_000;
  * resolves stops blocking after one interval and the next trigger supersedes it.
  */
 const RESUME_PROBE_MIN_INTERVAL_MS = 5_000;
+/**
+ * Consecutive "no viewer socket attached" readings before we act on them.
+ *
+ * /status can only prove the PROCESSES are alive. A half-open viewer socket
+ * therefore leaves a green dot over a frozen frame until the client's keepalive
+ * and TCP RTO eventually fire — minutes. /viewer-attached is the exact signal:
+ * KasmVNC's bottleneckStats map is keyed by peerEndpoint, written per client
+ * from VNCSConnectionST::sendStats and erased ONLY in ~VNCSConnectionST
+ * (GetAPIMessager.cxx, KasmVNC 1.5.0) — no idle eviction, no wholesale clear,
+ * and reads are non-destructive. So an empty map means every connection object
+ * is gone.
+ *
+ * Two in a row rather than one because the entry does not exist until the first
+ * writeUpdate() tick reaches sendStats, so a just-connected client reads empty
+ * for a beat. The resume-probe rate limit puts >=5s between these readings.
+ */
+const MAX_DETACHED_PROBES = 2;
 /** 4xx codes that mean "later", not "never". */
 const RETRYABLE_4XX = new Set([408, 429]);
 const DEBUG_LOG_LIMIT = 20;
@@ -319,6 +336,19 @@ function createViewerController(deps: ControllerDeps): Controller {
   let resumeSeq = 0;
   /** Date.now() when the last resume probe STARTED; null = none yet. */
   let lastResumeProbeAt: number | null = null;
+  /** consecutive definitive "no viewer attached" readings. */
+  let detachedStreak = 0;
+  /**
+   * We have seen this connection reported as attached at least once.
+   *
+   * The gate that makes the detached signal fail-safe. bottleneckStats is only
+   * ever written when the server has an apimessager; where it does not, the map
+   * is never populated and /viewer-attached answers `false` forever — which,
+   * acted on blindly, would tear down every healthy session on a fixed beat.
+   * Requiring a confirmed `true` first means the signal can only fire where it
+   * has already demonstrated it works, and reduces to a no-op everywhere else.
+   */
+  let sawViewerAttached = false;
   /** 401: retries are intentionally stopped; the safety net must not re-arm. */
   let halted = false;
   /**
@@ -670,6 +700,10 @@ function createViewerController(deps: ControllerDeps): Controller {
     // session outright.
     nonAliveStreak = 0;
     connectedProbeFailures = 0;
+    // Both are per-connection: this is a different socket, so the attach
+    // baseline has to be re-earned before the detached signal can fire again.
+    detachedStreak = 0;
+    sawViewerAttached = false;
     nextRetryAt = null;
     probing = false;
     transition("connected", "client reported connected");
@@ -878,8 +912,9 @@ function createViewerController(deps: ControllerDeps): Controller {
         droppedWhileConnected = false;
         scheduleReconnect("network dropped while connected; re-establishing");
       }
-      // alive → connection_state messages from the iframe (or their absence)
-      // stand; nothing to do.
+      // alive, and no outage to account for. The processes being up still says
+      // nothing about OUR socket, so ask the one endpoint that can tell.
+      else await checkViewerAttached(gen, seq);
     } catch (err) {
       if (seq !== resumeSeq) return;
       if (destroyed || gen !== generation || state !== "connected") return;
@@ -917,6 +952,43 @@ function createViewerController(deps: ControllerDeps): Controller {
         return;
       }
       console.debug(`[viewer] resume probe failed, ignoring: ${errMsg(err)}`);
+    }
+  }
+
+  /**
+   * Second half of a resume probe: the processes are alive, so ask whether a
+   * viewer socket is actually attached. This is the only check that can see a
+   * half-open socket — /status cannot, and the client itself will not notice
+   * until its keepalive and TCP RTO expire.
+   */
+  async function checkViewerAttached(gen: number, seq: number) {
+    let attached: boolean | null;
+    try {
+      ({ viewer_attached: attached } = await api.viewerAttached(profileId));
+    } catch (err) {
+      // No evidence either way. Deliberately does NOT touch detachedStreak, and
+      // does NOT count toward connectedProbeFailures — that budget belongs to
+      // /status, the probe that decides whether the profile is alive at all.
+      // Double-counting one unreachable control plane across both would halve
+      // the tolerance the /status budget was chosen to give.
+      console.debug(`[viewer] attach probe unavailable: ${errMsg(err)}`);
+      return;
+    }
+    if (seq !== resumeSeq) return;
+    if (destroyed || gen !== generation || state !== "connected") return;
+    // null is "could not tell", which is not evidence of a dead socket.
+    if (attached === null) return;
+    if (attached) {
+      sawViewerAttached = true;
+      detachedStreak = 0;
+      return;
+    }
+    // Never act without a baseline for THIS connection — see sawViewerAttached.
+    if (!sawViewerAttached) return;
+    detachedStreak += 1;
+    if (detachedStreak >= MAX_DETACHED_PROBES) {
+      detachedStreak = 0;
+      scheduleReconnect("viewer socket is no longer attached");
     }
   }
 
