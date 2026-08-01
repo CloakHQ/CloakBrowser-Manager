@@ -60,7 +60,7 @@ Each CloakBrowser profile generates a completely different device identity. To t
 - **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
-- **In-browser viewing** — interact with launched browsers via KasmVNC's native web client, directly in the web GUI (JPEG/WebP + optional H.264/H.265/AV1 streaming)
+- **In-browser viewing** — interact with launched browsers via KasmVNC's native web client, directly in the web GUI (server-authoritative JPEG/WebP by default, opt-in H.264/H.265/AV1 WebCodecs streaming)
 - **Playwright/Puppeteer API** — connect to any running profile programmatically via CDP, while still watching it live in the browser
 - **Optional authentication** — protect the web UI and API with a single token, or run wide open locally
 - **Powered by CloakBrowser** — 32 source-level C++ patches, passes Cloudflare Turnstile, 0.9 reCAPTCHA v3 score
@@ -88,7 +88,12 @@ CloakBrowser/Chromium
 - The native KasmVNC client and server come from the **same pinned 1.5.0 package** — no protocol translation anywhere (the old noVNC compatibility bridge is gone).
 - Viewer access uses short-lived, per-profile opaque tokens issued by `POST /api/profiles/<id>/viewer-token`; nginx validates every viewer request (page, assets, WebSocket upgrade) through FastAPI's `/api/viewer-auth`. Kasm ports never leave loopback.
 - The Manager owns a reconnect state machine (backoff + jitter, offline/visibility handling, session-status classification). A viewer disconnect never stops the browser — reconnecting returns you to the same running session.
-- Server-authoritative encoding policy: 30 FPS cap, dynamic JPEG/WebP quality, video-mode downscale under motion, bounded encoder threads. Clients cannot override server encoding settings.
+- Encoding policy is a deliberate choice, not a default you can have both ways. KasmVNC 1.5.0 gates video-codec negotiation and client quality overrides behind the *same* switch, so the Manager exposes it as one knob (`KASM_ENCODING_POLICY`). The default keeps the server in charge — 30 FPS cap, dynamic JPEG/WebP quality, video-mode downscale under motion — and clients cannot change any of it, which also means no H.264/H.265/AV1 codec is ever negotiated. Opting into `video` enables real WebCodecs streaming and simultaneously makes every quality setting client-overridable.
+- **Caveat on `video`.** `KASM_VIDEO_CODEC` narrows the *server's* encoder probe, but KasmVNC 1.5.0 offers no way to restrict what a **client** selects: a client that advertises another streaming-mode pseudo-encoding gets that encoder anyway, including software AV1 (measured at roughly 0.4s of a CPU core per 1080p keyframe, followed by a silent fallback to Tight for the rest of the session). That is why `video` is opt-in and the default policy is not.
+
+### Headless profiles
+
+A profile with **Headless** enabled starts no Xvnc and allocates no display or WebSocket port — there is nothing to view, so the viewer is not offered and `POST /api/profiles/<id>/viewer-token` answers `409`. Drive it over CDP instead (`/api/profiles/<id>/cdp`). Everything else — profiles, proxies, fingerprints, lifecycle — behaves identically.
 
 ### Environment variables
 
@@ -96,13 +101,16 @@ CloakBrowser/Chromium
 |----------|---------|---------|
 | `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
 | `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
-| `KASM_RECT_THREADS` | `2` | Encoder compression threads per profile (`0` = auto/all cores — risky with many profiles) |
+| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — see the caveat below. |
+| `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. One of `h264`, `h264_vaapi`, `h265`, `h265_vaapi`, `av1`, `av1_vaapi`. `auto` is refused on purpose (it lets the client pick, including software AV1). |
+| `KASM_XVNC_LOG_LEVEL` | `30` | Xvnc log verbosity (0-100). Raise to `100` to see per-connection encoder decisions in `/tmp/xvnc-<display>.log`. |
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
 | `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI |
+| `KASM_RECT_THREADS` | `2` | **Inert on KasmVNC 1.5.0** — `-RectThreads` is still accepted but nothing reads it; the OpenMP loop it drove was replaced by a oneTBB arena sized to the host core count. Cap encoder CPU with the container's `--cpus`/cpuset instead. |
 
 ### GPU acceleration (optional)
 
-Pass the host GPU into the container to enable KasmVNC DRI3 screen capture and VAAPI H.264/H.265/AV1 streaming encode (AMD/Intel open-source drivers; closed-source NVIDIA does not support DRI3):
+Pass the host GPU into the container to enable KasmVNC DRI3 screen capture (AMD/Intel open-source drivers; closed-source NVIDIA does not support DRI3):
 
 ```bash
 docker run --device /dev/dri:/dev/dri -p 8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
@@ -115,6 +123,8 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
 Without a GPU everything still works (software encoding).
+
+VAAPI hardware *video* encode only comes into play with `KASM_ENCODING_POLICY=video`; under the default policy the GPU accelerates screen capture only, because no video codec is negotiated.
 
 ## Development
 
@@ -139,6 +149,31 @@ npm run dev
 
 ```bash
 docker compose up --build
+```
+
+### Data plane (nginx + entrypoint)
+
+`docker/nginx.conf` and `entrypoint.sh` have their own test suite. The static
+config lint runs anywhere; the behavioural half boots the **shipped** config and
+entrypoint inside the image against stub upstreams, and is skipped when the
+image is not built.
+
+```bash
+docker build -t cloakbrowser-manager:kasm15 .
+python -m pytest backend/tests/test_dataplane.py -v      # ~25s
+```
+
+It covers the auth_request status mapping, the `/viewer/<token>` 308 and its
+relative `Location`, the 403 on Kasm's management `/api`, the token-prefix
+strip, WebSocket upgrade passthrough on both legs, the no-idle-reaping
+guarantee for CDP tunnels, and entrypoint.sh's signal handling. Run the probe
+directly for the full transcript, or point it at another image with
+`DATAPLANE_IMAGE=`:
+
+```bash
+docker run --rm --network none -v "$PWD":/repo:ro \
+  --entrypoint python cloakbrowser-manager:kasm15 \
+  /repo/scripts/dataplane_probe.py --repo /repo
 ```
 
 ## Requirements
