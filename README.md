@@ -85,11 +85,11 @@ CloakBrowser/Chromium
   → your browser (React SPA + native KasmVNC client in an iframe)
 ```
 
-- The native KasmVNC client and server come from the **same pinned 1.5.0 package** — no protocol translation anywhere (the old noVNC compatibility bridge is gone).
+- The native KasmVNC client and server come from the **same pinned 1.5.0 package** — no protocol translation anywhere.
 - Viewer access uses short-lived, per-profile opaque tokens issued by `POST /api/profiles/<id>/viewer-token`; nginx validates every viewer request (page, assets, WebSocket upgrade) through FastAPI's `/api/viewer-auth`. Kasm ports never leave loopback.
 - The Manager owns a reconnect state machine (backoff + jitter, offline/visibility handling, session-status classification). A viewer disconnect never stops the browser — reconnecting returns you to the same running session.
-- Encoding policy is a deliberate choice, not a default you can have both ways. KasmVNC 1.5.0 gates video-codec negotiation and client quality overrides behind the *same* switch, so the Manager exposes it as one knob (`KASM_ENCODING_POLICY`). The default keeps the server in charge — 30 FPS cap, dynamic JPEG/WebP quality, video-mode downscale under motion — and clients cannot change any of it, which also means no H.264/H.265/AV1 codec is ever negotiated. Opting into `video` enables real WebCodecs streaming and simultaneously makes every quality setting client-overridable.
-- **Caveat on `video`.** `KASM_VIDEO_CODEC` narrows the *server's* encoder probe, but KasmVNC 1.5.0 offers no way to restrict what a **client** selects: a client that advertises another streaming-mode pseudo-encoding gets that encoder anyway, including software AV1 (measured at roughly 0.4s of a CPU core per 1080p keyframe, followed by a silent fallback to Tight for the rest of the session). That is why `video` is opt-in and the default policy is not.
+- Encoding policy is a single knob (`KASM_ENCODING_POLICY`), because KasmVNC 1.5.0 gates video-codec negotiation and client quality overrides behind the *same* switch. `server-authoritative` keeps the server in charge — 30 FPS cap, dynamic JPEG/WebP quality, video-mode downscale under motion — and no H.264/H.265/AV1 codec is negotiated. `video` enables WebCodecs streaming and makes every quality setting client-overridable.
+- `video` is opt-in because the encoder cannot be enforced. `KASM_VIDEO_CODEC` narrows the *server's* probe, but KasmVNC 1.5.0 offers no way to restrict what a **client** selects: a client advertising another streaming-mode pseudo-encoding gets that encoder, including software AV1, which costs roughly 0.4s of a CPU core per 1080p keyframe and then drops the session back to Tight.
 
 ### Headless profiles
 
@@ -101,12 +101,12 @@ A profile with **Headless** enabled starts no Xvnc and allocates no display or W
 |----------|---------|---------|
 | `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
 | `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
-| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — see the caveat below. |
-| `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. One of `h264`, `h264_vaapi`, `h265`, `h265_vaapi`, `av1`, `av1_vaapi`. `auto` is refused on purpose (it lets the client pick, including software AV1). |
+| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — see the note above. |
+| `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. One of `h264`, `h264_vaapi`, `h265`, `h265_vaapi`, `av1`, `av1_vaapi`. `auto` is refused — it lets the client pick, including software AV1. |
 | `KASM_XVNC_LOG_LEVEL` | `30` | Xvnc log verbosity (0-100). Raise to `100` to see per-connection encoder decisions in `/tmp/xvnc-<display>.log`. |
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
 | `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI |
-| `KASM_RECT_THREADS` | `2` | **Inert on KasmVNC 1.5.0** — `-RectThreads` is still accepted but nothing reads it; the OpenMP loop it drove was replaced by a oneTBB arena sized to the host core count. Cap encoder CPU with the container's `--cpus`/cpuset instead. |
+| `KASM_RECT_THREADS` | *(ignored)* | No effect on KasmVNC 1.5.0 — `-RectThreads` parses but nothing reads it; encoder threads are sized to the host core count. Cap encoder CPU with the container's `--cpus`/cpuset. |
 
 ### GPU acceleration (optional)
 
