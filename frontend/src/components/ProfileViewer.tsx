@@ -18,6 +18,84 @@ interface ProfileViewerProps {
   onSessionEnded: () => void;
 }
 
+/**
+ * How often the last frame is copied out of the client while connected.
+ *
+ * It has to be periodic: the embedded client destroys its framebuffer canvas
+ * on disconnect, so by the time we learn the connection dropped there is
+ * nothing left to copy. 2s keeps the frozen frame recent enough to read while
+ * costing one downscaled drawImage — the source is already a GPU texture and
+ * the destination is <=640px wide, so no pixels are ever read back.
+ */
+const LAST_FRAME_SNAPSHOT_MS = 2_000;
+/** The overlay dims it anyway; full resolution buys nothing. */
+const SNAPSHOT_MAX_WIDTH = 640;
+
+/**
+ * The client's framebuffer canvas inside the iframe document, if we can see it.
+ *
+ * KasmVNC 1.5.0 (ui-BOjwDkC7.js) builds six canvases and only one is the
+ * framebuffer: the Display constructor does `_screen.appendChild(this._canvas)`
+ * after setting `margin:auto`. The others are excluded by construction rather
+ * than by name, because the bundle is minified and its class names are not a
+ * stable contract:
+ *   - the backbuffer and the WebGL surface are never appended, so
+ *     querySelectorAll — which only walks the document tree — never
+ *     returns them in the first place
+ *   - the cursor canvas is `visibility:hidden`  -> computed style
+ *   - the watermark canvas starts 0x0, as does the framebuffer
+ *     before its first frame                    -> zero area
+ * Whatever is left with the largest bitmap is the screen.
+ */
+export function pickFramebufferCanvas(doc: Document | null): HTMLCanvasElement | null {
+  if (!doc) return null;
+  let best: HTMLCanvasElement | null = null;
+  for (const canvas of Array.from(doc.querySelectorAll("canvas"))) {
+    if (canvas.width === 0 || canvas.height === 0) continue;
+    const style = doc.defaultView?.getComputedStyle(canvas);
+    if (style && (style.visibility === "hidden" || style.display === "none")) continue;
+    if (best === null || canvas.width * canvas.height > best.width * best.height) {
+      best = canvas;
+    }
+  }
+  return best;
+}
+
+/**
+ * Copy the client's current frame into our own canvas. Returns whether it
+ * produced an image.
+ *
+ * Never reads pixels back. Drawing a tainted canvas taints the destination but
+ * does not throw, whereas toDataURL/getImageData on one would — so keeping the
+ * result as a canvas rather than a data URL is what makes this safe regardless
+ * of how the client sourced its frames.
+ */
+export function captureLastFrame(
+  iframe: HTMLIFrameElement | null,
+  dest: HTMLCanvasElement | null,
+): boolean {
+  if (!iframe || !dest) return false;
+  let doc: Document | null = null;
+  try {
+    doc = iframe.contentDocument;
+  } catch {
+    return false; // not same-origin; nothing to read
+  }
+  const source = pickFramebufferCanvas(doc);
+  if (!source) return false;
+  const ctx = dest.getContext("2d");
+  if (!ctx) return false;
+  const scale = Math.min(1, SNAPSHOT_MAX_WIDTH / source.width);
+  dest.width = Math.max(1, Math.round(source.width * scale));
+  dest.height = Math.max(1, Math.round(source.height * scale));
+  try {
+    ctx.drawImage(source, 0, 0, dest.width, dest.height);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 const STATUS_META: Record<ViewerState, { dot: string; label: string }> = {
   idle: { dot: "bg-yellow-400 animate-pulse", label: "Connecting..." },
   connecting: { dot: "bg-yellow-400 animate-pulse", label: "Connecting..." },
@@ -30,6 +108,8 @@ const STATUS_META: Record<ViewerState, { dot: string; label: string }> = {
 export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboardSync, onSessionEnded }: ProfileViewerProps) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
+  const snapshotRef = useRef<HTMLCanvasElement>(null);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [clipboardSync, setClipboardSync] = useState(initialClipboardSync);
   const [cdpCopied, setCdpCopied] = useState(false);
@@ -48,6 +128,22 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     session.nextRetryAt !== null
       ? Math.max(0, Math.ceil((session.nextRetryAt - Date.now()) / 1000))
       : null;
+
+  // Keep a recent copy of the frame while the connection is up, so the
+  // reconnect overlay has something to dim. Only while connected AND visible:
+  // a hidden tab is not drawing anything new, so the copies would be identical.
+  useEffect(() => {
+    if (session.state !== "connected") return;
+    const capture = () => {
+      if (document.visibilityState !== "visible") return;
+      if (captureLastFrame(session.iframeRef.current, snapshotRef.current)) {
+        setHasSnapshot(true);
+      }
+    };
+    capture();
+    const id = setInterval(capture, LAST_FRAME_SNAPSHOT_MS);
+    return () => clearInterval(id);
+  }, [session.state, session.iframeRef]);
 
   const toggleFullscreen = () => {
     if (!wrapperRef.current) return;
@@ -150,12 +246,25 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           />
         )}
 
+        {/* The last frame, held so the reconnect overlay dims a picture of the
+            session rather than a black rectangle. Always mounted — it has to
+            exist as a draw target the whole time the connection is up — and
+            merely hidden the rest of the time. `display:none` does not affect
+            drawing into it. */}
+        <canvas
+          ref={snapshotRef}
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+          style={{
+            display: session.state === "reconnecting" && hasSnapshot ? "block" : "none",
+          }}
+        />
+
         {/* Reconnecting: keep the iframe mounted so the client can recover in
-            place. NOTE the overlay dims a BLANK pane, not the last frame —
-            measured: the embedded KasmVNC client destroys its framebuffer
-            canvas on disconnect, so there is nothing left underneath. Keeping
-            the iframe still matters (a remount would drop the session), the
-            visual just is not a frozen screenshot. */}
+            place — a remount would drop the session. The client destroys its
+            own framebuffer canvas on disconnect (measured), which is why the
+            frame above is copied out on a timer while connected rather than
+            grabbed here; by now there is nothing left to grab. */}
         {session.state === "reconnecting" && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/60 px-4 text-center">
             {session.offline ? (

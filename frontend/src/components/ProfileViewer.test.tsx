@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, act, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
-import { ProfileViewer } from "./ProfileViewer";
+import { ProfileViewer, pickFramebufferCanvas, captureLastFrame } from "./ProfileViewer";
 
 vi.mock("../lib/api", () => {
   class ApiError extends Error {
@@ -17,6 +17,7 @@ vi.mock("../lib/api", () => {
     api: {
       createViewerToken: vi.fn(),
       profileStatus: vi.fn(),
+      viewerAttached: vi.fn(),
     },
     ApiError,
   };
@@ -27,11 +28,14 @@ import { api } from "../lib/api";
 const mockApi = api as {
   createViewerToken: ReturnType<typeof vi.fn>;
   profileStatus: ReturnType<typeof vi.fn>;
+  viewerAttached: ReturnType<typeof vi.fn>;
 };
 
 beforeEach(() => {
   mockApi.createViewerToken.mockReset();
   mockApi.profileStatus.mockReset();
+  mockApi.viewerAttached.mockReset();
+  mockApi.viewerAttached.mockResolvedValue({ viewer_attached: true, clients: 1 });
   mockApi.createViewerToken.mockResolvedValue({
     token: "tok-1",
     viewer_url: "/viewer/tok-1/",
@@ -102,7 +106,8 @@ describe("ProfileViewer", () => {
     act(() => send("disconnected"));
     expect(screen.getByText("Connection lost — reconnecting")).toBeInTheDocument();
     expect(screen.getByText(/Attempt 1/)).toBeInTheDocument();
-    // iframe stays mounted (last frame preserved under the dim overlay)
+    // iframe stays mounted: a remount would drop the session the client is
+    // trying to recover in place.
     expect(container.querySelector("iframe")).toBeInTheDocument();
   });
 
@@ -227,5 +232,289 @@ describe("ProfileViewer", () => {
       screen.getByText("Back to profile").click();
     });
     expect(onSessionEnded).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── last-frame preservation ─────────────────────────────────────────────────
+//
+// The client destroys its own framebuffer canvas on disconnect, so the frame
+// has to be copied out while the connection is still up. These cover the two
+// halves: finding the right canvas among the six the client builds, and
+// copying it without ever reading pixels back.
+
+/** A canvas in `doc` shaped like one of the client's. */
+function addCanvas(
+  doc: Document,
+  { w, h, attach = true, style = {} }:
+    { w: number; h: number; attach?: boolean; style?: Partial<CSSStyleDeclaration> },
+) {
+  const c = doc.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  Object.assign(c.style, style);
+  if (attach) doc.body.appendChild(c);
+  return c;
+}
+
+/**
+ * A stand-in for the client's document.
+ *
+ * Must be a real iframe document, not document.implementation.createHTMLDocument:
+ * that has no browsing context, so `defaultView` is null and getComputedStyle
+ * is unreachable — the visibility filter would silently never run and these
+ * tests would pass on the size comparison alone.
+ */
+function ensureBody(doc: Document): HTMLElement {
+  // An iframe pointed at a URL jsdom will not load has a completely empty
+  // document — no documentElement, let alone a body.
+  if (!doc.documentElement) doc.appendChild(doc.createElement("html"));
+  if (!doc.body) doc.documentElement.appendChild(doc.createElement("body"));
+  return doc.body;
+}
+
+const clientFrames: HTMLIFrameElement[] = [];
+function clientDoc(): Document {
+  const frame = document.createElement("iframe");
+  document.body.appendChild(frame);
+  clientFrames.push(frame);
+  const doc = frame.contentDocument!;
+  expect(doc.defaultView).not.toBeNull();
+  return doc;
+}
+
+afterEach(() => {
+  clientFrames.splice(0).forEach((f) => f.remove());
+});
+
+describe("pickFramebufferCanvas", () => {
+  it("picks the screen out of the canvases the client builds", () => {
+    const doc = clientDoc();
+    // the real set, per ui-BOjwDkC7.js. The two detached ones are the reason
+    // the search must go through the document rather than a kept reference:
+    // querySelectorAll never sees them, which is what excludes them.
+    addCanvas(doc, { w: 4096, h: 4096, attach: false });            // backbuffer
+    addCanvas(doc, { w: 1920, h: 1080, attach: false });            // WebGL surface
+    addCanvas(doc, { w: 32, h: 32, style: { visibility: "hidden" } }); // cursor
+    addCanvas(doc, { w: 0, h: 0 });                                  // watermark
+    const screenCanvas = addCanvas(doc, { w: 1280, h: 720 });        // framebuffer
+
+    expect(pickFramebufferCanvas(doc)).toBe(screenCanvas);
+  });
+
+  it("ignores a framebuffer that has not drawn its first frame yet", () => {
+    // Display's constructor sets width/height to 0 before connecting.
+    const doc = clientDoc();
+    addCanvas(doc, { w: 0, h: 0 });
+    expect(pickFramebufferCanvas(doc)).toBeNull();
+  });
+
+  it("ignores a display:none canvas and returns null for no document", () => {
+    const doc = clientDoc();
+    addCanvas(doc, { w: 800, h: 600, style: { display: "none" } });
+    expect(pickFramebufferCanvas(doc)).toBeNull();
+    expect(pickFramebufferCanvas(null)).toBeNull();
+  });
+
+  it("a hidden canvas never wins, however large", () => {
+    // Pins the visibility filter itself: without it the cursor canvas — which
+    // the client positions fixed at z-index 65535 — could outrank the screen.
+    const doc = clientDoc();
+    const screenCanvas = addCanvas(doc, { w: 800, h: 600 });
+    addCanvas(doc, { w: 4096, h: 4096, style: { visibility: "hidden" } });
+    expect(pickFramebufferCanvas(doc)).toBe(screenCanvas);
+  });
+
+  it("prefers the largest when more than one qualifies", () => {
+    const doc = clientDoc();
+    addCanvas(doc, { w: 100, h: 100 });
+    const big = addCanvas(doc, { w: 1920, h: 1080 });
+    addCanvas(doc, { w: 200, h: 200 });
+    expect(pickFramebufferCanvas(doc)).toBe(big);
+  });
+});
+
+describe("captureLastFrame", () => {
+  /** dest canvas with a stubbed 2D context — jsdom has no real one. */
+  function fakeDest() {
+    const drawImage = vi.fn();
+    const dest = document.createElement("canvas");
+    vi.spyOn(dest, "getContext").mockReturnValue(
+      { drawImage } as unknown as CanvasRenderingContext2D,
+    );
+    return { dest, drawImage };
+  }
+
+  function iframeWith(doc: Document | null): HTMLIFrameElement {
+    return { contentDocument: doc } as unknown as HTMLIFrameElement;
+  }
+
+  it("downscales the frame and preserves its aspect ratio", () => {
+    const doc = clientDoc();
+    addCanvas(doc, { w: 1920, h: 1080 });
+    const { dest, drawImage } = fakeDest();
+
+    expect(captureLastFrame(iframeWith(doc), dest)).toBe(true);
+    // 1920 -> the 640 cap, and the height follows it
+    expect([dest.width, dest.height]).toEqual([640, 360]);
+    expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 640, 360);
+  });
+
+  it("never upscales a frame that is already small", () => {
+    const doc = clientDoc();
+    addCanvas(doc, { w: 320, h: 240 });
+    const { dest } = fakeDest();
+
+    expect(captureLastFrame(iframeWith(doc), dest)).toBe(true);
+    expect([dest.width, dest.height]).toEqual([320, 240]);
+  });
+
+  it("reports failure instead of throwing when there is nothing to copy", () => {
+    const { dest } = fakeDest();
+    const empty = clientDoc();
+
+    expect(captureLastFrame(null, dest)).toBe(false);
+    expect(captureLastFrame(iframeWith(empty), null)).toBe(false);
+    expect(captureLastFrame(iframeWith(empty), dest)).toBe(false);
+    expect(captureLastFrame(iframeWith(null), dest)).toBe(false);
+  });
+
+  it("survives a cross-origin iframe", () => {
+    // Accessing contentDocument across origins throws in a real browser.
+    const hostile = {
+      get contentDocument(): Document {
+        throw new DOMException("blocked", "SecurityError");
+      },
+    } as unknown as HTMLIFrameElement;
+    const { dest } = fakeDest();
+    expect(captureLastFrame(hostile, dest)).toBe(false);
+  });
+
+  it("survives a drawImage that throws", () => {
+    const doc = clientDoc();
+    addCanvas(doc, { w: 800, h: 600 });
+    const dest = document.createElement("canvas");
+    vi.spyOn(dest, "getContext").mockReturnValue({
+      drawImage: () => {
+        throw new DOMException("tainted", "SecurityError");
+      },
+    } as unknown as CanvasRenderingContext2D);
+
+    expect(captureLastFrame(iframeWith(doc), dest)).toBe(false);
+  });
+});
+
+describe("the reconnect overlay dims the last frame", () => {
+  /**
+   * jsdom has no 2D context, so the copy is stubbed at the prototype. What is
+   * under test is the wiring — captured while connected, revealed only while
+   * reconnecting — not the pixels.
+   */
+  function stubCanvas2D() {
+    return vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+  }
+
+  async function connected() {
+    mockApi.profileStatus.mockResolvedValue({
+      status: "running",
+      xvnc_alive: true,
+      browser_alive: true,
+    });
+    const view = render(
+      <ProfileViewer
+        profileId="p1"
+        cdpUrl={null}
+        clipboardSync={false}
+        onSessionEnded={() => {}}
+      />,
+    );
+    await act(async () => {});
+    const iframe = view.container.querySelector("iframe")!;
+    // give the client a frame to be copied. The iframe points at a URL jsdom
+    // will not load, so its document has no body to append to.
+    const doc = iframe.contentDocument!;
+    const frame = doc.createElement("canvas");
+    frame.width = 1920;
+    frame.height = 1080;
+    ensureBody(doc).appendChild(frame);
+    expect(frame.isConnected).toBe(true);
+
+    const send = (value: string) => {
+      const ev = new Event("message");
+      Object.defineProperty(ev, "data", {
+        value: { action: "connection_state", value },
+      });
+      Object.defineProperty(ev, "source", { value: iframe.contentWindow });
+      window.dispatchEvent(ev);
+    };
+    return { ...view, send };
+  }
+
+  /** the snapshot canvas is ours, not the client's (which lives in the iframe) */
+  const snapshotOf = (container: HTMLElement) =>
+    container.querySelector("canvas") as HTMLCanvasElement | null;
+
+  it("holds the frame while connected and reveals it on a drop", async () => {
+    vi.useFakeTimers();
+    const spy = stubCanvas2D();
+    try {
+      const { container, send } = await connected();
+
+      // mounted from the start: it has to exist as a draw target the whole
+      // time the connection is up, or there is nothing to reveal later
+      expect(snapshotOf(container)).not.toBeNull();
+
+      act(() => send("connected"));
+      await act(async () => {
+        vi.advanceTimersByTime(2_000);
+      });
+      // ...but stays out of the way while the live client is visible
+      expect(snapshotOf(container)!.style.display).toBe("none");
+
+      act(() => send("disconnected"));
+      expect(screen.getByText("Connection lost — reconnecting")).toBeInTheDocument();
+      expect(snapshotOf(container)!.style.display).toBe("block");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("stays hidden if no frame was ever captured", async () => {
+    // A connection that drops before the client ever painted has nothing to
+    // show; a blank canvas over the pane would be worse than no canvas.
+    vi.useFakeTimers();
+    mockApi.profileStatus.mockResolvedValue({
+      status: "running",
+      xvnc_alive: true,
+      browser_alive: true,
+    });
+    const { container } = render(
+      <ProfileViewer
+        profileId="p1"
+        cdpUrl={null}
+        clipboardSync={false}
+        onSessionEnded={() => {}}
+      />,
+    );
+    await act(async () => {});
+    const iframe = container.querySelector("iframe")!;
+    const send = (value: string) => {
+      const ev = new Event("message");
+      Object.defineProperty(ev, "data", {
+        value: { action: "connection_state", value },
+      });
+      Object.defineProperty(ev, "source", { value: iframe.contentWindow });
+      window.dispatchEvent(ev);
+    };
+
+    act(() => send("connected"));
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    act(() => send("disconnected"));
+
+    expect(screen.getByText("Connection lost — reconnecting")).toBeInTheDocument();
+    expect(snapshotOf(container)!.style.display).toBe("none");
   });
 });
