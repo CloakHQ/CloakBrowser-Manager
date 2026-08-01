@@ -518,3 +518,166 @@ describe("the reconnect overlay dims the last frame", () => {
     expect(snapshotOf(container)!.style.display).toBe("none");
   });
 });
+
+// ── toolbar controls ────────────────────────────────────────────────────────
+
+describe("toolbar controls", () => {
+  async function mountViewer(cdpUrl: string | null = "/cdp/abc") {
+    mockApi.profileStatus.mockResolvedValue({
+      status: "running",
+      xvnc_alive: true,
+      browser_alive: true,
+    });
+    const view = render(
+      <ProfileViewer
+        profileId="p1"
+        cdpUrl={cdpUrl}
+        clipboardSync={false}
+        onSessionEnded={() => {}}
+      />,
+    );
+    await act(async () => {});
+    return view;
+  }
+
+  it("enters and leaves fullscreen, and follows the browser out of it", async () => {
+    // jsdom implements none of the Fullscreen API.
+    const requestFullscreen = vi.fn();
+    const exitFullscreen = vi.fn();
+    Object.defineProperty(Element.prototype, "requestFullscreen", {
+      value: requestFullscreen, configurable: true, writable: true,
+    });
+    Object.defineProperty(document, "exitFullscreen", {
+      value: exitFullscreen, configurable: true, writable: true,
+    });
+    const setFullscreenElement = (el: Element | null) =>
+      Object.defineProperty(document, "fullscreenElement", {
+        value: el, configurable: true, writable: true,
+      });
+    setFullscreenElement(null);
+
+    await mountViewer();
+    act(() => screen.getByTitle("Fullscreen").click());
+    expect(requestFullscreen).toHaveBeenCalledTimes(1);
+
+    const exitButton = screen.getByTitle("Exit fullscreen");
+    setFullscreenElement(document.body);
+    act(() => exitButton.click());
+    expect(exitFullscreen).toHaveBeenCalledTimes(1);
+    expect(screen.getByTitle("Fullscreen")).toBeInTheDocument();
+
+    // the user can also leave via Esc, which only fires the event — without
+    // the listener the button would stay stuck on "Exit fullscreen"
+    setFullscreenElement(document.body);
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
+    expect(screen.getByTitle("Exit fullscreen")).toBeInTheDocument();
+
+    setFullscreenElement(null);
+    act(() => {
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
+    expect(screen.getByTitle("Fullscreen")).toBeInTheDocument();
+  });
+
+  it("copies the CDP endpoint as an absolute URL and confirms it briefly", async () => {
+    // cdp_url is a path; pasting it into a CDP client needs the origin.
+    vi.useFakeTimers();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText }, configurable: true,
+    });
+
+    await mountViewer("/cdp/abc");
+    await act(async () => {
+      screen.getByTitle("Copy CDP endpoint URL").click();
+    });
+
+    expect(writeText).toHaveBeenCalledWith(
+      `${window.location.protocol}//${window.location.host}/cdp/abc`,
+    );
+    expect(screen.getByTitle("Copied!")).toBeInTheDocument();
+
+    // and it reverts, so the toolbar does not claim a stale success
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(screen.getByTitle("Copy CDP endpoint URL")).toBeInTheDocument();
+  });
+
+  it("does not claim success when the clipboard write is refused", async () => {
+    // Denied permission / insecure context rejects rather than throwing.
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText }, configurable: true,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await mountViewer("/cdp/abc");
+    await act(async () => {
+      screen.getByTitle("Copy CDP endpoint URL").click();
+    });
+
+    expect(screen.getByTitle("Copy CDP endpoint URL")).toBeInTheDocument();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("hides the CDP button when the profile exposes no endpoint", async () => {
+    await mountViewer(null);
+    expect(screen.queryByTitle("Copy CDP endpoint URL")).not.toBeInTheDocument();
+  });
+
+  it("toggles clipboard sync and says the change is not retroactive", async () => {
+    // The flag is baked into the iframe URL, so it can only apply on the next
+    // connect — the title has to say so or the toggle reads as broken.
+    await mountViewer();
+    const enable = screen.getByTitle(/Enable clipboard sync/);
+    expect(enable.getAttribute("title")).toContain("applies on next connect");
+
+    act(() => enable.click());
+    expect(screen.getByTitle(/Disable clipboard sync/)).toBeInTheDocument();
+  });
+
+  it("does not copy frames while the tab is hidden", async () => {
+    // Nothing is being painted, so the copies would be identical.
+    vi.useFakeTimers();
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext");
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden");
+    try {
+      const { container } = await mountViewer();
+      const iframe = container.querySelector("iframe")!;
+      const send = (value: string) => {
+        const ev = new Event("message");
+        Object.defineProperty(ev, "data", {
+          value: { action: "connection_state", value },
+        });
+        Object.defineProperty(ev, "source", { value: iframe.contentWindow });
+        window.dispatchEvent(ev);
+      };
+      act(() => send("connected"));
+      getContext.mockClear();
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(getContext).not.toHaveBeenCalled();
+    } finally {
+      visibility.mockRestore();
+      getContext.mockRestore();
+    }
+  });
+
+  it("gives up quietly when the canvas has no 2D context", async () => {
+    // The real jsdom/headless case, and any browser that refuses the context.
+    const doc = clientDoc();
+    addCanvas(doc, { w: 800, h: 600 });
+    const dest = document.createElement("canvas");
+    vi.spyOn(dest, "getContext").mockReturnValue(null);
+    expect(
+      captureLastFrame({ contentDocument: doc } as unknown as HTMLIFrameElement, dest),
+    ).toBe(false);
+  });
+});

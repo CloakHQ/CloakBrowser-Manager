@@ -28,8 +28,12 @@ export default defineConfig({
         "src/hooks/useViewerSession.ts": {
           statements: 85, branches: 75, functions: 85, lines: 88,
         },
+        // 100% lines. The two uncovered statements (the !wrapperRef.current
+        // and !surface early returns) are defensive guards on refs React has
+        // already populated by the time the handler or effect runs; faking a
+        // null ref to reach them would test the fake, not the component.
         "src/components/ProfileViewer.tsx": {
-          statements: 67, branches: 74, functions: 58, lines: 67,
+          statements: 97, branches: 94, functions: 100, lines: 100,
         },
         "src/lib/api.ts": {
           statements: 100, branches: 84, functions: 100, lines: 100,
