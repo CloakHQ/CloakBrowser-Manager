@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import atexit
 import os
+import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from backend import browser_manager as bm
 from backend import vnc_manager
 from backend.vnc_manager import VNCInstance, VNCManager
 
@@ -18,6 +22,81 @@ from backend.vnc_manager import VNCInstance, VNCManager
 @pytest.fixture()
 def vnc() -> VNCManager:
     return VNCManager()
+
+
+# ── teardown-claim identities ────────────────────────────────────────────────
+# The guard now keys on (pid, /proc/<pid>/stat starttime), so tests need real
+# processes rather than sentinels: a MagicMock cannot be signalled, cannot go
+# zombie and cannot be found by the /proc scan, so none of the behaviours the
+# design turns on are observable against one.
+
+_SPARE_PROCESSES: list[subprocess.Popen] = []
+
+
+def _spawn(*argv: str) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(3600)", *argv],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    _SPARE_PROCESSES.append(proc)
+    return proc
+
+
+@atexit.register
+def _reap_spares() -> None:
+    for proc in _SPARE_PROCESSES:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def _spare_process() -> subprocess.Popen:
+    """A real, live child to stand in for a browser.
+
+    NEVER this process: escalation really calls os.kill, so recording our own
+    pid as the browser would have a test SIGTERM the test runner.
+    """
+    for proc in _SPARE_PROCESSES:
+        if proc.poll() is None:
+            return proc
+    return _spawn()
+
+
+def _ident(pid: int, cdp_port: int = 5100, udd: str = "/tmp/udd") -> bm.BrowserProcess:
+    _state, _ppid, starttime = bm._proc_stat(pid)
+    return bm.BrowserProcess(
+        pid=pid, starttime=starttime, user_data_dir=udd, cdp_port=cdp_port,
+    )
+
+
+def _live_proc(cdp_port: int = 5100, udd: str = "/tmp/udd") -> bm.BrowserProcess:
+    return _ident(_spare_process().pid, cdp_port, udd)
+
+
+def _dead_proc(cdp_port: int = 5100, udd: str = "/tmp/udd") -> bm.BrowserProcess:
+    # Same pid, different starttime: models both a browser that exited and a
+    # pid the kernel has since handed to somebody else.
+    live = _live_proc(cdp_port, udd)
+    return bm.BrowserProcess(
+        pid=live.pid, starttime=live.starttime + 1,
+        user_data_dir=udd, cdp_port=cdp_port,
+    )
+
+
+def _claim(proc: bm.BrowserProcess | None, context=None, **kw) -> bm.ClosingClaim:
+    return bm.ClosingClaim(
+        context=context, proc=proc,
+        user_data_dir=proc.user_data_dir if proc else "/tmp/udd",
+        cdp_port=proc.cdp_port if proc else None,
+        claimed_at=kw.pop("claimed_at", time.monotonic()), **kw,
+    )
+
+
+def _discovers(proc: bm.BrowserProcess | None):
+    """Stand-in for the /proc scan, for tests whose context is a MagicMock."""
+    async def _discover(_udd, _port):
+        return proc
+    return _discover
 
 
 # ── allocate ─────────────────────────────────────────────────────────────────
@@ -222,29 +301,161 @@ def test_preset_values():
     assert _flag_value(flags, "-VideoScaling") == "2"
     assert _flag_value(flags, "-webpEncodingTime") == "30"
     assert _flag_value(flags, "-CompareFB") == "2"
-    assert _flag_value(flags, "-RectThreads") == "2"
 
 
-def test_rect_threads_override(monkeypatch):
+# ── -RectThreads is dead upstream ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", ["text", "balanced", "low", "motion"])
+def test_no_preset_passes_rect_threads(name: str):
+    """rfb::Server::rectThreads is never read in 1.5.0 (oneTBB replaced OpenMP).
+
+    Re-adding it would put a knob back on the box that caps nothing, which is
+    exactly how an operator ends up tuning a dial against a loaded host and
+    watching nothing happen.
+    """
+    assert "-RectThreads" not in vnc_manager.QUALITY_PRESETS[name]
+
+
+def test_rect_threads_env_is_inert_and_says_so(monkeypatch, caplog):
+    """The old KASM_RECT_THREADS knob must not silently pretend to work."""
     monkeypatch.setenv("KASM_RECT_THREADS", "4")
-    flags = vnc_manager._quality_flags("balanced")
-    assert _flag_value(flags, "-RectThreads") == "4"
-
-
-def test_rect_threads_invalid_keeps_default(monkeypatch, caplog):
-    monkeypatch.setenv("KASM_RECT_THREADS", "lots")
     with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
         flags = vnc_manager._quality_flags("balanced")
-    assert _flag_value(flags, "-RectThreads") == "2"
-    assert "Invalid KASM_RECT_THREADS" in caplog.text
+    assert "-RectThreads" not in flags
+    assert "KASM_RECT_THREADS is ignored" in caplog.text
 
 
-def test_rect_threads_zero_warns(monkeypatch, caplog):
-    monkeypatch.setenv("KASM_RECT_THREADS", "0")
+def test_rect_threads_unset_is_silent(monkeypatch, caplog):
+    monkeypatch.delenv("KASM_RECT_THREADS", raising=False)
     with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
-        flags = vnc_manager._quality_flags("balanced")
-    assert _flag_value(flags, "-RectThreads") == "0"
-    assert "unbounded" in caplog.text
+        vnc_manager._quality_flags("balanced")
+    assert "KASM_RECT_THREADS" not in caplog.text
+
+
+# ── encoding policy (-IgnoreClientSettingsKasm vs -videoCodec) ───────────────
+
+
+def test_encoding_policy_default_is_server_authoritative(monkeypatch):
+    monkeypatch.delenv("KASM_ENCODING_POLICY", raising=False)
+    assert vnc_manager._encoding_policy_name() == "server-authoritative"
+
+
+@pytest.mark.parametrize("name", ["server-authoritative", "video"])
+def test_encoding_policy_from_env(monkeypatch, name: str):
+    monkeypatch.setenv("KASM_ENCODING_POLICY", f"  {name.upper()}  ")
+    assert vnc_manager._encoding_policy_name() == name
+
+
+def test_encoding_policy_unknown_falls_back(monkeypatch, caplog):
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "h264-please")
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        assert vnc_manager._encoding_policy_name() == "server-authoritative"
+    assert "Unknown KASM_ENCODING_POLICY" in caplog.text
+
+
+def test_server_authoritative_policy_drops_the_dead_video_codec():
+    """-IgnoreClientSettingsKasm makes -videoCodec unreachable, so don't pass it.
+
+    can_apply = !ignoreClientSettingsKasm gates the ONLY writer of
+    cp.encoder_config, and EncodeManager gates video mode on that field, so the
+    pair together advertises a codec path that can never engage.
+    """
+    flags = vnc_manager._encoding_flags("server-authoritative")
+    assert flags == ["-IgnoreClientSettingsKasm"]
+    assert "-videoCodec" not in flags
+
+
+def test_video_policy_drops_ignore_client_settings():
+    flags = vnc_manager._encoding_flags("video")
+    assert flags == ["-videoCodec", "h264"]
+    assert "-IgnoreClientSettingsKasm" not in flags
+
+
+def test_video_policy_never_offers_auto(monkeypatch: pytest.MonkeyPatch):
+    """"auto" hands encoder choice to the client, which is not safe here.
+
+    Measured live on this image: a client advertising -1037 selected software
+    AV1 (libsvtav1), spent 364ms on one 1080p keyframe, then errored and the
+    session fell back to Tight for its whole lifetime — worse than never
+    enabling video mode, and invisible at the default log level.
+    """
+    monkeypatch.delenv("KASM_VIDEO_CODEC", raising=False)
+    assert "auto" not in vnc_manager._encoding_flags("video")
+
+
+def test_explicit_auto_is_refused(monkeypatch: pytest.MonkeyPatch, caplog):
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "auto")
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        assert vnc_manager._video_codec() == "h264"
+    assert "refused" in caplog.text
+
+
+@pytest.mark.parametrize("codec", ["h264_vaapi", "h265", "av1_vaapi"])
+def test_known_codecs_pass_through(monkeypatch: pytest.MonkeyPatch, codec: str):
+    monkeypatch.setenv("KASM_VIDEO_CODEC", codec)
+    assert vnc_manager._video_codec() == codec
+
+
+def test_unknown_codec_falls_back(monkeypatch: pytest.MonkeyPatch, caplog):
+    monkeypatch.setenv("KASM_VIDEO_CODEC", "vp9")
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        assert vnc_manager._video_codec() == "h264"
+    assert "Unknown KASM_VIDEO_CODEC" in caplog.text
+
+
+def test_inert_preset_flags_are_dropped_under_the_video_policy(caplog):
+    """A flag the server ignores must not be emitted as if it applied.
+
+    In video mode EncodeManager takes the client's resolution rather than
+    -MaxVideoResolution and skips the -TreatLossless promotion, so
+    KASM_QUALITY_PRESET=low would silently still encode full 1080p.
+    """
+    full = vnc_manager._quality_flags("low")
+    assert "-MaxVideoResolution" in full and "-TreatLossless" in full
+
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.vnc"):
+        trimmed = vnc_manager._quality_flags(
+            "low", drop=vnc_manager._INERT_UNDER_VIDEO_POLICY,
+        )
+    for flag in vnc_manager._INERT_UNDER_VIDEO_POLICY:
+        assert flag not in trimmed
+    assert "-TreatLossless" in trimmed  # inert-looking, but load-bearing
+    # the flag's VALUE must go with it, or the next flag inherits it as its own
+    assert "1280x720" not in trimmed
+    # everything else survives with its own value still attached
+    assert trimmed[trimmed.index("-FrameRate") + 1] == "24"
+    assert trimmed[trimmed.index("-VideoScaling") + 1] == "2"
+    assert "inert" in caplog.text
+
+
+@pytest.mark.parametrize("policy", ["server-authoritative", "video"])
+def test_encoding_flags_are_mutually_exclusive(policy: str):
+    """Neither policy may ever emit both halves of the exclusive pair."""
+    flags = vnc_manager._encoding_flags(policy)
+    assert ("-IgnoreClientSettingsKasm" in flags) != ("-videoCodec" in flags)
+
+
+@pytest.mark.parametrize("name", ["text", "balanced", "low", "motion"])
+def test_presets_never_carry_an_encoding_policy_flag(name: str):
+    """_encoding_flags must stay the single emitter, or the exclusion breaks."""
+    preset = vnc_manager.QUALITY_PRESETS[name]
+    assert "-IgnoreClientSettingsKasm" not in preset
+    assert "-videoCodec" not in preset
+
+
+@pytest.mark.parametrize(
+    "policy,needle",
+    [
+        ("server-authoritative", "in-band H.264/H.265/AV1 is"),
+        ("video", "override the quality preset"),
+    ],
+)
+def test_encoding_policy_logs_its_trade_off(caplog, policy: str, needle: str):
+    """The operator must see what the active policy costs, not just its name."""
+    with caplog.at_level("INFO", logger="cloakbrowser.manager.vnc"):
+        vnc_manager._encoding_flags(policy)
+    assert needle in caplog.text
 
 
 # ── hw3d (DRI3) detection ────────────────────────────────────────────────────
@@ -357,7 +568,10 @@ async def test_start_vnc_base_command_unchanged(vnc: VNCManager, xvnc_cmd, monke
     cmd = xvnc_cmd["cmd"]
     assert ":100" in cmd
     assert _flag_value(cmd, "-websocketPort") == "6100"
-    assert _flag_value(cmd, "-rfbport") == "-1"
+    # -rfbport is not passed: KasmVNC 1.5.0 takes the raw-RFB listener branch
+    # only under -noWebsocket, so the flag is inert either way and claiming it
+    # "disables the raw port" describes a control that does not exist.
+    assert "-rfbport" not in cmd
     assert _flag_value(cmd, "-geometry") == "1920x1080"
     assert _flag_value(cmd, "-depth") == "24"
     assert _flag_value(cmd, "-interface") == "127.0.0.1"
@@ -372,17 +586,76 @@ async def test_start_vnc_base_command_unchanged(vnc: VNCManager, xvnc_cmd, monke
 async def test_start_vnc_performance_flags(vnc: VNCManager, xvnc_cmd, monkeypatch):
     monkeypatch.setenv("KASM_HW3D", "0")
     monkeypatch.delenv("KASM_QUALITY_PRESET", raising=False)
-    monkeypatch.delenv("KASM_RECT_THREADS", raising=False)
+    monkeypatch.delenv("KASM_ENCODING_POLICY", raising=False)
     await vnc.start_vnc(100, 6100)
     cmd = xvnc_cmd["cmd"]
     assert "-IgnoreClientSettingsKasm" in cmd  # server owns encoding policy
     assert _flag_value(cmd, "-FrameRate") == "30"
     assert _flag_value(cmd, "-MaxVideoResolution") == "1600x900"
-    assert _flag_value(cmd, "-RectThreads") == "2"
+    assert "-RectThreads" not in cmd
     assert "-hw3d" not in cmd
-    # Streaming codec must be set explicitly — the binary default is empty
-    # (disabled), the man page's "auto" claim is wrong.
-    assert _flag_value(cmd, "-videoCodec") == "auto"
+    # -videoCodec would be dead weight next to -IgnoreClientSettingsKasm: the
+    # server refuses the client's streaming-mode pseudo-encodings, so
+    # cp.encoder_config stays `unavailable` and video mode never engages.
+    assert "-videoCodec" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_start_vnc_video_policy_swaps_the_exclusive_pair(
+    vnc: VNCManager, xvnc_cmd, monkeypatch,
+):
+    """KASM_ENCODING_POLICY=video is the only way to reach WebCodecs H.264."""
+    monkeypatch.setenv("KASM_HW3D", "0")
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "video")
+    await vnc.start_vnc(100, 6100)
+    cmd = xvnc_cmd["cmd"]
+    assert _flag_value(cmd, "-videoCodec") == "h264"
+    assert "-IgnoreClientSettingsKasm" not in cmd
+    # The preset still ships; only who may override it changed.
+    assert _flag_value(cmd, "-FrameRate") == "30"
+    # ...except -MaxVideoResolution, which this policy makes inert and which
+    # must NOT be passed as if it still capped anything.
+    assert "-MaxVideoResolution" not in cmd
+    # -TreatLossless is NOT inert here: it governs the Tight path, which is
+    # still taken for every frame the client has not put in video mode.
+    # Dropping it silently reverted the preset to the binary default (off).
+    assert _flag_value(cmd, "-TreatLossless") == "8"
+
+
+@pytest.mark.asyncio
+async def test_start_vnc_logs_at_a_level_that_shows_codec_decisions(
+    vnc: VNCManager, xvnc_cmd, monkeypatch,
+):
+    """Without -Log the applied/ignored codec lines are DEBUG-only.
+
+    A session that fell back to Tight because the chosen encoder failed to open
+    then looks identical in the shipped logs to one streaming correctly.
+    """
+    monkeypatch.setenv("KASM_HW3D", "0")
+    monkeypatch.delenv("KASM_XVNC_LOG_LEVEL", raising=False)
+    await vnc.start_vnc(100, 6100)
+    assert _flag_value(xvnc_cmd["cmd"], "-Log") == "*:stdout:30"
+
+    monkeypatch.setenv("KASM_XVNC_LOG_LEVEL", "100")
+    await vnc.start_vnc(101, 6101)
+    assert _flag_value(xvnc_cmd["cmd"], "-Log") == "*:stdout:100"
+
+    monkeypatch.setenv("KASM_XVNC_LOG_LEVEL", "nonsense")
+    await vnc.start_vnc(102, 6102)
+    assert _flag_value(xvnc_cmd["cmd"], "-Log") == "*:stdout:30"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["server-authoritative", "video", "nonsense"])
+async def test_start_vnc_never_passes_both_encoding_flags(
+    vnc: VNCManager, xvnc_cmd, monkeypatch, policy: str,
+):
+    """The pair is mutually exclusive in KasmVNC 1.5.0 — including on fallback."""
+    monkeypatch.setenv("KASM_HW3D", "0")
+    monkeypatch.setenv("KASM_ENCODING_POLICY", policy)
+    await vnc.start_vnc(100, 6100)
+    cmd = xvnc_cmd["cmd"]
+    assert ("-IgnoreClientSettingsKasm" in cmd) != ("-videoCodec" in cmd)
 
 
 @pytest.mark.asyncio
@@ -615,6 +888,9 @@ async def test_launch_reclaims_display_if_the_browser_dies_before_registration(
     context.on = MagicMock()
 
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     stop_vnc = AsyncMock()
     monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
@@ -737,6 +1013,9 @@ async def test_launch_closes_the_context_when_a_later_step_fails(monkeypatch, tm
     context.add_init_script = AsyncMock(side_effect=RuntimeError("browser wedged"))
 
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
@@ -765,6 +1044,9 @@ async def test_launch_closes_the_context_when_cancelled(monkeypatch, tmp_path):
 
     context.add_init_script = never_returns
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
@@ -862,6 +1144,9 @@ async def test_launch_cancellation_is_not_held_open_by_a_wedged_context(
     context.close = never_closes
     context.add_init_script = never_returns
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     stop_vnc = AsyncMock()
     monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
@@ -955,11 +1240,12 @@ async def test_a_wedged_stop_blocks_relaunch_until_the_close_lands(monkeypatch, 
     context.close = never_closes
     mgr.running["p1"] = bm.RunningProfile(
         profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+        user_data_dir=str(tmp_path / "p1"), proc=_live_proc(),
     )
     monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
     assert await mgr.stop("p1") is False
-    assert mgr.is_wedged("p1") is True
+    assert await mgr.check_wedged("p1") is True
 
     # a relaunch must be refused while the old Chromium is still alive
     with pytest.raises(bm.ProfileAlreadyRunning):
@@ -967,7 +1253,7 @@ async def test_a_wedged_stop_blocks_relaunch_until_the_close_lands(monkeypatch, 
 
     # ...and allowed again once the close finally lands
     await mgr._on_browser_closed("p1", context)
-    assert mgr.is_wedged("p1") is False
+    assert await mgr.check_wedged("p1") is False
 
 
 @pytest.mark.asyncio
@@ -995,6 +1281,9 @@ async def test_aborted_launch_records_a_wedged_browser(monkeypatch, tmp_path):
     context.close = never
     context.add_init_script = never
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
@@ -1005,12 +1294,12 @@ async def test_aborted_launch_records_a_wedged_browser(monkeypatch, tmp_path):
 
     assert mgr.is_starting("p1") is False
     assert "p1" not in mgr.running
-    assert mgr.is_wedged("p1") is True          # gated, not forgotten
+    assert mgr.peek_wedged("p1") is True        # gated, not forgotten
     assert handlers, "close handler must be registered before the setup awaits"
 
     # the handler registered up-front is what eventually clears it
     await mgr._on_browser_closed("p1", context)
-    assert mgr.is_wedged("p1") is False
+    assert mgr.peek_wedged("p1") is False
 
 
 @pytest.mark.asyncio
@@ -1026,7 +1315,7 @@ async def test_wedge_clears_even_when_another_instance_holds_the_id(monkeypatch)
 
     mgr = bm.BrowserManager()
     wedged_context = MagicMock(name="A")
-    mgr._closing["p1"] = (wedged_context, time.monotonic() + 60, None, time.monotonic())
+    mgr._closing["p1"] = _claim(_live_proc(), context=wedged_context)
     # some other instance now owns the id
     mgr.running["p1"] = bm.RunningProfile(
         profile_id="p1", context=MagicMock(name="B"), display=101, ws_port=6101, cdp_port=5101,
@@ -1035,7 +1324,7 @@ async def test_wedge_clears_even_when_another_instance_holds_the_id(monkeypatch)
 
     await mgr._on_browser_closed("p1", wedged_context)
 
-    assert mgr.is_wedged("p1") is False        # resolved
+    assert mgr.peek_wedged("p1") is False      # resolved
     assert "p1" in mgr.running                 # and the live instance untouched
 
 
@@ -1065,6 +1354,7 @@ async def test_profile_is_guarded_for_the_whole_teardown_not_just_on_failure(
     context.close = slow_close
     mgr.running["p1"] = bm.RunningProfile(
         profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+        proc=_live_proc(),
     )
     monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
@@ -1072,33 +1362,150 @@ async def test_profile_is_guarded_for_the_whole_teardown_not_just_on_failure(
     await aio.sleep(0)  # let stop() reach the close
     await aio.sleep(0)
 
-    # mid-close: gone from running, but must NOT look free
+    # mid-close: gone from running, but must NOT look free — and the read path
+    # must say so, because "stopped" here offered the user a Launch button for
+    # a browser that is still alive.
     assert "p1" not in mgr.running
-    assert mgr.is_wedged("p1") is True
+    assert mgr.peek_wedged("p1") is True
+    assert mgr.get_status("p1")["status"] == "stopping"
 
     release.set()
     assert await task is True                 # closed cleanly in the end
-    assert mgr.is_wedged("p1") is False       # and the claim is released
+    assert mgr.peek_wedged("p1") is False     # and the claim is released
+    assert mgr.get_status("p1")["status"] == "stopped"
 
 
 @pytest.mark.asyncio
-async def test_a_browser_that_never_closes_does_not_brick_the_profile(monkeypatch):
-    """The guard needs a release valve.
+async def test_the_guard_releases_on_evidence_of_death_not_on_a_timer():
+    """The release condition is "that process is gone", with no ceiling.
 
-    Without a ceiling, a browser that never reports its close leaves launch
-    409ing, delete 409ing and stop 404ing for the life of the container — the
-    profile is simply unusable.
+    The old guard released on elapsed time, which is wrong in one direction
+    whatever the timer is set to: too short hands a live browser's
+    user_data_dir to a delete, too long bricks the profile. (pid, starttime)
+    answers the question directly, so neither trade-off is needed.
     """
-    from backend import browser_manager as bm
-
     mgr = bm.BrowserManager()
-    mgr._closing["p1"] = (MagicMock(), time.monotonic() + bm.CLOSING_CLAIM_TTL_S, None, time.monotonic())
-    assert mgr.is_wedged("p1") is True
 
-    # ...once the claim expires the profile is usable again
-    mgr._closing["p1"] = (MagicMock(), time.monotonic() - 0.01, None, time.monotonic())
-    assert mgr.is_wedged("p1") is False
-    assert "p1" not in mgr._closing        # and the entry is dropped
+    # a live process holds the guard however long the claim has been held; the
+    # only thing elapsed time drives is escalation, stubbed out here
+    signals: list[int] = []
+    monkeypatch_kill = signals.append
+    mgr._closing["p1"] = _claim(
+        _live_proc(), claimed_at=time.monotonic() - 100_000,
+    )
+    original_kill = bm.os.kill
+    try:
+        bm.os.kill = lambda _pid, sig: monkeypatch_kill(sig)
+        assert await mgr.check_wedged("p1") is True
+    finally:
+        bm.os.kill = original_kill
+    assert "p1" in mgr._closing
+
+    # ...and a claim whose process is gone releases at once, however fresh
+    mgr._closing["p2"] = _claim(_dead_proc(), claimed_at=time.monotonic())
+    assert await mgr.check_wedged("p2") is False
+    assert "p2" not in mgr._closing
+
+
+@pytest.mark.asyncio
+async def test_a_stored_identity_whose_starttime_moved_is_never_signalled():
+    """pid reuse must not turn escalation into killing a bystander."""
+    mgr = bm.BrowserManager()
+    killed: list[tuple[int, int]] = []
+    # long past both escalation deadlines, so only the identity check can stop it
+    mgr._closing["p1"] = _claim(
+        _dead_proc(),
+        claimed_at=time.monotonic() - (bm.CLOSING_SIGTERM_AFTER_S + 100),
+    )
+
+    original_kill = bm.os.kill
+    try:
+        bm.os.kill = lambda pid, sig: killed.append((pid, sig))
+        assert await mgr.check_wedged("p1") is False
+    finally:
+        bm.os.kill = original_kill
+
+    assert killed == []                        # the pid was recycled: hands off
+    assert "p1" not in mgr._closing
+
+
+@pytest.mark.asyncio
+async def test_a_browser_that_will_not_close_is_escalated_then_released():
+    """SIGTERM, then SIGKILL, then release only once the process is gone.
+
+    This is what replaces the ceiling: the manager ENDS the teardown it is
+    waiting on instead of choosing between bricking the profile and releasing
+    the guard under a live Chromium. Run against a REAL process that ignores
+    SIGTERM, because that is the case the two-step escalation exists for and
+    the one a mock cannot express.
+    """
+    import asyncio as aio
+
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "sys.stdout.write('ready\\n'); sys.stdout.flush(); time.sleep(60)"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    # Handshake, not a sleep: interpreter start-up is slower than the first
+    # SIGTERM, and a race here would silently test the wrong thing.
+    assert child.stdout.readline().strip() == "ready"
+    try:
+        mgr = bm.BrowserManager()
+        claim = _claim(
+            _ident(child.pid),
+            claimed_at=time.monotonic() - bm.CLOSING_SIGTERM_AFTER_S,
+        )
+        mgr._closing["p1"] = claim
+
+        assert await mgr.check_wedged("p1") is True
+        assert claim.sigterm_at is not None
+        await aio.sleep(0.2)
+        assert child.poll() is None            # SIGTERM ignored, still alive
+        assert await mgr.check_wedged("p1") is True   # guard held, not released
+
+        # past the SIGKILL grace period the manager stops asking nicely
+        claim.sigterm_at = time.monotonic() - bm.CLOSING_SIGKILL_AFTER_S
+        assert await mgr.check_wedged("p1") is True
+        assert claim.sigkill_at is not None
+
+        for _ in range(100):
+            await aio.sleep(0.02)
+            if not await mgr.check_wedged("p1"):
+                break
+        assert "p1" not in mgr._closing        # released on proof of death
+        assert child.poll() is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_in_flight_is_never_escalated():
+    """A launch holds a claim for its whole duration; it is not a teardown.
+
+    Without this exemption a launch slower than CLOSING_SIGTERM_AFTER_S (the
+    ceiling is LAUNCH_TIMEOUT_S = 60s) would have its own healthy Chromium
+    SIGTERMed by the sweeper.
+    """
+    mgr = bm.BrowserManager()
+    mgr._launching.add("p1")
+    mgr._closing["p1"] = _claim(
+        _live_proc(),
+        claimed_at=time.monotonic() - (bm.CLOSING_SIGTERM_AFTER_S + 100),
+    )
+
+    signals: list[int] = []
+    original_kill = bm.os.kill
+    try:
+        bm.os.kill = lambda pid, sig: signals.append(sig)
+        assert await mgr.check_wedged("p1") is True
+    finally:
+        bm.os.kill = original_kill
+
+    assert signals == []
+    assert "p1" in mgr._closing        # and the entry is dropped
 
 
 def test_unknown_hw3d_value_falls_back_to_auto(monkeypatch, caplog):
@@ -1147,6 +1554,9 @@ async def test_launch_abort_guards_the_profile_for_its_whole_cleanup(monkeypatch
     context.close = slow_close
     context.add_init_script = boom
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
@@ -1155,43 +1565,204 @@ async def test_launch_abort_guards_the_profile_for_its_whole_cleanup(monkeypatch
         await aio.sleep(0)          # let it reach the abort's close
 
     assert mgr.is_starting("p1") is False   # already out of _launching
-    assert mgr.is_wedged("p1") is True      # but NOT free
+    assert mgr.peek_wedged("p1") is True    # but NOT free
 
     release.set()
     with pytest.raises(RuntimeError, match="setup failed"):
         await task
-    assert mgr.is_wedged("p1") is False     # claim released once closed
+    assert mgr.peek_wedged("p1") is False   # claim released once closed
 
 
 @pytest.mark.asyncio
-async def test_claim_is_not_released_while_the_browser_is_still_listening():
-    """The TTL must decide on evidence, not on the X-server assumption.
+async def test_claim_is_not_released_while_the_browser_is_still_alive():
+    """A headless profile survives stop_vnc(), so time says nothing.
 
-    A headless profile keeps running after stop_vnc() kills the display, so
-    releasing purely on elapsed time hands a live browser's user_data_dir to
-    the next launch or delete.
+    Killing the display tells us nothing about a headless Chromium; releasing
+    on elapsed time hands a live browser's user_data_dir to the next launch or
+    delete. Only the process itself can answer.
     """
-    import socket as socket_mod
-    from backend import browser_manager as bm
-
-    listener = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    port = listener.getsockname()[1]
     mgr = bm.BrowserManager()
-    try:
-        # claim already expired, but the browser is demonstrably alive
-        mgr._closing["p1"] = (MagicMock(), time.monotonic() - 1, port, time.monotonic())
-        assert mgr.is_wedged("p1") is True
-        # and the deadline is pushed out rather than the claim dropped
-        assert mgr._closing["p1"][1] > time.monotonic()
-    finally:
-        listener.close()
+    claim = _claim(_live_proc())
+    mgr._closing["p1"] = claim
+    assert await mgr.check_wedged("p1") is True
+    assert mgr._closing["p1"] is claim         # held, and not rewritten
 
-    # once it really is gone, the expired claim releases
-    mgr._closing["p1"] = (MagicMock(), time.monotonic() - 1, port, time.monotonic())
-    assert mgr.is_wedged("p1") is False
+    mgr._closing["p1"] = _claim(_dead_proc())
+    assert await mgr.check_wedged("p1") is False
     assert "p1" not in mgr._closing
+
+
+@pytest.mark.asyncio
+async def test_peek_wedged_never_probes_and_never_mutates():
+    """The status path runs on an executor thread; it must be inert.
+
+    get_liveness_async() runs get_liveness -> get_status in a thread pool. A
+    probing, mutating check there raced the loop's own writes: a `del` raised
+    KeyError when the close handler removed the entry first, and a re-write
+    resurrected a claim stop() had already released, re-wedging a cleanly
+    closed profile.
+    """
+    from unittest.mock import patch
+
+    mgr = bm.BrowserManager()
+    claim = _claim(_dead_proc(), claimed_at=time.monotonic() - 100_000)
+    mgr._closing["abc"] = claim
+
+    with patch("backend.browser_manager.socket.socket") as sock, \
+            patch("backend.browser_manager.os.listdir") as listdir:
+        for _ in range(5):
+            assert mgr.peek_wedged("abc") is True
+            assert mgr.get_status("abc")["status"] == "stopping"
+            assert mgr.get_liveness("abc")["status"] == "stopping"
+        sock.assert_not_called()
+        listdir.assert_not_called()
+
+    assert mgr._closing["abc"] is claim        # byte-identical: nothing moved
+
+
+@pytest.mark.asyncio
+async def test_resolve_does_not_clobber_a_replacement_claim():
+    """The resurrection race: a verdict may only apply to the claim it probed."""
+    mgr = bm.BrowserManager()
+    probed = _claim(_dead_proc())
+    replacement = _claim(_live_proc())
+    mgr._closing["p1"] = replacement
+
+    # a verdict computed for `probed` arrives late
+    assert mgr._apply_claim_verdict("p1", probed, alive=False, discovered=None) is True
+    assert mgr._closing["p1"] is replacement
+
+
+@pytest.mark.asyncio
+async def test_check_wedged_probes_off_the_event_loop():
+    """A blocking probe under BrowserManager._lock froze the loop for 254ms.
+
+    That loop also serves nginx's viewer auth_request subrequests for every
+    live session, so an unrelated relaunch stalled every connected viewer.
+    """
+    import asyncio as aio
+
+    mgr = bm.BrowserManager()
+    mgr._closing["p1"] = _claim(_live_proc())
+    seen: dict[str, bool] = {}
+    original = bm.BrowserManager._claim_evidence
+
+    def recording(claim):
+        try:
+            aio.get_running_loop()
+            seen["on_loop"] = True
+        except RuntimeError:
+            seen["on_loop"] = False
+        return original(claim)
+
+    mgr._claim_evidence = staticmethod(recording)
+    await mgr.check_wedged("p1")
+    assert seen.get("on_loop") is False
+
+
+@pytest.mark.asyncio
+async def test_launch_does_not_probe_under_the_lock():
+    """check_wedged must run before _lock is taken, not inside it."""
+    import asyncio as aio
+
+    mgr = bm.BrowserManager()
+    mgr._closing["p1"] = _claim(_dead_proc())
+    held: list[bool] = []
+
+    def recording(claim):
+        held.append(mgr._lock.locked())
+        return (False, None)
+
+    mgr._claim_evidence = staticmethod(recording)
+    with pytest.raises(Exception):
+        # the claim resolves, so the launch proceeds and fails later on I/O
+        await mgr.launch({"id": "p1", "user_data_dir": "/nonexistent/x"})
+    assert held == [False]
+
+
+@pytest.mark.asyncio
+async def test_the_sweeper_releases_a_claim_nobody_asks_about():
+    """With a pure peek in the status path, nothing else opens the valve.
+
+    Otherwise a profile whose browser exited quietly reports "stopping" with
+    launch/stop/delete all refusing, forever — and the UI renders that as a
+    disabled button, so there is no user action left that could release it.
+    """
+    mgr = bm.BrowserManager()
+    mgr._closing["p1"] = _claim(_dead_proc())
+    mgr._closing["p2"] = _claim(_live_proc())
+
+    await mgr.sweep_teardown_claims()
+
+    assert mgr.get_status("p1")["status"] == "stopped"
+    assert mgr.get_status("p2")["status"] == "stopping"
+
+
+@pytest.mark.asyncio
+async def test_the_sweeper_survives_a_claim_that_raises():
+    """One bad claim must not stop every other one from being resolved."""
+    mgr = bm.BrowserManager()
+    mgr._closing["bad"] = _claim(_live_proc())
+    mgr._closing["good"] = _claim(_dead_proc())
+
+    async def explode(profile_id):
+        if profile_id == "bad":
+            raise RuntimeError("boom")
+        return mgr._apply_claim_verdict(
+            profile_id, mgr._closing[profile_id], alive=False, discovered=None,
+        )
+
+    mgr.check_wedged = explode  # type: ignore[assignment]
+    await mgr.sweep_teardown_claims()          # must not raise
+
+    assert "good" not in mgr._closing
+
+
+@pytest.mark.asyncio
+async def test_the_reaper_retires_a_browser_whose_driver_died(monkeypatch):
+    """Playwright emits NO close event when its node driver dies.
+
+    The event is driven by a message FROM the driver, so killing the driver
+    takes Chromium with it while is_closed() stays False and nothing fires.
+    _on_browser_closed() then never runs: the profile reports "running"
+    forever, /launch answers 409 forever, and the display, ws_port and
+    password file are held for the life of the container.
+    """
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    context = MagicMock()
+    context.is_closed.return_value = False     # exactly what the driver death shows
+    mgr.running["p1"] = bm.RunningProfile(
+        profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+        proc=_dead_proc(),
+    )
+    stop_vnc = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
+
+    await mgr.reap_dead_browsers()
+
+    assert "p1" not in mgr.running
+    stop_vnc.assert_awaited_once_with(100)
+    assert mgr.get_status("p1")["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_the_reaper_leaves_a_live_browser_alone(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    mgr.running["p1"] = bm.RunningProfile(
+        profile_id="p1", context=MagicMock(), display=100, ws_port=6100, cdp_port=5100,
+        proc=_live_proc(),
+    )
+    stop_vnc = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
+
+    await mgr.reap_dead_browsers()
+
+    assert "p1" in mgr.running
+    stop_vnc.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1211,6 +1782,9 @@ async def test_browser_exit_during_registration_reclaims_the_display_once(
     context.on = MagicMock()
 
     monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    # launch() fails closed when it cannot identify the Chromium it just
+    # started; a MagicMock context has no process behind it.
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
     monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
     stop_vnc = AsyncMock()
     monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
@@ -1223,10 +1797,15 @@ async def test_browser_exit_during_registration_reclaims_the_display_once(
 
 @pytest.mark.asyncio
 async def test_cancelling_stop_keeps_the_guard(monkeypatch):
-    """The close is shielded, so a cancelled stop() must not free the profile."""
+    """The close is shielded, so a cancelled stop() must not free the profile.
+
+    stop_vnc must be a coroutine that actually SUSPENDS and the task must be
+    cancelled TWICE. With an AsyncMock (which never reaches a suspension
+    point) and a single wait_for cancellation, the pending cancellation is
+    never re-delivered inside the finally, so the shield the test is named
+    after is a no-op and removing it leaves the suite green.
+    """
     import asyncio as aio
-    from unittest.mock import AsyncMock
-    from backend import browser_manager as bm
 
     mgr = bm.BrowserManager()
     context = MagicMock()
@@ -1238,50 +1817,344 @@ async def test_cancelling_stop_keeps_the_guard(monkeypatch):
     context.close = slow_close
     mgr.running["p1"] = bm.RunningProfile(
         profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+        proc=_live_proc(),
     )
-    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
 
-    stop_vnc = AsyncMock()
-    monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
+    released: list[int] = []
 
-    with pytest.raises(aio.TimeoutError):
-        await aio.wait_for(mgr.stop("p1"), timeout=0.05)
+    async def suspending_stop_vnc(display: int):
+        await aio.sleep(0.01)                  # a real stop_vnc takes a lock
+        released.append(display)
+
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", suspending_stop_vnc)
+
+    task = aio.ensure_future(mgr.stop("p1"))
+    for _ in range(4):
+        await aio.sleep(0)                     # let it reach the bounded close
+    task.cancel()                              # 1: unwinds into the finally
     await aio.sleep(0)
+    task.cancel()                              # 2: lands ON the stop_vnc await
+    with pytest.raises(aio.CancelledError):
+        await task
+    await aio.sleep(0.05)                      # let the shielded task finish
 
-    assert mgr.is_wedged("p1") is True         # still guarded
-    stop_vnc.assert_awaited()                  # but the display is NOT leaked
+    assert released == [100]                   # display, ws_port, passwd freed
+    assert mgr.peek_wedged("p1") is True       # and still guarded
 
 
 @pytest.mark.asyncio
-async def test_a_recycled_cdp_port_cannot_brick_a_profile_forever():
-    """"Something answers" is not proof it is OUR browser.
+async def test_a_recycled_pid_cannot_brick_a_profile():
+    """A recycled pid is a DIFFERENT process, and the claim must release.
 
-    CDP ports cycle 5100-5199, so a later profile's Chromium can bind the port
-    a stale claim remembers. Without an absolute ceiling that unrelated browser
-    would extend the claim indefinitely.
+    The old guard keyed on "is anything listening on the remembered CDP port",
+    which a later profile's Chromium could satisfy — so it needed an absolute
+    ceiling to escape, and that ceiling then released real wedges early.
+    (pid, starttime) cannot alias, so neither the aliasing nor the ceiling
+    that compensated for it exists any more.
     """
-    import socket as socket_mod
+    mgr = bm.BrowserManager()
+    proc = _live_proc()
+    mgr._closing["p1"] = _claim(proc)
+    assert await mgr.check_wedged("p1") is True
+
+    # same pid, different starttime: the pid was reused after our browser died
+    mgr._closing["p1"] = _claim(
+        bm.BrowserProcess(
+            pid=proc.pid, starttime=proc.starttime + 1,
+            user_data_dir=proc.user_data_dir, cdp_port=proc.cdp_port,
+        ),
+    )
+    assert await mgr.check_wedged("p1") is False
+    assert "p1" not in mgr._closing
+
+
+@pytest.mark.asyncio
+async def test_a_launch_cancelled_inside_playwright_still_guards_the_profile(
+    monkeypatch, tmp_path,
+):
+    """Cancellation there is Python-side only; the driver keeps launching.
+
+    LAUNCH_TIMEOUT_S is exactly this case. With the claim taken only once
+    `context` existed, the Chromium the node driver went on to start had NO
+    owner: the next launch unlinked the Singleton locks and opened a SECOND
+    browser on the same live user_data_dir, and DELETE rmtree'd underneath it.
+    """
+    import asyncio as aio
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+
+    async def never_returns(*_a, **_k):
+        await aio.sleep(3600)
+
+    monkeypatch.setattr(bm, "launch_persistent_context_async", never_returns)
+    monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+    # the driver went on to start a Chromium the abandoned coroutine never saw
+    monkeypatch.setattr(bm, "discover_browser_process", lambda *_a: _live_proc())
+
+    with pytest.raises(aio.TimeoutError):
+        await aio.wait_for(
+            mgr.launch({"id": "p1", "user_data_dir": str(tmp_path / "p1")}),
+            timeout=0.05,
+        )
+
+    assert mgr.is_starting("p1") is False
+    assert "p1" not in mgr.running
+    assert mgr.peek_wedged("p1") is True        # the orphan has an owner
+    claim = mgr._closing["p1"]
+    assert claim.context is None                # nothing to close: rediscover
+    assert claim.user_data_dir == str(tmp_path / "p1")
+    assert claim.cdp_port is not None
+
+    # a relaunch is refused until the orphan is proven gone. Bounded, because
+    # without the guard this call reaches the hanging Playwright stub and the
+    # failure mode would be a hung suite rather than a failed assertion.
+    with pytest.raises(bm.ProfileAlreadyRunning):
+        await aio.wait_for(
+            mgr.launch({"id": "p1", "user_data_dir": str(tmp_path / "p1")}),
+            timeout=2.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_identity_less_claim_adopts_the_orphan_the_scan_finds(monkeypatch):
+    """A claim with no context resolves by looking for the process itself."""
+    mgr = bm.BrowserManager()
+    orphan = _live_proc(cdp_port=5177, udd="/tmp/orphan")
+    mgr._closing["p1"] = bm.ClosingClaim(
+        context=None, proc=None, user_data_dir="/tmp/orphan", cdp_port=5177,
+        claimed_at=time.monotonic(),
+    )
+    monkeypatch.setattr(bm, "discover_browser_process", lambda *_a: orphan)
+
+    assert await mgr.check_wedged("p1") is True
+    assert mgr._closing["p1"].proc == orphan    # identity adopted, guard held
+
+
+@pytest.mark.asyncio
+async def test_an_identity_less_claim_releases_when_no_orphan_exists(monkeypatch):
+    mgr = bm.BrowserManager()
+    mgr._closing["p1"] = bm.ClosingClaim(
+        context=None, proc=None, user_data_dir="/tmp/orphan", cdp_port=5177,
+        claimed_at=time.monotonic(),
+    )
+    monkeypatch.setattr(bm, "discover_browser_process", lambda *_a: None)
+
+    assert await mgr.check_wedged("p1") is False
+    assert "p1" not in mgr._closing
+
+
+@pytest.mark.asyncio
+async def test_launch_fails_closed_when_the_browser_cannot_be_identified(
+    monkeypatch, tmp_path,
+):
+    """An unidentifiable browser can be neither proven dead nor escalated.
+
+    Registering one would put the teardown guard back on guesswork, which is
+    the thing the pid identity exists to remove.
+    """
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.pages = []
+    context.on = MagicMock()
+    context.close = AsyncMock()
+    context.add_init_script = AsyncMock()
+
+    monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(None))
+    monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="Could not identify"):
+        await mgr.launch({"id": "p1", "user_data_dir": str(tmp_path / "p1")})
+
+    assert "p1" not in mgr.running
+    context.close.assert_awaited()              # and the browser was closed
+
+
+@pytest.mark.asyncio
+async def test_a_successful_launch_drops_the_launch_phase_claim(monkeypatch, tmp_path):
+    """A live profile must not read as "stopping" or refuse stop/delete."""
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.pages = []
+    context.on = MagicMock()
+    context.add_init_script = AsyncMock()
+
+    proc = _live_proc()
+    monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(proc))
+    monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    running = await mgr.launch({"id": "p1", "user_data_dir": str(tmp_path / "p1")})
+
+    assert running.proc == proc
+    assert running.session_epoch                # a nonce, not a recycled port
+    assert mgr.peek_wedged("p1") is False
+    assert mgr.get_status("p1")["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_stop_reports_false_when_it_loses_the_pop_race(monkeypatch):
+    """The documented contract is what DELETE trusts before it rmtrees.
+
+    The early return used to answer True for any caller that found nothing in
+    `running` — including one racing a teardown that is still awaiting a close
+    which may never land.
+    """
+    import asyncio as aio
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    release = aio.Event()
+    context = MagicMock()
+    context.is_closed.return_value = False
+
+    async def slow_close():
+        await release.wait()
+
+    context.close = slow_close
+    mgr.running["p1"] = bm.RunningProfile(
+        profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+        proc=_live_proc(),
+    )
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    first = aio.ensure_future(mgr.stop("p1"))
+    for _ in range(4):
+        await aio.sleep(0)
+    assert mgr.peek_wedged("p1") is True
+
+    assert await mgr.stop("p1") is False        # lost the race, and says so
+
+    release.set()
+    assert await first is True
+
+
+@pytest.mark.asyncio
+async def test_on_browser_closed_cannot_clear_a_claim_it_does_not_own(monkeypatch):
+    """The identity check used to be bypassed whenever context was omitted.
+
+    Correct for its single caller, and a silent way for any second caller to
+    hand a live Chromium's user_data_dir to the next launch.
+    """
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    other_context = MagicMock(name="A")
+    mgr._closing["p1"] = _claim(_live_proc(), context=other_context)
+    mgr.running["p1"] = bm.RunningProfile(
+        profile_id="p1", context=MagicMock(name="B"), display=101, ws_port=6101,
+        cdp_port=5101, proc=_live_proc(),
+    )
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    await mgr._on_browser_closed("p1", mgr.running["p1"].context)
+
+    assert mgr.peek_wedged("p1") is True        # A's claim survives B's close
+    assert mgr._closing["p1"].context is other_context
+
+
+# ── headless profiles never allocate a display ───────────────────────────────
+
+
+def _launchable_context():
+    """A context that survives launch()'s registration re-check."""
+    from unittest.mock import AsyncMock
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.pages = []
+    context.add_init_script = AsyncMock()
+    context.close = AsyncMock()
+    context.on = MagicMock()
+    return context
+
+
+@pytest.mark.asyncio
+async def test_headless_launch_allocates_no_display_and_starts_no_xvnc(
+    monkeypatch, tmp_path,
+):
+    """A headless Chromium never draws to X, so an Xvnc for it is pure waste.
+
+    Twenty headless scraping profiles used to mean twenty idle Xvnc servers,
+    twenty displays, twenty ws ports and twenty password files that no pixel
+    would ever traverse — plus a viewer affordance onto an empty root window.
+    """
+    from unittest.mock import AsyncMock
     from backend import browser_manager as bm
 
-    listener = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    port = listener.getsockname()[1]
     mgr = bm.BrowserManager()
-    try:
-        # held just under the ceiling: a listening port still extends it
-        mgr._closing["p1"] = (
-            MagicMock(), time.monotonic() - 1, port,
-            time.monotonic() - (bm.CLOSING_CLAIM_MAX_S - 5),
-        )
-        assert mgr.is_wedged("p1") is True
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async", AsyncMock(return_value=_launchable_context()),
+    )
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
+    allocate = AsyncMock(side_effect=AssertionError("allocate() must not be called"))
+    start_vnc = AsyncMock(side_effect=AssertionError("start_vnc() must not be called"))
+    monkeypatch.setattr(mgr.vnc, "allocate", allocate)
+    monkeypatch.setattr(mgr.vnc, "start_vnc", start_vnc)
 
-        # past the ceiling: released despite the port still answering
-        mgr._closing["p1"] = (
-            MagicMock(), time.monotonic() - 1, port,
-            time.monotonic() - (bm.CLOSING_CLAIM_MAX_S + 1),
-        )
-        assert mgr.is_wedged("p1") is False
-        assert "p1" not in mgr._closing
-    finally:
-        listener.close()
+    running = await mgr.launch(
+        {"id": "p1", "user_data_dir": str(tmp_path / "p1"), "headless": True},
+    )
+
+    assert running.display is None
+    assert running.ws_port is None
+    assert mgr.vnc.active_displays == []
+    status = mgr.get_status("p1")
+    assert status["display"] is None and status["vnc_ws_port"] is None
+    assert mgr.get_liveness("p1")["xvnc_alive"] is None
+
+
+@pytest.mark.asyncio
+async def test_headed_launch_still_allocates_a_display(monkeypatch, tmp_path):
+    """The control case: skipping Xvnc must be conditional, not unconditional."""
+    from unittest.mock import AsyncMock
+    from backend import browser_manager as bm
+
+    mgr = bm.BrowserManager()
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async", AsyncMock(return_value=_launchable_context()),
+    )
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
+    start_vnc = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "start_vnc", start_vnc)
+
+    running = await mgr.launch(
+        {"id": "p1", "user_data_dir": str(tmp_path / "p1"), "headless": False},
+    )
+
+    assert running.display == 100
+    assert running.ws_port == 6100
+    start_vnc.assert_awaited_once()
+    assert mgr.get_status("p1")["display"] == ":100"
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_headless_profile_needs_no_display_teardown(
+    monkeypatch, tmp_path,
+):
+    """Every teardown path funnels through _release_display; None is normal."""
+    from unittest.mock import AsyncMock
+    from backend import browser_manager as bm
+
+    mgr = bm.BrowserManager()
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async", AsyncMock(return_value=_launchable_context()),
+    )
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
+    monkeypatch.setattr(mgr.vnc, "allocate", AsyncMock(side_effect=AssertionError("no")))
+    stop_vnc = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", stop_vnc)
+
+    await mgr.launch({"id": "p1", "user_data_dir": str(tmp_path / "p1"), "headless": True})
+    assert await mgr.stop("p1") is True
+    assert "p1" not in mgr.running
+    stop_vnc.assert_not_awaited()   # nothing was ever allocated to stop

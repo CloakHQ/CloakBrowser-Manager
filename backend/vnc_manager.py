@@ -14,11 +14,19 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger("cloakbrowser.manager.vnc")
 
-# Server-authoritative quality presets (Xvnc CLI flags; spellings per
-# Xkasmvnc(1) 1.5.0). Client-side quality settings are ignored via
-# -IgnoreClientSettingsKasm, so the active preset is the whole policy.
-# -videoCodec is set explicitly in start_vnc: the binary default is empty
-# (streaming disabled) despite the man page claiming "auto".
+# Quality presets (Xvnc CLI flags; every spelling and range checked against
+# `Xvnc -help` and common/rfb/ServerCore.cxx for KasmVNC 1.5.0). Whether these
+# or the client's own Kasm settings win is decided by KASM_ENCODING_POLICY.
+#
+# -RectThreads is deliberately absent. It still parses in 1.5.0, but nothing
+# reads rfb::Server::rectThreads any more: the OpenMP loop it drove in 1.3.3
+# (EncodeManager.cxx:1133) was replaced by an unconditional oneTBB arena sized
+# to cpu_info::cores_count (EncodeManager.cxx:233), per EncodeManager and so
+# per connected client. A grep of the 1.5.0 tree finds the parameter only in
+# its own declaration/definition, the perl vncserver wrapper and the man page.
+# Passing it caps nothing, so we do not pretend otherwise — the only remaining
+# lever on encoder threads is process-level CPU limiting (cgroup cpuset /
+# `--cpus`), not a VNC parameter.
 QUALITY_PRESETS: dict[str, list[str]] = {
     # Crisp text/UI priority: high quality, reluctant to enter video mode.
     "text": [
@@ -30,7 +38,6 @@ QUALITY_PRESETS: dict[str, list[str]] = {
         "-VideoScaling", "2",  # progressive bilinear
         "-webpEncodingTime", "30",
         "-CompareFB", "2",  # auto
-        "-RectThreads", "2",
     ],
     # Default: good text quality, quick switch to video mode on motion.
     "balanced": [
@@ -42,7 +49,6 @@ QUALITY_PRESETS: dict[str, list[str]] = {
         "-VideoScaling", "2",
         "-webpEncodingTime", "30",
         "-CompareFB", "2",
-        "-RectThreads", "2",
     ],
     # Bandwidth-saver: lower framerate/quality, capped video resolution.
     "low": [
@@ -54,7 +60,6 @@ QUALITY_PRESETS: dict[str, list[str]] = {
         "-VideoScaling", "2",
         "-webpEncodingTime", "30",
         "-CompareFB", "2",
-        "-RectThreads", "2",
     ],
     # Motion content (video/gaming): quick video-mode entry, fluid over sharp.
     "motion": [
@@ -66,7 +71,6 @@ QUALITY_PRESETS: dict[str, list[str]] = {
         "-VideoScaling", "2",
         "-webpEncodingTime", "30",
         "-CompareFB", "2",
-        "-RectThreads", "2",
     ],
 }
 
@@ -80,30 +84,190 @@ def _quality_preset_name() -> str:
     return name
 
 
-def _quality_flags(preset: str) -> list[str]:
-    flags = list(QUALITY_PRESETS[preset])
-    raw = os.environ.get("KASM_RECT_THREADS")
-    if raw is not None:
-        idx = flags.index("-RectThreads") + 1
-        flags[idx] = _rect_threads_value(raw, flags[idx])
-    return flags
-
-
-def _rect_threads_value(raw: str, default: str) -> str:
-    """Validate a KASM_RECT_THREADS override (0 = auto, see warning)."""
+def _xvnc_log_level() -> int:
+    """Xvnc -Log verbosity from KASM_XVNC_LOG_LEVEL (0-100, default 30)."""
+    raw = os.environ.get("KASM_XVNC_LOG_LEVEL")
+    if raw is None:
+        return 30
     try:
-        threads = int(raw)
+        level = int(raw)
     except ValueError:
-        logger.warning("Invalid KASM_RECT_THREADS=%r, using preset default %s", raw, default)
-        return default
-    if threads < 0:
-        logger.warning("Invalid KASM_RECT_THREADS=%r, using preset default %s", raw, default)
-        return default
-    if threads == 0:
+        logger.warning("Invalid KASM_XVNC_LOG_LEVEL=%r, using 30", raw)
+        return 30
+    if not 0 <= level <= 100:
+        logger.warning("KASM_XVNC_LOG_LEVEL=%r out of range 0-100, using 30", raw)
+        return 30
+    return level
+
+
+def _quality_flags(preset: str, drop: tuple[str, ...] = ()) -> list[str]:
+    """Preset flags, plus a warning for the KASM_RECT_THREADS knob we removed.
+
+    Operators who set it on an older image would otherwise turn the dial on a
+    loaded multi-tenant host and observe nothing change, with no clue why.
+
+    `drop` removes flag/value pairs the active encoding policy makes inert.
+    Emitting a flag the server will ignore is how KASM_QUALITY_PRESET=low ends
+    up encoding full 1080p anyway: the preset looks applied and is not.
+    """
+    if os.environ.get("KASM_RECT_THREADS") is not None:
         logger.warning(
-            "KASM_RECT_THREADS=0: unbounded automatic encoder threads — risky multi-tenant"
+            "KASM_RECT_THREADS is ignored: -RectThreads is a dead parameter in "
+            "KasmVNC 1.5.0 (oneTBB sizes the encoder arena to the core count). "
+            "Cap encoder CPU with a cgroup/--cpus limit instead."
         )
-    return str(threads)
+    flags = list(QUALITY_PRESETS[preset])
+    if not drop:
+        return flags
+    kept: list[str] = []
+    skip_value = False
+    for flag in flags:
+        if skip_value:
+            skip_value = False
+            continue
+        if flag in drop:
+            skip_value = True
+            continue
+        kept.append(flag)
+    logger.warning(
+        "Quality preset %r: %s dropped — inert under the active encoding policy, "
+        "so passing them would misreport the effective limits.",
+        preset, " / ".join(drop),
+    )
+    return kept
+
+
+# -IgnoreClientSettingsKasm and -videoCodec are MUTUALLY EXCLUSIVE in KasmVNC
+# 1.5.0, which neither flag's documentation says. ConnParams.cxx:164-165 derives
+# `can_apply = !ignoreClientSettingsKasm && canChangeKasmSettings()`, and the
+# only writer of cp.encoder_config is inside `if (can_apply)`
+# (ConnParams.cxx:374-386); EncodeManager.cxx:444 gates video mode on that field
+# being something other than `unavailable`. So with -IgnoreClientSettingsKasm
+# every streaming-mode pseudo-encoding the client offers is dropped ("CP: Client
+# sent config param Encoder -1027, ignored due to -IgnoreClientSettingsKasm"),
+# video mode is false on every frame, and -videoCodec cannot do anything at all
+# — the WebCodecs H.264/H.265/AV1 path is dead however capable FFmpeg or the GPU
+# is. Verified live against the shipped 1.5.0 Xvnc: the same run logs "applied"
+# for those pseudo-encodings once the flag is dropped.
+#
+# There is no third option upstream — one boolean gates both — so the choice is
+# a policy knob, and both flags are emitted from _encoding_flags() alone.
+# Nothing else in this module (and nothing in QUALITY_PRESETS) may add either,
+# which is what makes the exclusion structurally unbreakable.
+ENCODING_POLICY_SERVER = "server-authoritative"
+ENCODING_POLICY_VIDEO = "video"
+ENCODING_POLICIES = (ENCODING_POLICY_SERVER, ENCODING_POLICY_VIDEO)
+
+# The binary's default is the EMPTY string (= video mode off,
+# EncodeManager.cxx:199) despite the man page claiming "auto", so a codec has to
+# be passed explicitly to mean anything.
+#
+# NOT "auto". "auto" hands the CHOICE to the client: it widens the probed set to
+# every encoder the build advertises, and the client then picks by offering a
+# streaming-mode pseudo-encoding. Measured live on this image (no GPU, so the
+# software tier is all that is reachable): a client advertising -1037 selected
+# libsvtav1, which spent 364 ms encoding a single 1080p keyframe and then errored
+# out, after which the session silently fell back to Tight for its entire
+# lifetime — worse than never enabling video mode, and invisible in the default
+# logs. The upstream claim that software AV1 is excluded does not hold for a
+# client-driven selection.
+#
+# So the server names the encoder it wants. IMPORTANT, measured: this narrows
+# the server's own probe ("Using CLI-specified video codecs (supported subset):
+# libx264") but it does NOT restrict what a client may select — ConnParams.cxx
+# still honours a streaming-mode pseudo-encoding outside the list, so a client
+# offering -1037 gets software AV1 anyway. KasmVNC 1.5.0 exposes no enforcement
+# point for this. h264 is therefore the best DEFAULT, not a guarantee, and it is
+# the reason the `video` policy is opt-in and the default policy is not.
+_VIDEO_CODEC_DEFAULT = "h264"
+# Xkasmvnc(1) 1.5.0: "Supported options: auto, h264, h264_vaapi, h265,
+# h265_vaapi, av1, av1_vaapi". "auto" is deliberately NOT in this set — see above.
+_VIDEO_CODECS_ALLOWED = frozenset({
+    "h264", "h264_vaapi", "h265", "h265_vaapi", "av1", "av1_vaapi",
+})
+
+
+def _video_codec() -> str:
+    """Encoder(s) offered under the `video` policy, from KASM_VIDEO_CODEC."""
+    raw = os.environ.get("KASM_VIDEO_CODEC")
+    if raw is None:
+        return _VIDEO_CODEC_DEFAULT
+    codec = raw.strip().lower()
+    if codec == "auto":
+        logger.warning(
+            "KASM_VIDEO_CODEC=auto is refused: it lets the client select a "
+            "software AV1 encoder that stalls a core for ~364ms per keyframe and "
+            "then fails the session over to Tight. Using %r instead.",
+            _VIDEO_CODEC_DEFAULT,
+        )
+        return _VIDEO_CODEC_DEFAULT
+    if codec not in _VIDEO_CODECS_ALLOWED:
+        logger.warning(
+            "Unknown KASM_VIDEO_CODEC=%r (accepted: %s), using %r",
+            raw, ", ".join(sorted(_VIDEO_CODECS_ALLOWED)), _VIDEO_CODEC_DEFAULT,
+        )
+        return _VIDEO_CODEC_DEFAULT
+    return codec
+
+
+# The one flag the `video` policy makes inert, and must therefore not pretend
+# to set. In video mode EncodeManager.cxx:1242 takes the client's resolution
+# rather than -MaxVideoResolution, so emitting it is how KASM_QUALITY_PRESET=low
+# silently still encodes full 1080p.
+#
+# -TreatLossless is deliberately NOT in this list. It looked inert, but it is
+# not: it governs the Tight path (EncodeManager.cxx:742), which is still the
+# path taken for every frame in which the client has not selected a video
+# encoder — i.e. most of them. Dropping it silently reverted the preset value
+# to the binary default of 10 (off).
+_INERT_UNDER_VIDEO_POLICY = ("-MaxVideoResolution",)
+
+
+def _encoding_policy_name() -> str:
+    """Active policy from KASM_ENCODING_POLICY (default 'server-authoritative')."""
+    name = os.environ.get("KASM_ENCODING_POLICY", ENCODING_POLICY_SERVER).strip().lower()
+    if name not in ENCODING_POLICIES:
+        logger.warning(
+            "Unknown KASM_ENCODING_POLICY=%r, falling back to %r",
+            name, ENCODING_POLICY_SERVER,
+        )
+        return ENCODING_POLICY_SERVER
+    return name
+
+
+def _encoding_flags(policy: str) -> list[str]:
+    """The one place either -IgnoreClientSettingsKasm or -videoCodec is emitted.
+
+    Returning them from a single function is the enforcement mechanism for the
+    mutual exclusion documented above: there is no code path that can produce
+    both, so the dead-`-videoCodec` combination cannot be reintroduced by
+    editing a preset or adding a flag next to an unrelated one.
+    """
+    if policy == ENCODING_POLICY_VIDEO:
+        codec = _video_codec()
+        logger.warning(
+            "KasmVNC encoding policy 'video': WebCodecs streaming can negotiate "
+            "with -videoCodec %s. Two limits you are opting into. (1) Without "
+            "-IgnoreClientSettingsKasm the client's own Kasm settings "
+            "(DynamicQuality*, VideoTime/VideoArea, framerate) override the "
+            "quality preset, and %s is inert. (2) -videoCodec narrows the "
+            "server's probe but does NOT restrict the client's choice — 1.5.0 "
+            "has no enforcement point, so a client offering another "
+            "streaming-mode pseudo-encoding still gets that encoder, including "
+            "software AV1 (measured: ~0.4s of a core per 1080p keyframe, then a "
+            "silent fallback to Tight for the session). This is why the default "
+            "policy is 'server-authoritative'.",
+            codec, " / ".join(_INERT_UNDER_VIDEO_POLICY),
+        )
+        return ["-videoCodec", codec]
+    logger.info(
+        "KasmVNC encoding policy 'server-authoritative': the quality preset is "
+        "the whole policy and clients cannot override it. Trade-off: this also "
+        "suppresses the client's codec selection, so in-band H.264/H.265/AV1 is "
+        "unavailable and rects stay JPEG/WebP. Set KASM_ENCODING_POLICY=video "
+        "to swap which half you get."
+    )
+    return ["-IgnoreClientSettingsKasm"]
 
 
 def _dri_driver(node: str) -> str | None:
@@ -135,7 +299,14 @@ def _hw3d_flags() -> list[str]:
         logger.info("KasmVNC hw3d disabled: %s not present", node)
         return []
     if mode == "auto":
-        # Closed-source NVIDIA lacks DRI3; unresolvable driver counts as OK.
+        # Closed-source NVIDIA lacks DRI3 (kasmweb.com/kasmvnc/docs/latest/
+        # gpu_acceleration.html: "nouveau2 drivers only"); unresolvable driver
+        # counts as OK. Getting this wrong is fatal, not degrading:
+        # xvnc_init_dri3() FatalError()s if open()/gbm_create_device()/
+        # dri3_screen_init() fail (dri3.c:372-397), so Xvnc dies at startup,
+        # _wait_until_listening times out and POST /launch 500s. That asymmetry
+        # — silently slower vs. no profile at all — is why 'auto' is the default
+        # rather than 'force'.
         driver = _dri_driver(node)
         if driver == "nvidia":
             logger.info("KasmVNC hw3d disabled: %s uses the nvidia driver (no DRI3)", node)
@@ -188,10 +359,17 @@ async def _write_kasm_passwd(display: int, password: str) -> str:
 
     These credentials are not optional. Kasm's HTTP layer requires Basic auth
     for the static client, the WebSocket upgrade and the management API alike,
-    and there is no -DisableBasicAuth in the launch flags — so starting Xvnc
-    without a password file yields a profile that reports itself perfectly
-    healthy while every viewer request 401s, which the reconnect machine can
-    only loop against. Failing the launch is the honest outcome.
+    and we do not pass -DisableBasicAuth — so starting Xvnc without a password
+    file yields a profile that reports itself perfectly healthy while every
+    viewer request 401s, which the reconnect machine can only loop against.
+    Failing the launch is the honest outcome.
+
+    -DisableBasicAuth is not the escape hatch it looks like. Kasm only assigns
+    the internal `owner` flag inside the `if (!disablebasicauth)` branch
+    (websocket.c:1917, 1970-1976) while /api dispatch is `if (owner) ... else
+    401` (websocket.c:2024-2043), so the flag simultaneously opens the client to
+    anyone who reaches the port AND hard-401s the management API even for the
+    correct owner credentials — which would silently kill /kasm-stats.
     """
     path = f"/tmp/kasmpasswd-{display}"
     passwd_bin = shutil.which("kasmvncpasswd")
@@ -255,15 +433,27 @@ class VNCManager:
         """Start Xvnc (KasmVNC) on the given display."""
         xvnc_bin = shutil.which("Xvnc") or "Xvnc"
 
-        # KasmVNC requires -httpd to enable the WebSocket handler on the websocket port.
-        # Without it, the port accepts TCP but won't do WebSocket upgrade.
+        # -httpd serves the KasmVNC web client (index.html + assets) over the
+        # same websocket port; the viewer iframe 404s without it. It does NOT
+        # gate the WebSocket upgrade — websocket.c only consults httpdir in the
+        # `parse_handshake` FAILED branch (websocket.c:2044-2045), and a live
+        # run with no -httpd still answers 101 on /websockify. The path has to
+        # be explicit because the binary's compiled default is
+        # /usr/local/share/kasmvnc/www while the Debian package installs to
+        # /usr/share/kasmvnc/www.
         httpd_dir = "/usr/share/kasmvnc/www"
 
+        # No -rfbport: it would be a no-op anyway. vncExtInit.cc:281-296 only
+        # reaches the raw-RFB listener in the `else` of `if (!noWebsocket)`, and
+        # noWebsocket defaults to false, so KasmVNC 1.5.0 opens the websocket
+        # listener and nothing else. Verified live — `-rfbport 5999` produces no
+        # listener on 5999. The old `-rfbport -1` claimed to disable a port that
+        # was never opened; if you ever need a raw RFB port you must pass
+        # -noWebsocket, which breaks the viewer entirely.
         cmd = [
             xvnc_bin,
             f":{display}",
             "-websocketPort", str(ws_port),
-            "-rfbport", "-1",  # disable raw VNC TCP port — WebSocket only
             "-geometry", f"{width}x{height}",
             "-depth", "24",
             "-SecurityTypes", "None",  # no RFB-layer auth; HTTP Basic guards the port
@@ -272,22 +462,31 @@ class VNCManager:
             "-httpd", httpd_dir,
         ]
 
-        # Server-authoritative performance policy (KASM_QUALITY_PRESET);
-        # clients cannot override quality/encoding settings.
+        # Quality preset (KASM_QUALITY_PRESET) plus the one flag that decides
+        # who owns encoding policy (KASM_ENCODING_POLICY) — see _encoding_flags.
         preset = _quality_preset_name()
-        cmd += ["-IgnoreClientSettingsKasm"] + _quality_flags(preset)
+        policy = _encoding_policy_name()
+        cmd += _encoding_flags(policy) + _quality_flags(
+            preset, drop=_INERT_UNDER_VIDEO_POLICY if policy == ENCODING_POLICY_VIDEO else (),
+        )
 
-        # Never query STUN for a public IP: UDP/WebRTC transit is out of
-        # scope (Cloudflare Tunnel carries WSS only), and the lookup leaks.
+        # Without this the applied/ignored codec decision and the encoder probe
+        # results are DEBUG-only, so a session that fell back to Tight because
+        # the chosen encoder failed to open looks identical in the logs to one
+        # streaming correctly. Level 30 keeps the ordinary INFO lines;
+        # KASM_XVNC_LOG_LEVEL=100 surfaces the per-connection encoder decisions.
+        cmd += ["-Log", f"*:stdout:{_xvnc_log_level()}"]
+
+        # Mandatory, not a privacy preference. getPublicIP() (iceip.cxx:157-190)
+        # runs unconditionally at extension init, and with no -PublicIP it walks
+        # seven hardcoded Google/VoIP STUN servers and then exit(1)s if none
+        # answer. Verified: `--network none` without this flag exits rc=1, so
+        # _wait_until_listening times out and POST /launch 500s. Supplying it
+        # short-circuits the lookup entirely ("ICE: Using public IP ... from
+        # args") — no egress, and Cloudflare Tunnel carries WSS only, so the
+        # UDP/WebRTC listener Kasm still opens on the websocket port is unusable
+        # for negotiation.
         cmd += ["-PublicIP", "127.0.0.1"]
-
-        # In-band H.264/H.265/AV1 streaming (WebCodecs over the same
-        # WebSocket). The raw binary's default is EMPTY (= disabled) despite
-        # the man page claiming "auto" — set it explicitly. "auto" prefers
-        # VAAPI (when -hw3d's GPU is usable) and falls back to software
-        # encoders via dlopen'd FFmpeg; without FFmpeg it silently stays on
-        # JPEG/WebP rects.
-        cmd += ["-videoCodec", "auto"]
 
         # Owner credentials guard Kasm's HTTP layer (static client, WS
         # upgrade, management /api). nginx injects them on behalf of
@@ -301,8 +500,8 @@ class VNCManager:
 
         log_path = f"/tmp/xvnc-{display}.log"
         logger.info(
-            "Starting Xvnc on :%d (ws_port=%d, preset=%s) log=%s",
-            display, ws_port, preset, log_path,
+            "Starting Xvnc on :%d (ws_port=%d, preset=%s, encoding_policy=%s) log=%s",
+            display, ws_port, preset, policy, log_path,
         )
 
         log_file = open(log_path, "w")

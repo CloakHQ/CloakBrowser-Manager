@@ -11,8 +11,34 @@ import socket
 
 from starlette.testclient import TestClient
 
+from backend import browser_manager as bm
 from backend import main
 from backend.browser_manager import BrowserManager, RunningProfile
+
+
+def _wedge(pid: str) -> bm.ClosingClaim:
+    """Record a teardown claim whose browser is provably still alive.
+
+    A real live pid, not a sentinel: the claim resolves by asking /proc
+    whether THAT process is still running, so a fabricated identity would be
+    released by the first check and the test would silently exercise nothing.
+    """
+    import os as _os
+
+    _state, _ppid, starttime = bm._proc_stat(_os.getpid())
+    claim = bm.ClosingClaim(
+        context=MagicMock(),
+        proc=bm.BrowserProcess(
+            pid=_os.getpid(), starttime=starttime,
+            user_data_dir="/tmp/udd", cdp_port=5100,
+        ),
+        user_data_dir="/tmp/udd", cdp_port=5100,
+        # Fresh, so the sweeper's escalation clock cannot fire and SIGTERM the
+        # test runner.
+        claimed_at=__import__("time").monotonic(),
+    )
+    main.browser_mgr._closing[pid] = claim
+    return claim
 
 
 # ── Profile CRUD ─────────────────────────────────────────────────────────────
@@ -445,7 +471,7 @@ def test_viewer_auth_success(app_client: TestClient):
     create = app_client.post("/api/profiles", json={"name": "ViewerOk"})
     pid = create.json()["id"]
     _mock_running_profile(pid)
-    token = main.viewer_tokens.issue(pid, 6100)
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-under-test")
 
     resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
     assert resp.status_code == 200
@@ -468,7 +494,7 @@ def test_viewer_auth_injects_kasm_basic_auth(app_client: TestClient, monkeypatch
     create = app_client.post("/api/profiles", json={"name": "ViewerAuth"})
     pid = create.json()["id"]
     _mock_running_profile(pid)
-    token = main.viewer_tokens.issue(pid, 6100)
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-under-test")
     monkeypatch.setattr(
         main.browser_mgr.vnc, "get_api_credentials", lambda _d: ("manager", "pw123")
     )
@@ -716,8 +742,11 @@ def test_set_clipboard_success(app_client: TestClient):
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
 
-    # Cleanup
+    # Cleanup — including the tracked xclip: browser_mgr is a session-wide
+    # singleton and so is _xclip_procs.
     main.browser_mgr.running.pop(pid, None)
+    main._xclip_procs.pop(100, None)
+    main._xclip_locks.pop(100, None)
 
 
 def test_get_clipboard_from_page(app_client: TestClient):
@@ -754,7 +783,7 @@ def test_profile_response_has_status_field(app_client: TestClient):
     resp = app_client.get("/api/profiles")
     for profile in resp.json():
         assert "status" in profile
-        assert profile["status"] in ("running", "stopped")
+        assert profile["status"] in ("running", "starting", "stopping", "stopped")
 
 
 def test_profile_response_has_cdp_url_field(app_client: TestClient):
@@ -817,6 +846,10 @@ def _mock_running_profile(pid: str) -> MagicMock:
     mock.ws_port = 6100
     mock.cdp_port = 5100
     mock.profile_id = pid
+    mock.proc = None
+    # Real value, not a MagicMock: viewer_auth compares it against the token's
+    # epoch, and a MagicMock would make every token look stale.
+    mock.session_epoch = "epoch-under-test"
     main.browser_mgr.running[pid] = mock
     return mock
 
@@ -1058,7 +1091,9 @@ def test_viewer_auth_rejects_a_token_from_a_previous_run(app_client: TestClient)
     pid = create.json()["id"]
     mock = _mock_running_profile(pid)
     mock.ws_port = 6105  # relaunched on a different display
-    token = main.viewer_tokens.issue(pid, 6100)  # token from the previous run
+    token = main.viewer_tokens.issue(
+        pid, 6100, session_epoch="epoch-under-test",  # token from the previous run
+    )
 
     try:
         resp = app_client.get(
@@ -1169,9 +1204,7 @@ def test_delete_refuses_while_a_previous_stop_is_still_wedged(app_client: TestCl
     create = app_client.post("/api/profiles", json={"name": "WedgedThenDelete"})
     pid = create.json()["id"]
 
-    from unittest.mock import MagicMock as _MM
-    import time as _t
-    main.browser_mgr._closing[pid] = (_MM(), _t.monotonic() + 60, None, _t.monotonic())  # a previous /stop left Chromium alive
+    _wedge(pid)  # a previous /stop left Chromium alive
     try:
         assert app_client.delete(f"/api/profiles/{pid}").status_code == 409
         assert app_client.post(f"/api/profiles/{pid}/launch").status_code == 409
@@ -1253,5 +1286,573 @@ def test_status_endpoint_probes_off_the_event_loop(
     try:
         assert app_client.get(f"/api/profiles/{pid}/status").status_code == 200
         assert seen.get("on_loop") is False
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── "stopping" lifecycle ─────────────────────────────────────────────────────
+
+
+def test_a_teardown_in_flight_tells_one_coherent_story(app_client: TestClient):
+    """One state, one answer, on every path.
+
+    A wedged teardown used to produce four mutually contradictory answers:
+    list/detail/status said "stopped", launch said "Profile is already
+    running", stop said 404 "Profile is not running", and only DELETE told the
+    truth. The UI rendered the grey dot and an enabled Launch button that was
+    guaranteed to 409.
+    """
+    create = app_client.post("/api/profiles", json={"name": "Wedged"})
+    pid = create.json()["id"]
+    _wedge(pid)
+    try:
+        assert app_client.get("/api/profiles").json()[0]["status"] == "stopping"
+        assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "stopping"
+        assert app_client.put(
+            f"/api/profiles/{pid}", json={"name": "Wedged"},
+        ).json()["status"] == "stopping"
+
+        status = app_client.get(f"/api/profiles/{pid}/status").json()
+        assert status["status"] == "stopping"
+        # nothing left to probe: same shape as "stopped"
+        assert status["xvnc_alive"] is None
+        assert status["browser_alive"] is None
+        assert status["vnc_ws_port"] is None
+        assert status["cdp_url"] is None
+
+        detail = "Browser is still shutting down; try again"
+        launch = app_client.post(f"/api/profiles/{pid}/launch")
+        assert launch.status_code == 409
+        assert launch.json()["detail"] == detail
+
+        stop = app_client.post(f"/api/profiles/{pid}/stop")
+        assert stop.status_code == 409
+        assert stop.json()["detail"] == detail
+
+        delete = app_client.delete(f"/api/profiles/{pid}")
+        assert delete.status_code == 409
+        assert delete.json()["detail"] == detail
+    finally:
+        main.browser_mgr._closing.pop(pid, None)
+
+    assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "stopped"
+
+
+def test_starting_wins_over_a_teardown_claim(app_client: TestClient):
+    """A launch holds a claim for its whole duration, so both can be true.
+
+    Every mutation path checks is_starting first and answers "Profile is
+    starting", so the status has to agree with the refusal the caller gets.
+    """
+    create = app_client.post("/api/profiles", json={"name": "Both"})
+    pid = create.json()["id"]
+    _wedge(pid)
+    main.browser_mgr._launching.add(pid)
+    try:
+        assert app_client.get(f"/api/profiles/{pid}/status").json()["status"] == "starting"
+        assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "starting"
+        assert app_client.post(f"/api/profiles/{pid}/launch").json()["detail"] == (
+            "Profile is already starting"
+        )
+    finally:
+        main.browser_mgr._launching.discard(pid)
+        main.browser_mgr._closing.pop(pid, None)
+
+
+def test_the_status_endpoint_never_mutates_the_teardown_claim(app_client: TestClient):
+    """The 3s poll reaches get_status on an EXECUTOR thread.
+
+    A probing, mutating check there raced the loop's own writes to _closing:
+    a `del` raised KeyError when the close handler removed the entry first,
+    and a re-write resurrected a claim stop() had already released.
+    """
+    create = app_client.post("/api/profiles", json={"name": "PollWedged"})
+    pid = create.json()["id"]
+    claim = _wedge(pid)
+    try:
+        for _ in range(5):
+            assert app_client.get(
+                f"/api/profiles/{pid}/status",
+            ).json()["status"] == "stopping"
+        assert main.browser_mgr._closing[pid] is claim
+        assert claim.sigterm_at is None
+    finally:
+        main.browser_mgr._closing.pop(pid, None)
+
+
+def test_the_lifespan_sweeper_releases_a_claim_with_no_user_action(
+    tmp_db, monkeypatch: pytest.MonkeyPatch,
+):
+    """Nothing else opens the valve once the status path is a pure peek.
+
+    Without the sweeper the profile shows an orange "stopping" dot and a
+    DISABLED "Shutting down…" button indefinitely — so the user's only escape
+    is a control they cannot click.
+    """
+    import time as _t
+    from unittest.mock import AsyncMock as _AM
+
+    monkeypatch.setattr(bm, "CLAIM_SWEEP_INTERVAL_S", 0.01)
+    monkeypatch.setattr(main.browser_mgr, "cleanup_stale", _AM())
+    monkeypatch.setattr(main.browser_mgr, "cleanup_all", _AM())
+    monkeypatch.setattr(main.browser_mgr.vnc, "cleanup_stale", _AM())
+
+    with TestClient(main.app) as client:
+        pid = client.post("/api/profiles", json={"name": "Sweepable"}).json()["id"]
+        # a claim whose process is provably gone: same pid, different starttime
+        claim = _wedge(pid)
+        claim.proc = bm.BrowserProcess(
+            pid=claim.proc.pid, starttime=claim.proc.starttime + 1,
+            user_data_dir=claim.proc.user_data_dir, cdp_port=claim.proc.cdp_port,
+        )
+        assert client.get(f"/api/profiles/{pid}").json()["status"] == "stopping"
+
+        deadline = _t.monotonic() + 5
+        while _t.monotonic() < deadline:
+            if client.get(f"/api/profiles/{pid}").json()["status"] == "stopped":
+                break
+            _t.sleep(0.02)
+        assert client.get(f"/api/profiles/{pid}").json()["status"] == "stopped"
+        assert pid not in main.browser_mgr._closing
+
+
+# ── viewer token session identity ────────────────────────────────────────────
+
+
+def test_viewer_auth_rejects_a_token_from_a_previous_session_on_the_same_port(
+    app_client: TestClient,
+):
+    """allocate() gap-fills, so a relaunch reuses the identical ws_port.
+
+    The port comparison therefore can never fire for the case it was written
+    for; only a per-launch nonce can tell two sessions apart.
+    """
+    create = app_client.post("/api/profiles", json={"name": "EpochStale"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-1")
+
+    # relaunched: same display, same ws_port, new session
+    mock.session_epoch = "epoch-2"
+    try:
+        resp = app_client.get(
+            "/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Viewer token is stale"
+    finally:
+        main.viewer_tokens.revoke_profile(pid)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_token_carries_the_running_session_epoch(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "EpochOk"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    try:
+        token = app_client.post(f"/api/profiles/{pid}/viewer-token").json()["token"]
+        assert main.viewer_tokens.validate(token).session_epoch == "epoch-under-test"
+    finally:
+        main.viewer_tokens.revoke_profile(pid)
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── AuthMiddleware robustness ────────────────────────────────────────────────
+
+
+def _auth_scope(header: bytes) -> dict:
+    return {"type": "http", "path": "/api/profiles", "headers": [(b"authorization", header)]}
+
+
+def test_a_non_ascii_authorization_header_is_unauthenticated_not_a_crash(monkeypatch):
+    """httpx refuses to send these, so this has to be asserted at the ASGI layer.
+
+    A bare latin-1 byte used to raise UnicodeDecodeError out of val.decode(),
+    and a well-formed non-ASCII token raised TypeError out of
+    hmac.compare_digest — both surfacing as an unauthenticated HTTP 500 with a
+    traceback, before any authentication decision.
+    """
+    monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
+    assert main._check_auth(_auth_scope(b"Bearer \xe9vil")) is False
+    assert main._check_auth(_auth_scope(b"Bearer \xc3\xa9vil")) is False
+    assert main._check_auth(_auth_scope(b"Bearer test-secret")) is True
+    assert main._check_auth(
+        {"type": "http", "path": "/api/profiles",
+         "headers": [(b"cookie", b"auth_token=\xe9vil")]},
+    ) is False
+
+
+# ── Clipboard robustness ─────────────────────────────────────────────────────
+
+
+def test_get_clipboard_skips_a_wedged_page_instead_of_dying_on_it(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """page.evaluate has no timeout in playwright 1.60 and hangs forever.
+
+    One page running `while(true){}` used to kill this endpoint permanently
+    for that profile: the loop never reached the next page or the xclip
+    fallback, and uvicorn does not cancel a handler when the client gives up,
+    so every poll added another immortal task.
+    """
+    import asyncio as aio
+    import time as _t
+
+    monkeypatch.setattr(main, "_CLIPBOARD_PAGE_TIMEOUT_S", 0.05)
+
+    # Real coroutine functions, not AsyncMock: an AsyncMock side_effect that
+    # returns a coroutine hands it back as the RESULT, so nothing ever hangs
+    # and the test would pass against an unbounded evaluate.
+    async def wedged_evaluate(_js):
+        await aio.sleep(3600)
+
+    reached: list[str] = []
+
+    async def good_evaluate(_js):
+        reached.append(_js)
+        return "from the second tab"
+
+    wedged = MagicMock()
+    wedged.evaluate = wedged_evaluate
+    good = MagicMock()
+    good.evaluate = good_evaluate
+
+    create = app_client.post("/api/profiles", json={"name": "ClipWedged"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    mock.context = MagicMock()
+    mock.context.pages = [wedged, good]
+
+    try:
+        started = _t.monotonic()
+        resp = app_client.get(f"/api/profiles/{pid}/clipboard")
+        elapsed = _t.monotonic() - started
+        assert resp.status_code == 200
+        assert resp.json()["text"] == "from the second tab"
+        assert reached, "the wedged tab must be skipped, not fatal"
+        assert elapsed < 3.0
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_clipboard_caps_the_response_at_1mb(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ClipHuge"})
+    pid = create.json()["id"]
+    page = AsyncMock()
+    page.evaluate = AsyncMock(return_value="x" * (main._CLIPBOARD_MAX_READ + 500))
+    mock = _mock_running_profile(pid)
+    mock.context = MagicMock()
+    mock.context.pages = [page]
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/clipboard")
+        assert len(resp.json()["text"]) == main._CLIPBOARD_MAX_READ
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_clipboard_endpoints_degrade_when_xclip_is_missing(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """No xclip is the README's local-dev path; it must not be a 500."""
+    create = app_client.post("/api/profiles", json={"name": "NoXclip"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    mock.context = MagicMock()
+    mock.context.pages = []
+
+    async def missing(*_a, **_k):
+        raise FileNotFoundError(2, "No such file or directory", "xclip")
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", missing)
+    try:
+        assert app_client.get(f"/api/profiles/{pid}/clipboard").json() == {"text": ""}
+        post = app_client.post(f"/api/profiles/{pid}/clipboard", json={"text": "hi"})
+        assert post.status_code == 503
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+        main._xclip_procs.pop(100, None)
+        main._xclip_locks.pop(100, None)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_set_clipboard_leaves_no_orphan_xclip(
+    tmp_db, monkeypatch: pytest.MonkeyPatch,
+):
+    """Three pastes in the same millisecond used to orphan two xclips.
+
+    The pop/spawn/store sequence contains two awaits, so every caller popped
+    the same entry and only the last was tracked. The untracked ones owned the
+    X11 CLIPBOARD selection, were never killed, and outlived the request.
+    """
+    import asyncio as aio
+
+    spawned: list[MagicMock] = []
+
+    async def fake_exec(*_a, **_k):
+        await aio.sleep(0)                      # the real await points
+        proc = MagicMock()
+        proc.returncode = None
+        proc.stdin = MagicMock()
+        proc.stdin.drain = AsyncMock()
+
+        async def wait():
+            proc.returncode = -9
+        proc.wait = wait
+        proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
+    pid = "clip-race"
+    mock = MagicMock(spec=RunningProfile)
+    mock.display = 100
+    main.browser_mgr.running[pid] = mock
+    try:
+        await aio.gather(*(
+            main.set_clipboard(pid, main.ClipboardRequest(text=f"t{i}"))
+            for i in range(3)
+        ))
+        assert len(spawned) == 3
+        survivors = [p for p in spawned if p.returncode is None]
+        assert len(survivors) == 1
+        assert main._xclip_procs[100] is survivors[0]
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+        main._xclip_procs.pop(100, None)
+        main._xclip_locks.pop(100, None)
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_profile_reaps_its_xclip(monkeypatch: pytest.MonkeyPatch):
+    """An xclip must not outlive the X server it holds a selection on."""
+    mgr = bm.BrowserManager()
+    mgr.add_display_released_hook(main._reap_xclip_for_display)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
+    main._xclip_procs[100] = proc
+
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.close = AsyncMock()
+    mgr.running["p1"] = bm.RunningProfile(
+        profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+    )
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+    try:
+        await mgr.stop("p1")
+        proc.kill.assert_called_once()
+        assert 100 not in main._xclip_procs
+    finally:
+        main._xclip_procs.pop(100, None)
+
+
+# ── CDP WebSocket proxy data plane ───────────────────────────────────────────
+
+
+class _FakeCdpSocket:
+    """Minimal stand-in for the `websockets` client connection."""
+
+    def __init__(self):
+        import asyncio as aio
+
+        self.received: list[object] = []
+        self.outbound: aio.Queue = aio.Queue()
+        self.closed = False
+
+    async def send(self, message):
+        self.received.append(message)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        message = await self.outbound.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        self.closed = True
+        return False
+
+
+def test_cdp_proxy_forwards_frames_in_both_directions(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """Dropping ALL client->CDP forwarding used to leave the suite green.
+
+    README documents /api/profiles/<id>/cdp as a public integration surface;
+    a broken pump makes connect_over_cdp() hang at the handshake with no
+    server-side error.
+    """
+    import types
+
+    create = app_client.post("/api/profiles", json={"name": "CdpPump"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    fake = _FakeCdpSocket()
+    fake_module = types.SimpleNamespace(connect=lambda *_a, **_k: fake)
+    monkeypatch.setitem(__import__("sys").modules, "websockets", fake_module)
+
+    version = MagicMock()
+    version.json.return_value = {"webSocketDebuggerUrl": "ws://127.0.0.1:5100/devtools/browser/x"}
+    client = MagicMock()
+    client.get = AsyncMock(return_value=version)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(main.httpx, "AsyncClient", lambda *a, **k: client)
+
+    try:
+        with app_client.websocket_connect(f"/api/profiles/{pid}/cdp") as ws:
+            ws.send_text('{"id":1,"method":"Target.getTargets"}')
+            fake.outbound.put_nowait('{"id":1,"result":{}}')
+            assert ws.receive_text() == '{"id":1,"result":{}}'
+        assert '{"id":1,"method":"Target.getTargets"}' in fake.received
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_page_proxy_targets_the_requested_devtools_path(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    import types
+
+    create = app_client.post("/api/profiles", json={"name": "CdpPage"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    fake = _FakeCdpSocket()
+    urls: list[str] = []
+
+    def connect(url, **_k):
+        urls.append(url)
+        return fake
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "websockets", types.SimpleNamespace(connect=connect),
+    )
+    try:
+        with app_client.websocket_connect(
+            f"/api/profiles/{pid}/cdp/devtools/page/ABC",
+        ) as ws:
+            ws.send_bytes(b"\x01\x02")
+            fake.outbound.put_nowait(b"\x03")
+            assert ws.receive_bytes() == b"\x03"
+        assert urls == ["ws://127.0.0.1:5100/devtools/page/ABC"]
+        assert b"\x01\x02" in fake.received
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── Headless profiles have no display, no Xvnc and no viewer ─────────────────
+
+
+def _mock_headless_running_profile(pid: str) -> MagicMock:
+    """A running headless profile: no display, no ws_port."""
+    mock = _mock_running_profile(pid)
+    mock.display = None
+    mock.ws_port = None
+    # spec=RunningProfile does not expose dataclass fields that have no
+    # class-level default, so `context` has to be attached by hand.
+    mock.context = MagicMock()
+    return mock
+
+
+def test_headless_profile_reports_no_display_or_vnc_port(app_client: TestClient):
+    """A headless profile has no X server, so it must not advertise one.
+
+    Reporting a display it does not own is what made the UI offer a viewer
+    affordance onto an empty root window.
+    """
+    create = app_client.post(
+        "/api/profiles", json={"name": "Headless", "headless": True},
+    )
+    pid = create.json()["id"]
+    _mock_headless_running_profile(pid)
+    try:
+        body = app_client.get(f"/api/profiles/{pid}/status").json()
+        assert body["status"] == "running"
+        assert body["display"] is None
+        assert body["vnc_ws_port"] is None
+        assert body["xvnc_alive"] is None      # nothing to be alive
+        listed = app_client.get("/api/profiles").json()
+        entry = next(p for p in listed if p["id"] == pid)
+        assert entry["status"] == "running"
+        assert entry["vnc_ws_port"] is None
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_headless_profile_refuses_a_viewer_token(app_client: TestClient):
+    """409, not 404: the profile IS running, it just cannot be viewed.
+
+    404 routes the viewer's state machine to endSession("Browser session
+    ended"), which claims the browser died when it is running perfectly well.
+    """
+    create = app_client.post(
+        "/api/profiles", json={"name": "HeadlessTok", "headless": True},
+    )
+    pid = create.json()["id"]
+    _mock_headless_running_profile(pid)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/viewer-token")
+        assert resp.status_code == 409
+        assert "headless" in resp.json()["detail"].lower()
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_headless_profile_refuses_the_x_clipboard(app_client: TestClient):
+    """No X server means no X clipboard; ":None" as a DISPLAY is not an answer."""
+    create = app_client.post(
+        "/api/profiles", json={"name": "HeadlessClip", "headless": True},
+    )
+    pid = create.json()["id"]
+    _mock_headless_running_profile(pid)
+    try:
+        resp = app_client.post(
+            f"/api/profiles/{pid}/clipboard", json={"text": "hello"},
+        )
+        assert resp.status_code == 409
+        # The read side degrades instead of erroring: the Playwright leg is
+        # still valid headless, only the xclip fallback is unreachable.
+        mock = main.browser_mgr.running[pid]
+        mock.context.pages = []
+        assert app_client.get(f"/api/profiles/{pid}/clipboard").json() == {"text": ""}
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_headless_launch_returns_200_with_null_display(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """LaunchResponse must accept the nulls a headless launch produces.
+
+    vnc_ws_port and display were non-nullable, so a headless launch raised
+    ResponseValidationError AFTER the browser had already started: the caller
+    saw 500 for an operation that succeeded, and the retry then answered 409.
+    """
+    create = app_client.post(
+        "/api/profiles", json={"name": "HeadlessLaunch", "headless": True},
+    )
+    pid = create.json()["id"]
+
+    async def fake_launch(_profile):
+        return _mock_headless_running_profile(pid)
+
+    monkeypatch.setattr(main.browser_mgr, "launch", fake_launch)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/launch")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "running"
+        assert body["vnc_ws_port"] is None
+        assert body["display"] is None
+        assert body["cdp_url"] == f"/api/profiles/{pid}/cdp"
     finally:
         main.browser_mgr.running.pop(pid, None)

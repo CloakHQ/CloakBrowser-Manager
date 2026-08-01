@@ -6,6 +6,18 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+# The lifecycle contract, machine-checked on the way out. Kept as a Literal so
+# adding a value is a type error at every producer instead of a string that
+# silently reaches a frontend that has never heard of it — the mirror of
+# frontend/src/lib/api.ts's PROFILE_LIFECYCLES tuple, which these four values
+# must stay identical to.
+#   running  = a live RunningProfile exists
+#   starting = a launch is in flight or queued behind auto-launch
+#   stopping = teardown in flight (or wedged); the browser may still be alive
+#              and launch/stop/delete all refuse with 409
+#   stopped  = nothing is held for this profile
+ProfileLifecycleT = Literal["running", "starting", "stopping", "stopped"]
+
 
 class ProfileCreate(BaseModel):
     name: str
@@ -100,7 +112,7 @@ class ProfileResponse(BaseModel):
     created_at: str
     updated_at: str
     tags: list[TagResponse] = []
-    status: str = "stopped"  # "running" | "starting" | "stopped"
+    status: ProfileLifecycleT = "stopped"
     vnc_ws_port: int | None = None
     cdp_url: str | None = None
 
@@ -108,8 +120,13 @@ class ProfileResponse(BaseModel):
 class LaunchResponse(BaseModel):
     profile_id: str
     status: str = "running"
-    vnc_ws_port: int
-    display: str
+    # Null for a headless profile: it allocates no display and no Xvnc, so
+    # there is nothing to report. These were non-nullable, which turned every
+    # headless launch into a 500 ResponseValidationError AFTER the browser had
+    # already started — the caller saw "Internal Server Error" for a launch
+    # that in fact succeeded, and the next attempt then answered 409.
+    vnc_ws_port: int | None = None
+    display: str | None = None
     cdp_url: str | None = None
 
 
@@ -120,7 +137,7 @@ class StatusResponse(BaseModel):
 
 
 class ProfileStatusResponse(BaseModel):
-    status: str  # "running" | "starting" | "stopped"
+    status: ProfileLifecycleT
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None

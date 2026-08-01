@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import socket
 
+from backend import browser_manager as bm
 from backend.browser_manager import (
     BASE_CDP_PORT,
     CDP_PORT_RANGE,
@@ -262,3 +270,537 @@ def test_init_idempotent(tmp_path: Path):
     # Second call should NOT overwrite (file already exists)
     _init_profile_defaults(tmp_path)
     assert bookmarks_path.read_text() == "SENTINEL"
+
+
+# ── /proc identity ───────────────────────────────────────────────────────────
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_proc_argv_normalises_chromiums_space_joined_cmdline(monkeypatch, tmp_path: Path):
+    """Chromium rewrites argv into ONE space-joined buffer, not NUL-separated.
+
+    The textbook split(b"\\0") returns a single blob, so the obvious scan finds
+    nothing against a real browser while passing every test written against a
+    plain Python child — which uses the normal encoding. Feed the reader the
+    encoding a real Chromium produces, because a subprocess decoy cannot.
+    """
+    import builtins
+
+    blob = tmp_path / "cmdline"
+    blob.write_bytes(
+        b"/opt/chrome --headless=new --no-sandbox "
+        b"--user-data-dir=/data/profiles/abc --remote-debugging-port=5100\0"
+    )
+    real_open = builtins.open
+    monkeypatch.setattr(
+        builtins, "open",
+        lambda path, *a, **k: real_open(
+            blob if str(path).endswith("/cmdline") else path, *a, **k
+        ),
+    )
+
+    assert bm._proc_argv(4242) == [
+        "/opt/chrome", "--headless=new", "--no-sandbox",
+        "--user-data-dir=/data/profiles/abc", "--remote-debugging-port=5100",
+    ]
+
+
+def test_proc_argv_reads_the_ordinary_nul_separated_form():
+    """The normalisation must not break the encoding every other process uses."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "--marker=zzz"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(100):
+            argv = bm._proc_argv(child.pid)
+            if "--marker=zzz" in argv:
+                break
+            time.sleep(0.02)
+        assert argv[-1] == "--marker=zzz"
+        assert argv[0].endswith("python") or "python" in argv[0]
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_discover_finds_the_browser_and_skips_renderers_and_strangers(tmp_path: Path):
+    """Renderers carry the SAME --user-data-dir and --remote-debugging-port.
+
+    Excluding --type= is mandatory, not defensive: without it the scan returns
+    a renderer, and every later liveness check and every escalation targets
+    the wrong process.
+    """
+    udd = str(tmp_path / "profile")
+    port = _free_port()
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", *argv],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        for argv in (
+            [f"--user-data-dir={udd}", f"--remote-debugging-port={port}"],
+            [f"--user-data-dir={udd}", f"--remote-debugging-port={port}",
+             "--type=renderer"],
+            [f"--user-data-dir={udd}-other", f"--remote-debugging-port={port}"],
+            [f"--user-data-dir={udd}", f"--remote-debugging-port={port + 1}"],
+        )
+    ]
+    browser = children[0]
+    try:
+        for _ in range(100):
+            found = bm.discover_browser_process(udd, port, os.getpid())
+            if found is not None:
+                break
+            time.sleep(0.02)
+        assert found is not None
+        assert found.pid == browser.pid
+        assert found.starttime == bm._proc_stat(browser.pid)[2]
+    finally:
+        for child in children:
+            child.kill()
+            child.wait()
+
+    assert bm.discover_browser_process(udd, port, os.getpid()) is None
+
+
+def test_a_renderer_is_never_mistaken_for_the_browser(tmp_path: Path):
+    """Renderers inherit --user-data-dir AND --remote-debugging-port.
+
+    With only a renderer running, the scan must find nothing: returning it
+    would make every later liveness check and every escalation target a child
+    that dies and respawns independently of the browser.
+    """
+    udd = str(tmp_path / "profile")
+    port = _free_port()
+    renderer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         f"--user-data-dir={udd}", f"--remote-debugging-port={port}",
+         "--type=renderer"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(100):
+            if f"--user-data-dir={udd}" in bm._proc_argv(renderer.pid):
+                break
+            time.sleep(0.02)
+        assert f"--type=renderer" in bm._proc_argv(renderer.pid)
+        assert bm.discover_browser_process(udd, port, os.getpid()) is None
+    finally:
+        renderer.kill()
+        renderer.wait()
+
+
+def test_discover_ignores_a_match_outside_our_process_tree(tmp_path: Path):
+    """The manager must never be able to signal a process it did not start."""
+    udd = str(tmp_path / "profile")
+    port = _free_port()
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         f"--user-data-dir={udd}", f"--remote-debugging-port={port}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert bm.discover_browser_process(udd, port, os.getpid()) is not None
+        # same predicate, a root we are not below: no match
+        assert bm.discover_browser_process(udd, port, root_pid=-1) is None
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_process_is_alive_treats_a_zombie_as_dead():
+    """PID 1 here is a shell with no reaping, so a killed browser can sit in Z.
+
+    Counting Z as alive would mean the teardown guard never releases.
+    """
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.exit(0)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        proc = bm.BrowserProcess(
+            pid=child.pid, starttime=bm._proc_stat(child.pid)[2],
+            user_data_dir="/tmp/x", cdp_port=5100,
+        )
+        for _ in range(200):
+            stat = bm._proc_stat(child.pid)
+            if stat is not None and stat[0] == "Z":
+                break
+            time.sleep(0.01)
+        assert stat is not None and stat[0] == "Z", "needed a zombie to test"
+        assert bm.process_is_alive(proc) is False
+    finally:
+        child.wait()
+
+
+def test_process_is_alive_rejects_a_recycled_pid():
+    """pid alone is not an identity; starttime is what makes it one."""
+    stat = bm._proc_stat(os.getpid())
+    same_pid_other_process = bm.BrowserProcess(
+        pid=os.getpid(), starttime=stat[2] + 1, user_data_dir="/tmp/x", cdp_port=5100,
+    )
+    assert bm.process_is_alive(same_pid_other_process) is False
+
+
+def test_signal_process_refuses_a_recycled_pid(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(bm.os, "kill", lambda pid, sig: calls.append(pid))
+    stat = bm._proc_stat(os.getpid())
+    stale = bm.BrowserProcess(
+        pid=os.getpid(), starttime=stat[2] + 1, user_data_dir="/tmp/x", cdp_port=5100,
+    )
+    assert bm._signal_process(stale, signal.SIGTERM) is False
+    assert calls == []
+
+
+# ── _close_context_bounded ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_context_bounded_does_not_trust_is_closed(monkeypatch):
+    """playwright sets _closing_or_closed BEFORE its first await.
+
+    is_closed() therefore means "closing or closed", so short-circuiting on it
+    reported success for a close that was merely in flight — and the caller
+    then dropped the teardown guard while Chromium was still writing to
+    user_data_dir.
+    """
+    monkeypatch.setattr(bm, "CONTEXT_CLOSE_TIMEOUT_S", 0.05)
+    state = {"closed": False}
+
+    class HangingContext:
+        def is_closed(self):
+            return state["closed"]
+
+        async def close(self):
+            state["closed"] = True     # exactly what playwright does, up front
+            await asyncio.sleep(3600)
+
+    context = HangingContext()
+    assert await bm._close_context_bounded(context, "p1") is False
+    assert context.is_closed() is True          # ...and yet still alive
+    assert await bm._close_context_bounded(context, "p1") is False
+
+
+# ── cleanup_all / auto_launch_all ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_stops_every_profile_concurrently(monkeypatch):
+    """Shutdown cost must be the slowest profile, not the sum of all of them.
+
+    Sequentially it is the SUM of every CONTEXT_CLOSE_TIMEOUT_S plus Xvnc
+    teardown, so a handful of profiles exceeds Docker's stop grace period and
+    the container is SIGKILLed mid-cleanup — killing uncleanly the very
+    browsers the ordered shutdown exists to protect. conftest mocks this
+    method away in every app fixture, so it must be exercised directly.
+    """
+    mgr = BrowserManager()
+    windows: list[tuple[str, float]] = []
+
+    def make_context(name: str):
+        context = MagicMock()
+        context.is_closed.return_value = False
+
+        async def close():
+            windows.append((f"start-{name}", time.monotonic()))
+            await asyncio.sleep(0.05)
+            windows.append((f"end-{name}", time.monotonic()))
+
+        context.close = close
+        return context
+
+    for index in range(4):
+        mgr.running[f"p{index}"] = bm.RunningProfile(
+            profile_id=f"p{index}", context=make_context(str(index)),
+            display=100 + index, ws_port=6100 + index, cdp_port=5100 + index,
+        )
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+    vnc_cleanup = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "cleanup_all", vnc_cleanup)
+
+    started = time.monotonic()
+    await mgr.cleanup_all()
+    elapsed = time.monotonic() - started
+
+    assert mgr.running == {}
+    vnc_cleanup.assert_awaited_once()
+    assert elapsed < 0.15                       # not 4 x 0.05 in series
+    assert [w[0] for w in windows[:4]] == [f"start-{i}" for i in range(4)]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_survives_one_profile_that_raises(monkeypatch):
+    """One broken teardown must not strand the others or the vnc cleanup."""
+    mgr = BrowserManager()
+    stopped: list[str] = []
+
+    async def stop(profile_id: str) -> bool:
+        if profile_id == "bad":
+            raise RuntimeError("boom")
+        stopped.append(profile_id)
+        return True
+
+    mgr.running["bad"] = MagicMock()
+    mgr.running["good"] = MagicMock()
+    monkeypatch.setattr(mgr, "stop", stop)
+    vnc_cleanup = AsyncMock()
+    monkeypatch.setattr(mgr.vnc, "cleanup_all", vnc_cleanup)
+
+    await mgr.cleanup_all()
+
+    assert stopped == ["good"]
+    vnc_cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_launch_claims_the_whole_queue_up_front(monkeypatch, tmp_db):
+    """Queued profiles must report "starting", never "stopped".
+
+    Launches are sequential and the last one can be minutes away. An open
+    viewer reads "stopped" as terminal, so without the up-front claim a
+    container restart ends every session that was about to come back.
+    """
+    from backend import database as db
+
+    ids = [db.create_profile(name=f"auto{i}", auto_launch=True)["id"] for i in range(3)]
+    mgr = BrowserManager()
+    gate = asyncio.Event()
+    seen: list[list[bool]] = []
+
+    async def launch(profile):
+        # while the FIRST profile is launching, the other two must read starting
+        seen.append([mgr.is_starting(other) for other in ids])
+        await gate.wait()
+
+    monkeypatch.setattr(mgr, "launch", launch)
+    task = asyncio.ensure_future(mgr.auto_launch_all())
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if seen:
+            break
+
+    assert seen[0] == [True, True, True]
+
+    gate.set()
+    await task
+    assert [mgr.is_starting(pid) for pid in ids] == [False, False, False]
+
+
+@pytest.mark.asyncio
+async def test_auto_launch_bounds_each_launch(monkeypatch, tmp_db):
+    """Without the per-launch ceiling one wedged profile blocks the whole queue."""
+    from backend import database as db
+
+    ids = [db.create_profile(name=f"auto{i}", auto_launch=True)["id"] for i in range(2)]
+    monkeypatch.setattr(bm, "LAUNCH_TIMEOUT_S", 0.05)
+    mgr = BrowserManager()
+    reached: list[str] = []
+
+    async def launch(profile):
+        reached.append(profile["id"])
+        if profile["id"] == ids[0]:
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(mgr, "launch", launch)
+    await asyncio.wait_for(mgr.auto_launch_all(), timeout=3.0)
+
+    # both were reached: the hang did not block the queue behind it
+    assert sorted(reached) == sorted(ids)
+    assert mgr.is_starting(ids[0]) is False
+    assert mgr.is_starting(ids[1]) is False
+
+
+@pytest.mark.asyncio
+async def test_auto_launch_cancellation_does_not_strand_starting(monkeypatch, tmp_db):
+    """Shutdown cancels this task; a leftover claim is a permanent 409."""
+    from backend import database as db
+
+    pid = db.create_profile(name="auto", auto_launch=True)["id"]
+    mgr = BrowserManager()
+
+    async def launch(profile):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(mgr, "launch", launch)
+    task = asyncio.ensure_future(mgr.auto_launch_all())
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if mgr.is_starting(pid):
+            break
+    assert mgr.is_starting(pid) is True
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert mgr.is_starting(pid) is False
+
+
+# ── driver identity and the SIGKILL leg ──────────────────────────────────────
+
+
+def test_discovery_records_the_driver_that_owns_the_browser(tmp_path: Path):
+    """The browser's ppid at discovery is the Playwright node driver.
+
+    Recording it is what makes the SIGKILL leg able to clean up the driver too;
+    without it a forced teardown leaves the driver blocked on a pipe read from
+    a dead browser, holding it as a zombie for the container's lifetime.
+    """
+    udd = str(tmp_path / "profile")
+    port = _free_port()
+    # A parent that spawns the "browser" so the browser has a non-init ppid,
+    # mirroring node -> chrome.
+    # The flags reach the parent through the ENVIRONMENT, never its argv: a
+    # parent carrying them too would match the scan predicate itself and be
+    # discovered instead of its child, which is what a driver never does.
+    parent = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os,subprocess,sys,time;"
+            "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)',"
+            "os.environ['T_UDD'],os.environ['T_PORT']]);"
+            "print(c.pid,flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        env={
+            **os.environ,
+            "T_UDD": f"--user-data-dir={udd}",
+            "T_PORT": f"--remote-debugging-port={port}",
+        },
+    )
+    try:
+        browser_pid = int(parent.stdout.readline().strip())
+        found = None
+        for _ in range(150):
+            found = bm.discover_browser_process(udd, port, os.getpid())
+            if found is not None:
+                break
+            time.sleep(0.02)
+        assert found is not None, "browser not discovered"
+        assert found.pid == browser_pid
+        assert found.driver_pid == parent.pid
+        assert found.driver_starttime == bm._proc_stat(parent.pid)[2]
+    finally:
+        parent.kill()
+        parent.wait()
+
+
+def test_signal_driver_kills_the_real_driver_process(tmp_path: Path):
+    driver = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        stat = bm._proc_stat(driver.pid)
+        assert stat is not None
+        proc = bm.BrowserProcess(
+            pid=os.getpid(), starttime=bm._proc_stat(os.getpid())[2],
+            user_data_dir=str(tmp_path), cdp_port=1,
+            driver_pid=driver.pid, driver_starttime=stat[2],
+        )
+        assert bm._signal_driver(proc, signal.SIGKILL) is True
+        driver.wait(timeout=5)
+        assert driver.poll() is not None
+    finally:
+        if driver.poll() is None:
+            driver.kill()
+            driver.wait()
+
+
+def test_signal_driver_refuses_a_recycled_driver_pid(tmp_path: Path):
+    """A driver pid whose starttime moved belongs to somebody else now."""
+    victim = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        stat = bm._proc_stat(victim.pid)
+        proc = bm.BrowserProcess(
+            pid=os.getpid(), starttime=bm._proc_stat(os.getpid())[2],
+            user_data_dir=str(tmp_path), cdp_port=1,
+            driver_pid=victim.pid, driver_starttime=stat[2] + 1,  # recycled
+        )
+        assert bm._signal_driver(proc, signal.SIGKILL) is False
+        time.sleep(0.2)
+        assert victim.poll() is None, "an unrelated process was killed"
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_signal_driver_is_a_noop_when_no_driver_was_recorded(tmp_path: Path):
+    proc = bm.BrowserProcess(
+        pid=os.getpid(), starttime=bm._proc_stat(os.getpid())[2],
+        user_data_dir=str(tmp_path), cdp_port=1,
+    )
+    assert bm._signal_driver(proc, signal.SIGKILL) is False
+
+
+def test_sigterm_leg_fires_before_playwrights_own_force_kill():
+    """Playwright force-kills a frozen Chromium at its own 30s deadline.
+
+    Measured live: with the SIGTERM leg at 30s the sweeper first evaluated it at
+    ~33.5s and Playwright always won, so the manager's polite signal was
+    unreachable and every wedge was really a silent SIGKILL by the driver. The
+    worst-case moment the leg can fire is the threshold plus one sweep.
+    """
+    assert bm.CLOSING_SIGTERM_AFTER_S + bm.CLAIM_SWEEP_INTERVAL_S < 30.0
+
+
+# ── an unattributable claim must fail closed ─────────────────────────────────
+
+
+def test_a_claim_with_no_identity_is_held_while_its_cdp_port_is_bound(tmp_path: Path):
+    """"Discovery found nothing" is not "the browser is gone".
+
+    A Chromium reparented to PID 1 (driver OOM-killed mid-write) fails the
+    descendant check and is invisible to the scan. Releasing then hands its live
+    user_data_dir to a relaunch or an rmtree.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    claim = bm.ClosingClaim(
+        context=None, proc=None, user_data_dir=str(tmp_path / "nope"),
+        cdp_port=port, claimed_at=time.monotonic(),
+    )
+    try:
+        alive, discovered = bm.BrowserManager._claim_evidence(claim)
+        assert alive is True, "guard released with the CDP port still bound"
+        assert discovered is None
+    finally:
+        listener.close()
+
+    # ...and once nothing holds the port, the claim resolves.
+    alive, discovered = bm.BrowserManager._claim_evidence(claim)
+    assert alive is False
+    assert discovered is None
+
+
+@pytest.mark.asyncio
+async def test_an_unattributable_claim_reports_itself_once(tmp_path: Path, caplog):
+    """It cannot be signalled, so it must at least be visible in the log."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    mgr = BrowserManager()
+    claim = bm.ClosingClaim(
+        context=None, proc=None, user_data_dir=str(tmp_path / "nope"),
+        cdp_port=port, claimed_at=time.monotonic(),
+    )
+    mgr._closing["p1"] = claim
+    try:
+        with caplog.at_level("ERROR", logger="cloakbrowser.manager.browser"):
+            assert await mgr.check_wedged("p1") is True
+            assert await mgr.check_wedged("p1") is True
+        assert caplog.text.count("cannot be signalled") == 1
+    finally:
+        listener.close()

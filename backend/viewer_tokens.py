@@ -21,6 +21,13 @@ class ViewerSession:
     ws_port: int
     issued_at: float
     expires_at: float
+    # Which launch this token was minted for. ws_port alone cannot answer that:
+    # VNCManager.allocate() gap-fills from BASE_DISPLAY upward, so a
+    # stop+relaunch of the same profile deterministically returns the identical
+    # display and ws_port and the staleness check can never fire. A nonce
+    # generated per launch cannot be recycled. Empty means "minted without an
+    # epoch", which never matches a live session.
+    session_epoch: str = ""
 
 
 class ViewerTokenStore:
@@ -33,7 +40,10 @@ class ViewerTokenStore:
     def __init__(self):
         self._sessions: dict[str, ViewerSession] = {}
 
-    def issue(self, profile_id: str, ws_port: int, ttl: int = VIEWER_TOKEN_TTL) -> str:
+    def issue(
+        self, profile_id: str, ws_port: int, ttl: int = VIEWER_TOKEN_TTL,
+        session_epoch: str = "",
+    ) -> str:
         """Issue a fresh token for a profile. Old tokens stay valid until expiry."""
         token = secrets.token_urlsafe(32)
         now = time.time()
@@ -50,6 +60,7 @@ class ViewerTokenStore:
             ws_port=ws_port,
             issued_at=now,
             expires_at=now + ttl,
+            session_epoch=session_epoch,
         )
         return token
 

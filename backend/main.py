@@ -53,33 +53,55 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 # (except /api/auth/* and /api/status) require Bearer token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
+# One string for one state. launch, stop and delete used to answer a wedged
+# teardown with three different messages (and two different status codes), so
+# an operator could not tell they were looking at the same thing.
+_SHUTTING_DOWN_DETAIL = "Browser is still shutting down; try again"
+
 # Paths that bypass authentication even when AUTH_TOKEN is set
 # (/api/viewer-auth is exempt: the viewer token in X-Original-URI is the credential)
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status", "/api/viewer-auth"})
 
 
 def _check_auth(scope: Scope) -> bool:
-    """Check if the request has a valid auth token (header or cookie)."""
-    # Check Authorization: Bearer <token> header
-    for key, val in scope.get("headers", []):
-        if key == b"authorization":
-            auth_value = val.decode()
-            if auth_value.startswith("Bearer "):
-                token = auth_value[7:]
-                if token and hmac.compare_digest(token, AUTH_TOKEN):
-                    return True
-            break
+    """Check if the request has a valid auth token (header or cookie).
 
-    # Check auth_token cookie
-    for key, val in scope.get("headers", []):
-        if key == b"cookie":
-            cookies = SimpleCookie()
-            cookies.load(val.decode())
-            if "auth_token" in cookies:
-                cookie_val = cookies["auth_token"].value
-                if cookie_val and hmac.compare_digest(cookie_val, AUTH_TOKEN):
-                    return True
-            break
+    A malformed credential can only ever mean "unauthenticated". It used to
+    mean HTTP 500 plus a traceback: `Authorization: Bearer <0xe9>` raised
+    UnicodeDecodeError from the utf-8 decode, and a well-formed non-ASCII
+    token raised TypeError out of hmac.compare_digest, both before any
+    authentication decision. Comparing the raw ASGI bytes avoids the decode
+    entirely, and the blanket except makes the failure mode a 401 rather than
+    an unauthenticated error-rate amplifier.
+    """
+    try:
+        expected = AUTH_TOKEN.encode()
+        # Check Authorization: Bearer <token> header
+        for key, val in scope.get("headers", []):
+            if key == b"authorization":
+                if val.startswith(b"Bearer "):
+                    token = val[7:]
+                    if token and hmac.compare_digest(token, expected):
+                        return True
+                break
+
+        # Check auth_token cookie
+        for key, val in scope.get("headers", []):
+            if key == b"cookie":
+                cookies = SimpleCookie()
+                # latin-1 is the ASGI header encoding and is byte-preserving,
+                # so it cannot raise on any header a client can send.
+                cookies.load(val.decode("latin-1"))
+                if "auth_token" in cookies:
+                    cookie_val = cookies["auth_token"].value
+                    if cookie_val and hmac.compare_digest(
+                        cookie_val.encode("latin-1"), expected,
+                    ):
+                        return True
+                break
+    except Exception as exc:
+        logger.warning("Rejecting a malformed credential: %s", type(exc).__name__)
+        return False
 
     return False
 
@@ -184,17 +206,49 @@ browser_mgr = BrowserManager()
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 
+def _demote_abandoned_driver_errors(loop, context: dict) -> None:
+    """Keep a correctly-handled wedged teardown out of the ERROR log.
+
+    _close_context_bounded deliberately abandons a close that outran its bound;
+    when the driver connection later drops, that future's exception is never
+    retrieved and asyncio reports it at ERROR with a stack trace, no profile id
+    and no context. Operators (and log alerts) read that as a crash in a path
+    that in fact worked exactly as designed. Anything else is left alone.
+    """
+    exc = context.get("exception")
+    message = context.get("message", "")
+    if "never retrieved" in message and isinstance(exc, Exception) and (
+        "Connection closed while reading from the driver" in str(exc)
+        or "Target page, context or browser has been closed" in str(exc)
+    ):
+        logger.warning(
+            "Abandoned Playwright close finally failed (expected after a wedged "
+            "teardown): %s", exc,
+        )
+        return
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    asyncio.get_running_loop().set_exception_handler(_demote_abandoned_driver_errors)
+    browser_mgr.add_display_released_hook(_reap_xclip_for_display)
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
+    # Nothing else re-examines a teardown claim: the status path is a pure peek
+    # by design, so without this loop a profile whose browser exited quietly
+    # stays "stopping" with launch/stop/delete all refusing, forever. It also
+    # reaps browsers whose Playwright driver died without emitting a close.
+    browser_mgr._sweep_task = asyncio.create_task(browser_mgr.run_maintenance())
     logger.info("CloakBrowser Manager started")
     yield
     logger.info("Shutting down — stopping all browsers...")
-    if browser_mgr._auto_launch_task and not browser_mgr._auto_launch_task.done():
-        browser_mgr._auto_launch_task.cancel()
-        await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
+    background = [browser_mgr._auto_launch_task, browser_mgr._sweep_task]
+    for task in background:
+        if task and not task.done():
+            task.cancel()
+    await asyncio.gather(*[t for t in background if t], return_exceptions=True)
     await browser_mgr.cleanup_all()
 
 
@@ -247,18 +301,28 @@ async def auth_logout(request: Request, response: Response):
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 
+def _profile_response(profile: dict) -> ProfileResponse:
+    """Attach the cheap lifecycle fields to a DB row.
+
+    One helper rather than four inlined copies: the copies drifted apart the
+    moment a fourth lifecycle value existed, and three of the four read paths
+    would have kept reporting "stopped" for a profile mid-teardown while the
+    fourth told the truth. get_status() is a pure peek, so this is safe on the
+    3s poll.
+    """
+    status = browser_mgr.get_status(profile["id"])
+    return ProfileResponse(**{
+        **profile,
+        "status": status["status"],
+        "vnc_ws_port": status["vnc_ws_port"],
+        "cdp_url": status["cdp_url"],
+        "tags": [TagResponse(**t) for t in profile.get("tags", [])],
+    })
+
+
 @app.get("/api/profiles", response_model=list[ProfileResponse])
 async def list_profiles():
-    profiles = db.list_profiles()
-    result = []
-    for p in profiles:
-        status = browser_mgr.get_status(p["id"])
-        p["status"] = status["status"]
-        p["vnc_ws_port"] = status["vnc_ws_port"]
-        p["cdp_url"] = status["cdp_url"]
-        p["tags"] = [TagResponse(**t) for t in p.get("tags", [])]
-        result.append(ProfileResponse(**p))
-    return result
+    return [_profile_response(p) for p in db.list_profiles()]
 
 
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
@@ -269,13 +333,7 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
-    profile = db.create_profile(**data)
-    status = browser_mgr.get_status(profile["id"])
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(db.create_profile(**data))
 
 
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -283,12 +341,7 @@ async def get_profile(profile_id: str):
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -301,12 +354,7 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.delete("/api/profiles/{profile_id}")
@@ -332,9 +380,9 @@ async def _delete_profile_locked(profile_id: str):
     # A previous /stop may have left Chromium alive (bounded close timed out).
     # It is out of `running`, so the stop below would be skipped and the rmtree
     # would run under a live browser.
-    if browser_mgr.is_wedged(profile_id):
+    if await browser_mgr.check_wedged(profile_id):
         raise HTTPException(
-            status_code=409, detail="Browser is still shutting down; try again",
+            status_code=409, detail=_SHUTTING_DOWN_DETAIL,
         )
 
     # Stop browser if running
@@ -350,7 +398,7 @@ async def _delete_profile_locked(profile_id: str):
             # and writing to user_data_dir. Deleting it now corrupts a live
             # profile; refuse rather than race a wedged browser.
             raise HTTPException(
-                status_code=409, detail="Browser is still shutting down; try again",
+                status_code=409, detail=_SHUTTING_DOWN_DETAIL,
             )
 
     # Revoke viewer tokens even if the profile wasn't running
@@ -389,6 +437,12 @@ async def launch_profile(profile_id: str):
         raise HTTPException(status_code=409, detail="Profile is already running")
     if browser_mgr.is_starting(profile_id):
         raise HTTPException(status_code=409, detail="Profile is already starting")
+    # Say what is actually true. A teardown in flight used to surface here as
+    # "Profile is already running" — flatly contradicting the status the same
+    # API reported a poll earlier, and contradicting DELETE, which reported the
+    # shutdown correctly. One state, one message.
+    if await browser_mgr.check_wedged(profile_id):
+        raise HTTPException(status_code=409, detail=_SHUTTING_DOWN_DETAIL)
 
     try:
         # Same ceiling auto-launch uses: without it a wedged Playwright call
@@ -412,7 +466,7 @@ async def launch_profile(profile_id: str):
         profile_id=profile_id,
         status="running",
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}",
+        display=f":{running.display}" if running.display is not None else None,
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -424,6 +478,12 @@ async def stop_profile(profile_id: str):
         # into registering the instance we just tore down.
         if browser_mgr.is_starting(profile_id):
             raise HTTPException(status_code=409, detail="Profile is starting; try again")
+        # Neither is mid-teardown. 404 "Profile is not running" was the third
+        # of three contradictory answers for one state (list said "stopped",
+        # launch said "already running", delete said "shutting down"), and it
+        # is the one that tells the operator to stop trying.
+        if await browser_mgr.check_wedged(profile_id):
+            raise HTTPException(status_code=409, detail=_SHUTTING_DOWN_DETAIL)
         raise HTTPException(status_code=404, detail="Profile is not running")
     closed = await browser_mgr.stop(profile_id)
     # Report honestly: the display is reclaimed either way, but a wedged
@@ -470,7 +530,18 @@ async def create_viewer_token(profile_id: str):
         if browser_mgr.is_starting(profile_id):
             raise HTTPException(status_code=503, detail="Profile is starting")
         raise HTTPException(status_code=404, detail="Profile not running")
-    token = viewer_tokens.issue(profile_id, running.ws_port, ttl=VIEWER_TOKEN_TTL)
+    if running.ws_port is None:
+        # Headless: no Xvnc was ever started, so there is nothing to view.
+        # 409 rather than 404 — the profile IS running, it just has no
+        # display; 404 would send the viewer to a "session ended" overlay
+        # implying the browser died.
+        raise HTTPException(
+            status_code=409, detail="Profile is headless and has no viewer",
+        )
+    token = viewer_tokens.issue(
+        profile_id, running.ws_port, ttl=VIEWER_TOKEN_TTL,
+        session_epoch=running.session_epoch,
+    )
     logger.info("Issued viewer token for profile %s (ttl=%ds)", profile_id, VIEWER_TOKEN_TTL)
     return ViewerTokenResponse(
         token=token,
@@ -503,11 +574,15 @@ async def viewer_auth(request: Request):
         raise HTTPException(status_code=403, detail="Profile not running")
 
     # Upstream and credentials must come from the same source of truth. The
-    # token carries the ws_port it was minted for; the credentials come from
-    # the live display. If a token ever outlives a relaunch, mixing the two
-    # would point nginx at a stale port while handing it valid-looking auth
-    # for a different display.
-    if session.ws_port != running.ws_port:
+    # token names the session it was minted for; the credentials come from the
+    # live display. If a token ever outlives a relaunch, mixing the two would
+    # point nginx at a stale port while handing it valid-looking auth for a
+    # different display.
+    # The epoch, not the port, is what makes this check real: allocate()
+    # gap-fills from BASE_DISPLAY up, so a stop+relaunch of the same profile
+    # deterministically returns the identical display and ws_port and the port
+    # comparison alone can never fire. It is kept as a cheap second assertion.
+    if session.session_epoch != running.session_epoch or session.ws_port != running.ws_port:
         logger.info("Viewer token for profile %s predates a relaunch", session.profile_id)
         raise HTTPException(status_code=403, detail="Viewer token is stale")
 
@@ -522,6 +597,92 @@ async def viewer_auth(request: Request):
         headers["X-Viewer-Authorization"] = "Basic " + base64.b64encode(raw).decode()
 
     return Response(status_code=200, headers=headers)
+
+
+# An idle profile never produces the encoded frame get_frame_stats waits for,
+# so this request is expected to time out; keep it well under the client-wide
+# timeout so a stats poll stays cheap.
+KASM_FRAME_STATS_TIMEOUT_S = 1.5
+# The viewer-liveness probe hits 127.0.0.1 and Kasm answers it in ~3ms without
+# touching the frame clock, so anything slower means the control plane is sick,
+# not busy — report "unknown" rather than making the caller wait.
+KASM_VIEWER_PROBE_TIMEOUT_S = 2.0
+
+
+def _viewer_attached(bottleneck) -> bool | None:
+    """Whether a viewer WebSocket is attached, or None if we cannot tell.
+
+    /api/get_bottleneck_stats is the only exact liveness signal Kasm exposes:
+    entries are keyed by peerEndpoint, written per client per framebuffer update
+    (VNCSConnectionST::sendStats) and erased in ~VNCSConnectionST, so the object
+    goes empty the moment the last viewer socket dies. Verified live going
+    empty -> populated -> empty across a connect/disconnect while
+    /api/get_sessions stayed stale on the same run.
+
+    None means "no answer" — a 401/5xx, an unreachable port or a body we could
+    not parse. Callers must not treat that as "no viewer": only a definitively
+    empty object is evidence of a dead socket, and acting on a control-plane
+    blip would tear down a perfectly healthy session.
+    """
+    if not isinstance(bottleneck, dict):
+        return None
+    return len(bottleneck) > 0
+
+
+def _viewer_client_count(bottleneck) -> int | None:
+    """Number of attached viewer endpoints, or None if indeterminate.
+
+    The payload is {username: {peerEndpoint: [...]}} — one inner key per live
+    socket, so -AlwaysShared multi-viewer sessions are counted, not collapsed.
+    """
+    if not isinstance(bottleneck, dict):
+        return None
+    return sum(len(v) for v in bottleneck.values() if isinstance(v, dict))
+
+
+@app.get("/api/profiles/{profile_id}/viewer-attached")
+async def viewer_attached(profile_id: str):
+    """Whether a viewer WebSocket is currently attached to this profile.
+
+    The frontend's connected-heartbeat can only prove the *processes* are alive
+    via /status, so a half-open viewer socket leaves a green dot over a frozen
+    frame until TCP RTO fires. This is the missing signal, and it is cheap:
+    one bounded localhost GET, no frame-clock dependency.
+
+    Always 200 for a running profile — `viewer_attached: null` means the probe
+    could not answer, which is deliberately distinct from `false` so a caller
+    cannot mistake a stats-endpoint hiccup for a dead viewer.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+
+    bottleneck = None
+    try:
+        auth = browser_mgr.vnc.get_api_credentials(running.display)
+        async with httpx.AsyncClient(
+            timeout=KASM_VIEWER_PROBE_TIMEOUT_S, auth=auth,
+        ) as client:
+            resp = await client.get(
+                f"http://127.0.0.1:{running.ws_port}/api/get_bottleneck_stats"
+            )
+        if resp.status_code >= 400:
+            # Not a 502: an unauthenticated or broken stats endpoint says
+            # nothing about the viewer socket, and the heartbeat that consumes
+            # this must be able to shrug it off rather than error out.
+            logger.warning(
+                "Viewer probe: bottleneck stats returned HTTP %d for %s",
+                resp.status_code, profile_id,
+            )
+        else:
+            bottleneck = _json_or_raw(resp)
+    except Exception as exc:
+        logger.debug("Viewer probe unavailable for %s: %s", profile_id, exc)
+
+    return {
+        "viewer_attached": _viewer_attached(bottleneck),
+        "clients": _viewer_client_count(bottleneck),
+    }
 
 
 @app.get("/api/profiles/{profile_id}/kasm-stats")
@@ -558,15 +719,31 @@ async def kasm_stats(profile_id: str):
             bottleneck = _json_or_raw(bottleneck_resp)
             sessions = _json_or_raw(sessions_resp)
 
-            # /api/get_frame_stats only works while the client collects perf
-            # stats (client-side enable_perf_stats); otherwise it 503s after
-            # a 10s wait. Isolate it so bottleneck/sessions still return.
+            # /api/get_frame_stats blocks until Kasm produces an encoded frame
+            # with non-zero encoding time (websocket.c:1600-1612 polls
+            # netServerFrameStatsReady 500x20ms), then answers 503. It has
+            # nothing to do with the client's enable_perf_stats, which drives a
+            # separate non-fatal 2s wait — a live client on a static screen
+            # still eats the full 10s. So it must be both gated and bounded.
+            #
+            # Gate on bottleneck, never on sessions: get_sessions is provably
+            # stale. VNCServerST::updateSessionUsersList only republishes when
+            # the list is NON-empty, and the disconnect path marks the client
+            # CLOSING (so it stops counting as authenticated) before calling it
+            # — the last viewer's departure computes an empty list and throws it
+            # away, leaving sessionsInfo populated forever. Gating on it made
+            # this call fire on every /kasm-stats after the first viewer ever
+            # attached, costing the client's whole 5s read timeout each time.
             frame = None
-            if isinstance(sessions, dict) and sessions.get("users"):
+            if _viewer_attached(bottleneck):
                 try:
                     frame_resp = await client.get(
                         f"http://127.0.0.1:{running.ws_port}/api/get_frame_stats",
                         params={"client": "all"},
+                        # Own timeout: an idle profile draws no frames, so this
+                        # request is expected to hang. 1.5s bounds the common
+                        # case instead of paying the client-wide 5s.
+                        timeout=KASM_FRAME_STATS_TIMEOUT_S,
                     )
                     frame = _json_or_raw(frame_resp)
                 except Exception as exc:
@@ -614,9 +791,48 @@ async def get_system_status():
 # ── Clipboard Relay ──────────────────────────────────────────────────────────
 
 _CLIPBOARD_MAX_READ = 1_048_576  # 1MB cap on GET response
+# Playwright 1.60 has no timeout parameter on page.evaluate and the call is
+# unbounded all the way down (_inner_send waits on FIRST_COMPLETED with no
+# deadline), so a page running `while(true){}` made GET /clipboard hang
+# forever — permanently, because the loop never reached the next page or the
+# xclip fallback, and uvicorn does not cancel a handler when the client goes
+# away. Both a per-page and a whole-loop bound are needed: without the second,
+# N wedged tabs sum to N * the first.
+_CLIPBOARD_PAGE_TIMEOUT_S = 2.0
+_CLIPBOARD_READ_TIMEOUT_S = 5.0
+_CLIPBOARD_MAX_PAGES = 20
 
 # Track xclip processes per display so we can kill the old one before spawning new
 _xclip_procs: dict[int, asyncio.subprocess.Process] = {}
+# One lock per display. The pop/spawn/store sequence below contains two awaits,
+# so three concurrent pastes on one display each popped the same entry and only
+# the last was tracked — the other two owned the X11 CLIPBOARD selection,
+# were never killed, and outlived the request.
+_xclip_locks: dict[int, asyncio.Lock] = {}
+
+
+def _xclip_lock(display: int) -> asyncio.Lock:
+    lock = _xclip_locks.get(display)
+    if lock is None:
+        lock = _xclip_locks[display] = asyncio.Lock()
+    return lock
+
+
+def _reap_xclip_for_display(display: int) -> None:
+    """Kill the xclip bound to a display once its Xvnc is gone.
+
+    Registered on BrowserManager at startup. Nothing used to remove entries
+    from _xclip_procs on stop, delete or crash, so every xclip ever spawned
+    survived for the container's lifetime holding a selection on a dead X
+    server.
+    """
+    proc = _xclip_procs.pop(display, None)
+    _xclip_locks.pop(display, None)
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError) as exc:
+            logger.debug("xclip for :%d already gone: %s", display, exc)
 
 
 @app.post("/api/profiles/{profile_id}/clipboard")
@@ -628,26 +844,76 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
 
     import os
 
-    # Kill previous xclip for this display (it stays alive to serve paste)
-    old = _xclip_procs.pop(running.display, None)
-    if old and old.returncode is None:
-        old.kill()
-        await old.wait()
+    display = running.display
+    if display is None:
+        # Headless: no X server, so there is no X clipboard to push into.
+        # Without this the DISPLAY below becomes the literal ":None" and
+        # xclip fails with an error the caller cannot act on.
+        raise HTTPException(
+            status_code=409, detail="Profile is headless and has no X clipboard",
+        )
+    async with _xclip_lock(display):
+        # Kill previous xclip for this display (it stays alive to serve paste)
+        old = _xclip_procs.pop(display, None)
+        if old and old.returncode is None:
+            old.kill()
+            await old.wait()
 
-    env = {**os.environ, "DISPLAY": f":{running.display}"}
-    proc = await asyncio.create_subprocess_exec(
-        "xclip", "-selection", "clipboard",
-        stdin=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    # xclip reads stdin then stays alive to serve paste requests.
-    proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
-    await proc.stdin.drain()  # type: ignore[union-attr]
-    proc.stdin.close()  # type: ignore[union-attr]
+        env = {**os.environ, "DISPLAY": f":{display}"}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xclip", "-selection", "clipboard",
+                stdin=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            # No xclip (local dev per the README) used to escape the handler as
+            # an unhandled FileNotFoundError and 500 with a traceback.
+            logger.warning("Clipboard relay unavailable for :%d: %s", display, exc)
+            raise HTTPException(status_code=503, detail="Clipboard relay unavailable")
 
-    _xclip_procs[running.display] = proc
+        try:
+            # xclip reads stdin then stays alive to serve paste requests.
+            proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
+            await proc.stdin.drain()  # type: ignore[union-attr]
+            proc.stdin.close()  # type: ignore[union-attr]
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            # xclip exits immediately when DISPLAY is unreachable (a dead
+            # Xvnc). Reap it here rather than leaving it untracked.
+            logger.warning("Clipboard write failed on :%d: %s", display, exc)
+            if proc.returncode is None:
+                proc.kill()
+            raise HTTPException(status_code=503, detail="Clipboard relay unavailable")
+
+        _xclip_procs[display] = proc
 
     return {"ok": True}
+
+
+async def _read_clipboard_from_pages(context) -> str:
+    """First non-empty captured selection across a context's pages.
+
+    Each evaluate is individually bounded so ONE wedged tab is skipped rather
+    than fatal — previously it blocked the loop before page[1] and before the
+    xclip fallback, killing the endpoint for that profile permanently. The page
+    count is capped so the caller's own bound is not the only thing standing
+    between a tab explosion and a slow request.
+    """
+    for page in list(context.pages)[:_CLIPBOARD_MAX_PAGES]:
+        try:
+            text = await asyncio.wait_for(
+                page.evaluate("window.__clipboardText || ''"),
+                timeout=_CLIPBOARD_PAGE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Clipboard read timed out on a wedged page; skipping")
+            continue
+        except Exception as exc:
+            logger.debug("Clipboard read failed on page: %s", exc)
+            continue
+        if text:
+            return text
+    return ""
 
 
 @app.get("/api/profiles/{profile_id}/clipboard")
@@ -668,27 +934,37 @@ async def get_clipboard(profile_id: str):
     # The init script also captures copy events when they do fire.
     # Check all pages — user may have copied in any tab
     try:
-        for page in running.context.pages:
-            try:
-                text = await page.evaluate("window.__clipboardText || ''")
-                if text:
-                    return {"text": text[:_CLIPBOARD_MAX_READ]}
-            except Exception as exc:
-                logger.debug("Clipboard read failed on page: %s", exc)
-                continue
+        text = await asyncio.wait_for(
+            _read_clipboard_from_pages(running.context),
+            timeout=_CLIPBOARD_READ_TIMEOUT_S,
+        )
+        if text:
+            return {"text": text[:_CLIPBOARD_MAX_READ]}
     except Exception as exc:
+        # Includes the whole-loop TimeoutError: N wedged tabs must not sum to
+        # N * _CLIPBOARD_PAGE_TIMEOUT_S before the xclip fallback is tried.
         logger.debug("Playwright clipboard read failed: %s", exc)
 
-    # Fallback: xclip for non-Chrome clipboard owners
+    # Fallback: xclip for non-Chrome clipboard owners. The Playwright read
+    # above works for a headless profile; this leg cannot, because there is
+    # no X server behind it.
     import os
 
+    if running.display is None:
+        return {"text": ""}
+
     env = {**os.environ, "DISPLAY": f":{running.display}"}
-    proc = await asyncio.create_subprocess_exec(
-        "xclip", "-selection", "clipboard", "-o",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "xclip", "-selection", "clipboard", "-o",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        # Degrade to an empty clipboard rather than a 500 with a traceback.
+        logger.warning("Clipboard relay unavailable for :%d: %s", running.display, exc)
+        return {"text": ""}
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
     except asyncio.TimeoutError:
@@ -708,15 +984,23 @@ async def get_clipboard(profile_id: str):
 
 
 @app.get("/api/profiles/{profile_id}/cdp")
-async def cdp_info(profile_id: str):
+async def cdp_info(profile_id: str, request: Request):
     """Return CDP connection info. Prevents SPA catch-all from serving index.html."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+    # Scheme and host from the ORIGINAL request, like the neighbouring
+    # /json/version endpoint. A hardcoded http://<host> behind a TLS terminator
+    # is a snippet that cannot work: an https-only ingress either refuses it or
+    # redirects, with nothing on screen explaining why.
+    scheme = "https" if _is_https(request) else "http"
+    host = request.headers.get("host", "localhost:8080")
     return {
         "cdp_url": f"/api/profiles/{profile_id}/cdp",
-        "usage": "playwright.chromium.connect_over_cdp('http://<host>/api/profiles/"
-        + profile_id + "/cdp')",
+        "usage": (
+            f"playwright.chromium.connect_over_cdp('{scheme}://{host}"
+            f"/api/profiles/{profile_id}/cdp')"
+        ),
     }
 
 
