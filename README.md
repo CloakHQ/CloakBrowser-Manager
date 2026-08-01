@@ -102,10 +102,11 @@ A profile with **Headless** enabled starts no Xvnc and allocates no display or W
 | `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
 | `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
 | `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — so `KASM_QUALITY_PRESET` no longer binds. See the note above. |
-| `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. One of `h264`, `h264_vaapi`, `h265`, `h265_vaapi`, `av1`, `av1_vaapi`. `auto` is refused — it lets the client pick, including software AV1. |
+| `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. Software: `h264`, `h265`, `av1`. VAAPI (Intel/AMD): `h264_vaapi`, `h265_vaapi`, `av1_vaapi`. NVENC (NVIDIA): `h264_nvenc`, `h265_nvenc`/`hevc_nvenc`, `av1_nvenc`. `auto` is refused — it lets the client pick, including software AV1. |
 | `KASM_XVNC_LOG_LEVEL` | `30` | Xvnc log verbosity (0-100). Raise to `100` to see per-connection encoder decisions in `/tmp/xvnc-<display>.log`. |
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
 | `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI |
+| `CHROME_GPU_ACCEL` | `auto` | Chromium GL backend. `auto` uses the NVIDIA GPU when one is present in the container (`/dev/nvidiactl`), else SwiftShader. `1`/`nvidia` forces it without the device check, `0` forces SwiftShader. |
 | `KASM_RECT_THREADS` | *(ignored)* | No effect on KasmVNC 1.5.0 — `-RectThreads` parses but nothing reads it; encoder threads are sized to the host core count. Cap encoder CPU with the container's `--cpus`/cpuset. |
 
 ### GPU acceleration (optional)
@@ -125,6 +126,48 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 Without a GPU everything still works (software encoding).
 
 VAAPI hardware *video* encode only comes into play with `KASM_ENCODING_POLICY=video`; under the default policy the GPU accelerates screen capture only, because no video codec is negotiated.
+
+### NVIDIA GPU (NVENC encode + Chromium acceleration)
+
+Needs an NVIDIA GPU and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host. One command builds both the base image and the NVIDIA layer:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d --build
+```
+
+This overlay defaults to `KASM_ENCODING_POLICY=video` and `KASM_VIDEO_CODEC=h264_nvenc,h264`, because under the repo-wide default policy no video codec is ever negotiated and the GPU encoder could not engage at all.
+
+What it turns on:
+
+| | Accelerated? | Notes |
+|---|---|---|
+| KasmVNC video encode | **Yes — NVENC** | Xvnc encodes the framebuffer on the GPU. Undocumented in `Xvnc -help` but fully implemented in 1.5.0. |
+| Chromium WebGL / raster / compositing | **Yes — ANGLE + Vulkan** | `--use-angle=vulkan`. Vulkan is the only backend that works headed on a virtual X server (see below). |
+| Chromium video *decode* | No | NVDEC via VA-API needs DRI3 to import the decoded frame for compositing; no virtual X server has it. Enabling it breaks playback rather than accelerating it. |
+| KasmVNC `-hw3d` screen capture | No | DRI3, which the closed NVIDIA driver does not implement. Auto-detected and left off — forcing it (`KASM_HW3D=1`) makes Xvnc exit at startup. NVENC does not need it. |
+
+Two things are easy to get wrong here, and both fail silently:
+
+- **`--use-angle=gl-egl` is the software path.** NVIDIA's EGL declines the X11 platform on an X server it does not drive, so GLVND falls through to Mesa and you get llvmpipe on the CPU with the GPU attached and idle. Measured on the same host: `gl-egl` → `ANGLE (Mesa, llvmpipe)`; `vulkan` → `ANGLE (NVIDIA, Vulkan 1.4.312 (RTX 3080 Ti))` with GPU compositing enabled. `--use-gl=egl` is worse still — it is deprecated and silently disables WebGL.
+- **The bundled KasmVNC client cannot select NVENC by itself.** Its automatic candidate list is hardcoded to the VAAPI and software variants, so against an NVENC server it quietly settles on JPEG/WebP while Xvnc still reports `capability: h264_nvenc`. The Manager works around this by sending `kasmvnc_mode_preference` in the viewer URL, derived from `KASM_VIDEO_CODEC`.
+
+Verify it end to end with the bundled probe (expected to fail without a GPU):
+
+```bash
+docker run --rm --gpus all -v "$PWD":/repo:ro \
+  --entrypoint python cloakbrowser-manager-manager:latest /repo/scripts/gpu_probe.py
+```
+
+It asserts the driver libraries, the EGL loader, the encoder KasmVNC actually selected, and the renderer Chromium actually bound — not `chrome://gpu`'s feature table, which reports "enabled" for llvmpipe and SwiftShader alike.
+
+Two live checks on a running session:
+
+```bash
+docker exec <container> grep "acceleration capability" /tmp/xvnc-100.log   # must not say "none"
+nvidia-smi --query-gpu=utilization.encoder,encoder.stats.sessionCount --format=csv
+```
+
+Caveats: `av1_nvenc` needs Ada (RTX 40-series) or newer — on Ampere it probes out to `capability: none`. Consumer GeForce cards cap concurrent NVENC sessions (8 on recent drivers), and beyond that KasmVNC falls back to software encoding per session; datacenter cards are unrestricted.
 
 ## Development
 
