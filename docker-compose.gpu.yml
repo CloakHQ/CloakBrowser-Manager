@@ -2,9 +2,13 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 #
-# Enables KasmVNC DRI3 screen capture (-hw3d) and VAAPI H.264/H.265/AV1
-# streaming encode on AMD/Intel open-source drivers. Closed-source NVIDIA does
-# NOT support DRI3; the manager auto-detects that and stays on software encode.
+# Enables KasmVNC DRI3 screen capture (-hw3d) on AMD/Intel open-source drivers.
+# Closed-source NVIDIA does NOT support DRI3; the manager auto-detects that and
+# stays on software capture.
+#
+# VAAPI H.264/H.265/AV1 encode additionally requires KASM_ENCODING_POLICY=video:
+# under the default server-authoritative policy KasmVNC negotiates no video
+# codec at all, so the GPU accelerates capture only.
 #
 # Docker fails container creation outright when a mapped device node does not
 # exist, which is why this lives outside the default compose file.

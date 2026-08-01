@@ -34,7 +34,9 @@ RUN echo "deb http://deb.debian.org/debian trixie contrib" >> /etc/apt/sources.l
 
 # nginx data plane + VA-API (AMD/Intel) + FFmpeg runtime libs for KasmVNC 1.5
 # in-band H.264/H.265/AV1 video streaming (dlopen'd at runtime; JPEG/WebP
-# fallback if absent)
+# fallback if absent). The codec path only engages under
+# KASM_ENCODING_POLICY=video — the default server-authoritative policy never
+# negotiates a video codec, so these libs sit unused there.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     libva2 libva-drm2 mesa-va-drivers vainfo \
@@ -66,8 +68,6 @@ RUN case "${TARGETARCH}" in \
     && rm kasmvncserver_trixie_1.5.0_${TARGETARCH}.deb \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker/nginx.conf /etc/nginx/nginx.conf
-
 WORKDIR /app
 
 # Python deps
@@ -85,11 +85,21 @@ RUN python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+# --start-period: the probe goes through nginx to uvicorn, and uvicorn's
+# lifespan runs cleanup_stale plus auto_launch_all (LAUNCH_TIMEOUT_S=60 per
+# auto-launch profile) before it accepts. Without a grace period those early
+# refusals count against --retries and a container that is merely still booting
+# is reported `unhealthy` to operators and to `depends_on: service_healthy`.
+# Target stays /api/status, not /healthz, so the probe covers nginx AND uvicorn.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=90s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/status')" || exit 1
 
 VOLUME /data
 
+# Config and entrypoint last: both are tiny and change often, and anything
+# copied above them invalidates the 119MB pip layer and the 337MB
+# ensure_binary download on every edit (~2.5 min of a 3 min build).
+COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

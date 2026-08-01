@@ -19,6 +19,11 @@ services:
       # under Compose — they only reached the container via `docker run -e`.
       - AUTH_TOKEN=${AUTH_TOKEN:-}
       - KASM_QUALITY_PRESET
+      - KASM_ENCODING_POLICY
+      - KASM_VIDEO_CODEC
+      - KASM_XVNC_LOG_LEVEL
+      # Inert on KasmVNC 1.5.0 (-RectThreads is accepted but never read); kept
+      # only so an existing deployment that sets it does not break.
       - KASM_RECT_THREADS
       - KASM_HW3D
       - KASM_DRINODE
