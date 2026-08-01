@@ -89,7 +89,7 @@ CloakBrowser/Chromium
 - Viewer access uses short-lived, per-profile opaque tokens issued by `POST /api/profiles/<id>/viewer-token`; nginx validates every viewer request (page, assets, WebSocket upgrade) through FastAPI's `/api/viewer-auth`. Kasm ports never leave loopback.
 - The Manager owns a reconnect state machine (backoff + jitter, offline/visibility handling, session-status classification). A viewer disconnect never stops the browser — reconnecting returns you to the same running session.
 - Encoding policy is a single knob (`KASM_ENCODING_POLICY`), because KasmVNC 1.5.0 gates video-codec negotiation and client quality overrides behind the *same* switch. `server-authoritative` keeps the server in charge — 30 FPS cap, dynamic JPEG/WebP quality, video-mode downscale under motion — and no H.264/H.265/AV1 codec is negotiated. `video` enables WebCodecs streaming and makes every quality setting client-overridable.
-- `video` is opt-in because the encoder cannot be enforced. `KASM_VIDEO_CODEC` narrows the *server's* probe, but KasmVNC 1.5.0 offers no way to restrict what a **client** selects: a client advertising another streaming-mode pseudo-encoding gets that encoder, including software AV1, which costs roughly 0.4s of a CPU core per 1080p keyframe and then drops the session back to Tight.
+- Under `video`, `KASM_VIDEO_CODEC` decides the encoder for the bundled viewer: it narrows the server's probe, the server advertises only that probed set, and the client can only select from what it is offered. It is not *enforced*, though — KasmVNC accepts any streaming-mode pseudo-encoding a client sends, even for an encoder it rejected at probe time, so a client other than the bundled one can still land on software AV1 (roughly 0.4s of a CPU core per 1080p keyframe, then a silent drop back to Tight). `video` is opt-in for the other reason: it also hands every quality setting to the client, so `KASM_QUALITY_PRESET` stops binding.
 
 ### Headless profiles
 
@@ -101,7 +101,7 @@ A profile with **Headless** enabled starts no Xvnc and allocates no display or W
 |----------|---------|---------|
 | `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
 | `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
-| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — see the note above. |
+| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — so `KASM_QUALITY_PRESET` no longer binds. See the note above. |
 | `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. One of `h264`, `h264_vaapi`, `h265`, `h265_vaapi`, `av1`, `av1_vaapi`. `auto` is refused — it lets the client pick, including software AV1. |
 | `KASM_XVNC_LOG_LEVEL` | `30` | Xvnc log verbosity (0-100). Raise to `100` to see per-connection encoder decisions in `/tmp/xvnc-<display>.log`. |
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |

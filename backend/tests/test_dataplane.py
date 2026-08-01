@@ -59,6 +59,7 @@ PROBE_CHECKS = (
     "entrypoint_double_sigterm",
     "entrypoint_sigterm_before_children",
     "entrypoint_shutdown_terminates_children",
+    "codec_probe_narrowing",
 )
 
 

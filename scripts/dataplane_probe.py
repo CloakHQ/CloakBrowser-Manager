@@ -618,10 +618,74 @@ def check_shutdown_terminates_children(entrypoint_path, shim_dir):
                   f"nginx signalled {events['nginx term'] - events['uvicorn exit']:.2f}s after")
 
 
+# ── encoder probe ────────────────────────────────────────────────────────────
+
+
+PROBE_SUBSET_MARKER = "Using CLI-specified video codecs (supported subset):"
+
+
+def xvnc_supported_codecs(video_codec, display=":91"):
+    """Start Xvnc with -videoCodec and return the subset it says it will use."""
+    command = [
+        "Xvnc", display, "-websocketPort", "6191", "-geometry", "800x600",
+        "-depth", "24", "-SecurityTypes", "None", "-interface", "127.0.0.1",
+        "-AlwaysShared", "-Log", "*:stdout:100", "-videoCodec", video_codec,
+        # Required here, not cosmetic: the probe container runs --network none,
+        # and Xvnc EXITS ("Failed to get public IP, please specify it with
+        # -publicIP") before it ever reaches the encoder probe. Without this
+        # the check fails for a reason that has nothing to do with codecs.
+        "-publicIP", "127.0.0.1",
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        output = completed.stdout + completed.stderr
+    except subprocess.TimeoutExpired as expired:
+        output = (expired.stdout or b"").decode() + (expired.stderr or b"").decode()
+    finally:
+        for path in (f"/tmp/.X{display[1:]}-lock", f"/tmp/.X11-unix/X{display[1:]}"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    for line in output.splitlines():
+        if PROBE_SUBSET_MARKER in line:
+            return line.split(PROBE_SUBSET_MARKER, 1)[1].split()
+    return None
+
+
+def check_codec_probe_narrowing(entrypoint_path, shim_dir):
+    """-videoCodec must narrow what the server will offer a client.
+
+    This is the single empirical fact KASM_ENCODING_POLICY=video rests on. The
+    server does not ENFORCE the codec — ConnParams accepts any streaming-mode
+    pseudo-encoding a client offers — but the client we ship can only choose
+    from the set the server advertises, and that set is this probe's output. If
+    an upstream bump ever stopped -videoCodec narrowing it, the policy would
+    silently start offering every encoder the build has, including the software
+    AV1 that stalls a core per keyframe and then fails the session to Tight.
+    """
+    del entrypoint_path, shim_dir  # runs against Xvnc, not the entrypoint
+    narrowed = xvnc_supported_codecs("h264")
+    widest = xvnc_supported_codecs("auto")
+    if narrowed is None or widest is None:
+        return False, (f"Xvnc printed no {PROBE_SUBSET_MARKER!r} line "
+                       f"(h264={narrowed}, auto={widest})")
+    if narrowed != ["libx264"]:
+        return False, f"-videoCodec h264 offered {narrowed}, expected ['libx264']"
+    if not set(narrowed) <= set(widest):
+        return False, f"h264 subset {narrowed} is not contained in auto's {widest}"
+    if len(widest) <= len(narrowed):
+        return False, (f"-videoCodec did not narrow anything: h264={narrowed} "
+                       f"auto={widest}. Either the build lost its extra encoders "
+                       f"or the flag stopped filtering.")
+    return True, f"h264 -> {narrowed}; auto -> {widest}"
+
+
 ENTRYPOINT_CHECKS = (
     ("entrypoint_double_sigterm", check_double_sigterm_during_shutdown),
     ("entrypoint_sigterm_before_children", check_sigterm_before_children_start),
     ("entrypoint_shutdown_terminates_children", check_shutdown_terminates_children),
+    ("codec_probe_narrowing", check_codec_probe_narrowing),
 )
 
 

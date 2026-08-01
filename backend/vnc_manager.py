@@ -172,13 +172,30 @@ ENCODING_POLICIES = (ENCODING_POLICY_SERVER, ENCODING_POLICY_VIDEO)
 # logs. The upstream claim that software AV1 is excluded does not hold for a
 # client-driven selection.
 #
-# So the server names the encoder it wants. IMPORTANT, measured: this narrows
-# the server's own probe ("Using CLI-specified video codecs (supported subset):
-# libx264") but it does NOT restrict what a client may select — ConnParams.cxx
-# still honours a streaming-mode pseudo-encoding outside the list, so a client
-# offering -1037 gets software AV1 anyway. KasmVNC 1.5.0 exposes no enforcement
-# point for this. h264 is therefore the best DEFAULT, not a guarantee, and it is
-# the reason the `video` policy is opt-in and the default policy is not.
+# So the server names the encoder it wants, and for the client we ship that
+# settles it. The chain, each link checked rather than assumed:
+#   1. -videoCodec narrows the probe. Measured on this image (no GPU):
+#      `h264` -> "Using CLI-specified video codecs (supported subset): libx264";
+#      `auto` -> "libx264 libx265". Pinned by the codec_probe_narrowing check in
+#      scripts/dataplane_probe.py.
+#   2. That probed set IS what the client is told about: SMsgWriter.cxx's
+#      writeVideoEncoders() iterates cp->available_encoders.
+#   3. The shipped client can only choose from what it was told. ui-BOjwDkC7.js
+#      builds the menu in getAvailableStreamingModes(n) and picks in
+#      getBestStreamingMode(n, ...) — every branch, including a persisted
+#      stream_mode preference and the kasmvnc_mode_preference URL override,
+#      is filtered against `n`. It cannot ask for an encoder outside the list.
+#
+# What is NOT true is that the server ENFORCES it. ConnParams.cxx accepts any
+# streaming-mode pseudo-encoding a client offers and, when the encoder is not in
+# available_encoders, constructs a config for it anyway:
+#     if (iter != available_encoders.end()) encoder_config = *iter;
+#     else                                  encoder_config = EncoderConfig{encoder};
+# That is the path by which a client asking for -1037 gets software AV1 on a box
+# whose probe rejected it — and then dies at encode time. So: a guarantee for
+# the viewer we ship, not a guarantee against an arbitrary client. The `video`
+# policy stays opt-in because of limit (1) above — the preset stops binding —
+# not because the codec is unpredictable.
 _VIDEO_CODEC_DEFAULT = "h264"
 # Xkasmvnc(1) 1.5.0: "Supported options: auto, h264, h264_vaapi, h265,
 # h265_vaapi, av1, av1_vaapi". "auto" is deliberately NOT in this set — see above.
@@ -250,13 +267,13 @@ def _encoding_flags(policy: str) -> list[str]:
             "with -videoCodec %s. Two limits you are opting into. (1) Without "
             "-IgnoreClientSettingsKasm the client's own Kasm settings "
             "(DynamicQuality*, VideoTime/VideoArea, framerate) override the "
-            "quality preset, and %s is inert. (2) -videoCodec narrows the "
-            "server's probe but does NOT restrict the client's choice — 1.5.0 "
-            "has no enforcement point, so a client offering another "
-            "streaming-mode pseudo-encoding still gets that encoder, including "
-            "software AV1 (measured: ~0.4s of a core per 1080p keyframe, then a "
-            "silent fallback to Tight for the session). This is why the default "
-            "policy is 'server-authoritative'.",
+            "quality preset, and %s is inert. (2) The codec holds for the "
+            "shipped client but is not ENFORCED: ConnParams accepts any "
+            "streaming-mode pseudo-encoding a client offers, building a config "
+            "for it even when that encoder is not in available_encoders — "
+            "including software AV1 (measured: ~0.4s of a core per 1080p "
+            "keyframe, then a silent fallback to Tight for the session). This "
+            "is why the default policy is 'server-authoritative'.",
             codec, " / ".join(_INERT_UNDER_VIDEO_POLICY),
         )
         return ["-videoCodec", codec]
