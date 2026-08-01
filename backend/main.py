@@ -1167,6 +1167,41 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
 
 # ── Static Frontend ───────────────────────────────────────────────────────────
 
+
+def _resolve_spa_file(base: Path, full_path: str) -> Path | None:
+    """Path under `base` for a SPA request, or None to fall through to index.
+
+    Containment is the whole job. `base / full_path` is NOT safe on its own:
+    Path.__truediv__ DISCARDS the left side when the right side is absolute, so
+    `Path("/app/frontend/dist") / "/etc/passwd"` is `/etc/passwd`. The catch-all
+    route below is not behind the auth middleware (it gates only /api/*), and
+    nginx forwards a percent-encoded `%2f` verbatim without decoding it, so an
+    unauthenticated `GET /%2fdata/profiles.db` reached this function with
+    full_path="/data/profiles.db" and served the profile database.
+
+    A pure function so the containment rule is testable directly: the route is
+    only registered when the built frontend exists, which it does not in a
+    source checkout.
+    """
+    if not full_path:
+        return None
+    candidate = Path(full_path)
+    # Reject absolute paths outright rather than relying on the resolve()
+    # containment check alone — it is the specific case `/` silently swallows.
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        resolved = (base / candidate).resolve()
+        root = base.resolve()
+    except OSError:
+        return None
+    # resolve() follows symlinks, so this also refuses a link inside the build
+    # directory that points outside it.
+    if resolved != root and root not in resolved.parents:
+        return None
+    return resolved if resolved.is_file() else None
+
+
 # Serve React build. Must be AFTER API routes so /api/* isn't caught by the SPA.
 if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
@@ -1176,7 +1211,7 @@ if FRONTEND_DIR.exists():
         """Serve React SPA — all non-API routes return index.html."""
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found")
-        file_path = FRONTEND_DIR / full_path
-        if full_path and file_path.exists() and file_path.is_file():
+        file_path = _resolve_spa_file(FRONTEND_DIR, full_path)
+        if file_path is not None:
             return FileResponse(file_path)
         return FileResponse(FRONTEND_DIR / "index.html")

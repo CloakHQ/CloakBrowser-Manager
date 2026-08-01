@@ -1856,3 +1856,61 @@ def test_headless_launch_returns_200_with_null_display(
         assert body["cdp_url"] == f"/api/profiles/{pid}/cdp"
     finally:
         main.browser_mgr.running.pop(pid, None)
+
+
+# ── SPA catch-all containment ────────────────────────────────────────────────
+
+
+def test_spa_serves_a_real_asset(tmp_path: pathlib.Path):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    asset = dist / "assets" / "main.js"
+    asset.write_text("console.log(1)")
+    assert main._resolve_spa_file(dist, "assets/main.js") == asset.resolve()
+
+
+def test_spa_refuses_to_escape_the_build_directory(tmp_path: pathlib.Path):
+    """`base / full_path` discards the base when full_path is absolute.
+
+    The catch-all is not behind the auth middleware (that gates only /api/*),
+    and nginx forwards a percent-encoded %2f without decoding it, so an
+    unauthenticated GET /%2fdata/profiles.db arrived here as "/data/profiles.db"
+    and returned the SQLite profile database.
+
+    Every attack below targets a file that REALLY EXISTS, created here rather
+    than assumed present on the host — otherwise the vulnerable implementation
+    also returns None (via is_file()) and the test passes for the wrong reason.
+    """
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html></html>")
+    secret = tmp_path / "profiles.db"
+    secret.write_text("SQLite format 3\x00")
+
+    # absolute — the case Path.__truediv__ silently swallows
+    assert main._resolve_spa_file(dist, str(secret)) is None
+    # traversal to the same real file, relative to the build dir
+    assert main._resolve_spa_file(dist, "../profiles.db") is None
+    assert main._resolve_spa_file(dist, "a/../../profiles.db") is None
+    assert main._resolve_spa_file(dist, "..") is None
+    # and the containment rule holds for a genuine absolute system path
+    assert main._resolve_spa_file(dist, "/etc/passwd") is None
+
+
+def test_spa_refuses_a_symlink_pointing_outside_the_build(tmp_path: pathlib.Path):
+    """resolve() follows links, so a link planted in the build cannot escape."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("nope")
+    (dist / "leak").symlink_to(secret)
+    assert main._resolve_spa_file(dist, "leak") is None
+
+
+def test_spa_falls_through_to_index_for_client_routes(tmp_path: pathlib.Path):
+    """A real SPA route is not a file, and must not 404."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html></html>")
+    assert main._resolve_spa_file(dist, "profiles/abc") is None
+    assert main._resolve_spa_file(dist, "") is None
