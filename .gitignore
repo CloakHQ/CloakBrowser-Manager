@@ -29,3 +29,4 @@ debug
 # Agent scratch
 tmp/
 trash/
+frontend/coverage/

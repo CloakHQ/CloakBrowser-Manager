@@ -803,7 +803,10 @@ describe("connectivity signals", () => {
     });
     expect(result.current.state).toBe("connected");
 
-    // a definitive answer still acts
+    // a definitive answer still acts. Past the resume-probe interval, so this
+    // exercises the blip/definitive distinction rather than the rate limit —
+    // which has its own tests.
+    await advance(6_000);
     mockApi.profileStatus.mockRejectedValue(new ApiError(404, "Not found"));
     await act(async () => {
       document.dispatchEvent(new Event("visibilitychange"));
@@ -1028,6 +1031,11 @@ describe("connectivity signals", () => {
     await act(async () => {
       document.dispatchEvent(new Event("visibilitychange")); // probe 1 (stalls)
     });
+    // Past the resume-probe interval so probe 2 is actually issued: the point
+    // here is reply ORDERING between two concurrent probes, not the rate limit.
+    // Measuring the interval from a probe's start (not its reply) is what lets
+    // a stalled probe be superseded at all.
+    await advance(6_000);
     mockApi.profileStatus.mockResolvedValue(ALIVE);
     await act(async () => {
       document.dispatchEvent(new Event("visibilitychange")); // probe 2 -> alive
@@ -1039,6 +1047,74 @@ describe("connectivity signals", () => {
       resolveStale({ status: "stopped", xvnc_alive: null, browser_alive: null });
     });
     expect(view.result.current.state).toBe("connected");
+  });
+
+  it("a burst of tab switches costs one probe, not one per switch", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    for (let i = 0; i < 20; i++) {
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+    }
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(1);
+    expect(view.result.current.state).toBe("connected");
+
+    // ...and the rate limit is a floor on the gap, not a one-shot latch.
+    await advance(6_000);
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("the heartbeat is never suppressed by the resume-probe rate limit", async () => {
+    // The heartbeat is the only timer `connected` has. If a tab switch could
+    // eat it, a suppressed probe would have no successor.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    // switch tabs just before each heartbeat lands
+    for (let i = 0; i < 3; i++) {
+      await advance(44_000);
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await advance(1_000);
+    }
+    // 3 tab switches + 3 heartbeats, minus the heartbeats within 5s of a switch
+    expect(mockApi.profileStatus.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(view.result.current.state).toBe("connected");
+  });
+
+  it("a drop while connected always probes, however recent the last one", async () => {
+    // The rate limit must not swallow THE probe that matters: offline->online
+    // under a live socket is the one case where no successor re-establishes it.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const view = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(1);
+
+    // no time passes: a plain trigger here would be suppressed
+    act(() => {
+      window.dispatchEvent(new Event("offline"));
+    });
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(2);
+    // ...and it re-establishes rather than trusting the process verdict
+    expect(view.result.current.state).toBe("reconnecting");
   });
 
   it("resume probe that finds the profile stopped ends the session", async () => {

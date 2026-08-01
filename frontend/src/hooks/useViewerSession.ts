@@ -140,6 +140,26 @@ const OFFLINE_RECHECK_MS = 30_000;
  * dot over a frozen frame indefinitely. Re-verify on a slow beat.
  */
 const CONNECTED_HEARTBEAT_MS = 45_000;
+/**
+ * Floor on the gap between two resume probes.
+ *
+ * probeAfterResume orders its REPLIES (resumeSeq) but had no admission control,
+ * so every trigger issued a request: "online" bursts during a VPN flap and
+ * ordinary tab switching each cost one control-plane round-trip, and a user
+ * cycling tabs produced one probe per switch for the life of the session.
+ * Coalescing on an in-flight probe would not fix that — when the control plane
+ * answers quickly each switch still finds no probe running — so the bound has
+ * to be on the rate, not on concurrency.
+ *
+ * Skipping is safe because `connected` always has the heartbeat interval armed,
+ * so a suppressed probe always has a successor. The one case where a skip would
+ * lose information — the network dropped under a live socket — bypasses this
+ * entirely; see droppedWhileConnected.
+ *
+ * Measured from the START of a probe, not its reply, so a probe that never
+ * resolves stops blocking after one interval and the next trigger supersedes it.
+ */
+const RESUME_PROBE_MIN_INTERVAL_MS = 5_000;
 /** 4xx codes that mean "later", not "never". */
 const RETRYABLE_4XX = new Set([408, 429]);
 const DEBUG_LOG_LIMIT = 20;
@@ -297,6 +317,8 @@ function createViewerController(deps: ControllerDeps): Controller {
   let droppedWhileConnected = false;
   /** orders concurrent resume probes so a stale reply cannot win. */
   let resumeSeq = 0;
+  /** Date.now() when the last resume probe STARTED; null = none yet. */
+  let lastResumeProbeAt: number | null = null;
   /** 401: retries are intentionally stopped; the safety net must not re-arm. */
   let halted = false;
   /**
@@ -820,6 +842,19 @@ function createViewerController(deps: ControllerDeps): Controller {
 
   /** Lightweight authoritative probe when the tab becomes visible again. */
   async function probeAfterResume() {
+    // Rate-limit the environment-driven triggers. droppedWhileConnected is
+    // exempt: that flag means the network went away UNDER a live socket, so the
+    // usual justification for skipping — "the heartbeat will ask again shortly"
+    // — is exactly wrong. The socket is already suspect and nothing else will
+    // re-establish it, so that probe must always run.
+    if (
+      !droppedWhileConnected &&
+      lastResumeProbeAt !== null &&
+      Date.now() - lastResumeProbeAt < RESUME_PROBE_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    lastResumeProbeAt = Date.now();
     // "online" and visibilitychange can both land here, and neither the
     // generation nor the connected state changes while they are outstanding —
     // so without a sequence an older, slower reply can act after a newer one
