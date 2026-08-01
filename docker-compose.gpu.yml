@@ -6,6 +6,12 @@
 # Closed-source NVIDIA does NOT support DRI3; the manager auto-detects that and
 # stays on software capture.
 #
+# This is the WRONG file for an NVIDIA GPU — use docker-compose.nvidia.yml.
+# "No DRI3" rules out -hw3d capture, but it does not rule out the GPU: NVENC
+# encode goes through CUDA and Chromium reaches the card through ANGLE/Vulkan,
+# neither of which needs DRI3. Mapping /dev/dri here would get you a render node
+# and none of that.
+#
 # VAAPI H.264/H.265/AV1 encode additionally requires KASM_ENCODING_POLICY=video:
 # under the default server-authoritative policy KasmVNC negotiates no video
 # codec at all, so the GPU accelerates capture only.

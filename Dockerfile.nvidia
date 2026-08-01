@@ -1,0 +1,51 @@
+# NVIDIA GPU variant of the manager image.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d --build
+#
+# `FROM base` is not a public image — the compose overlay binds it to the CPU
+# image built from ./Dockerfile (additional_contexts: base: service:manager-base),
+# so both images build from one command and the recipe stays in one file.
+#
+# This is a THIN layer on that image on purpose, and specifically NOT a
+# nvidia/cuda base. Nothing CUDA has to be baked in: KasmVNC's NVENC encoder
+# reaches the GPU through libnvidia-encode.so.1 + libcuda.so.1, and Chromium
+# reaches it through libEGL_nvidia.so.0. All three are *driver* libraries that
+# the NVIDIA container runtime injects at `docker run` time and that must match
+# the host kernel module exactly, so baking in a CUDA userspace would add
+# gigabytes and invite precisely the version skew the injection exists to avoid.
+# Measured: h264_nvenc probes and opens on the stock python:3.12-slim base with
+# nothing added but `--gpus all`. A CUDA base would also drag the image off
+# Debian trixie, which is where the KasmVNC 1.5.0 .deb and the libavcodec61
+# soname the base image symlinks against both come from.
+FROM base
+
+# libvulkan1 is the load-bearing package, and the only one this image strictly
+# needs. --use-angle=vulkan is the backend that actually reaches the GPU for a
+# HEADED browser on KasmVNC's X server (the reasoning and the measurements are
+# in backend/browser_manager.py), and the Vulkan loader is what reads the
+# /etc/vulkan/icd.d/nvidia_icd.json the container runtime injects. It happens to
+# arrive today as a Mesa dependency; naming it explicitly is what stops a future
+# base-image change from silently dropping the GPU path back to llvmpipe.
+#
+# The GLVND loaders are for the FALLBACK path only, and are deliberately kept
+# despite not being needed by the Vulkan one. ANGLE ships its own libEGL.so
+# beside the Chromium binary, but its gl-egl backend resolves the *system*
+# libEGL.so.1 to reach the injected libEGL_nvidia.so.0 via
+# /usr/share/glvnd/egl_vendor.d/10_nvidia.json — and the base image has no
+# libEGL.so.1 at all. Without them, a host where Vulkan is unavailable does not
+# degrade to "GPU with readback", it degrades to SwiftShader on the CPU with the
+# GPU attached and idle. These are the packages CloakBrowser PR #476 adds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvulkan1 \
+    libglvnd0 libegl1 libgles2 libglx0 libopengl0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Read by the NVIDIA container runtime when it computes the injection set.
+# `video` is the load-bearing one and is NOT in the runtime's default of
+# `utility,compute`: it supplies libnvidia-encode.so.1, and without it KasmVNC's
+# probe drops every *_nvenc candidate and logs "Hardware video encoding
+# acceleration capability: none" while the session quietly encodes on the CPU.
+# `graphics` supplies libEGL_nvidia/libnvidia-eglcore for Chromium. Set here
+# rather than in compose so `docker run --gpus all <image>` is correct too.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video

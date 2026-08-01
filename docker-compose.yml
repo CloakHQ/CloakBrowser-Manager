@@ -27,6 +27,10 @@ services:
       - KASM_RECT_THREADS
       - KASM_HW3D
       - KASM_DRINODE
+      # Chromium GL backend. Defaults to 'auto', which only engages the GPU
+      # path when an NVIDIA device is present in the container, so it is inert
+      # here and load-bearing under docker-compose.nvidia.yml.
+      - CHROME_GPU_ACCEL
     # GPU passthrough is opt-in — Docker hard-fails container creation when a
     # `devices:` source path is missing, so mapping /dev/dri here would break
     # every GPU-less host. Enable it with the override file instead:
