@@ -195,6 +195,7 @@ export function buildViewerUrl(
   token: string,
   clipboardSync: boolean,
   cacheBust = 0,
+  streamMode?: string | null,
 ): string {
   const params = new URLSearchParams({
     path: `viewer/${token}/websockify`,
@@ -211,6 +212,16 @@ export function buildViewerUrl(
     // happens to produce an identical URL
     _r: String(cacheBust),
   });
+  // Only present when the server runs an NVENC codec. The client's automatic
+  // selection cannot reach those at all — its candidate list is hardcoded to
+  // the VAAPI and software variants, so against an NVENC-only server it
+  // silently settles on JPEG/WebP and the GPU encoder never runs. This
+  // parameter sets `forcedCodecs`, which is the one path that bypasses that
+  // list. Left off otherwise on purpose: forcedCodecs is checked BEFORE the
+  // client's own "fall back to image mode after an encoding error" branch, so
+  // setting it unconditionally would disable that recovery for codecs the
+  // client already picks correctly by itself.
+  if (streamMode) params.set("kasmvnc_mode_preference", streamMode);
   return `${viewerUrl}?${params.toString()}`;
 }
 
@@ -443,7 +454,9 @@ function createViewerController(deps: ControllerDeps): Controller {
       // with, and closing the gate before any document has ever booted would
       // mean a client that never reaches "init" can never connect at all.
       if (iframeSrc !== null) pendingDoc += 1;
-      iframeSrc = buildViewerUrl(tok.viewer_url, tok.token, getClipboardSync(), connectSeq++);
+      iframeSrc = buildViewerUrl(
+        tok.viewer_url, tok.token, getClipboardSync(), connectSeq++, tok.stream_mode,
+      );
       emit();
     } catch (err) {
       if (destroyed || gen !== generation) return;

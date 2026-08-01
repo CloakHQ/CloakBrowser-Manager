@@ -118,6 +118,26 @@ afterEach(() => {
 // ── buildViewerUrl ──────────────────────────────────────────────────────────
 
 describe("buildViewerUrl", () => {
+  it("omits kasmvnc_mode_preference when the server does not force one", () => {
+    // Forcing a mode bypasses the client's own "fall back to image mode after
+    // an encoding error" recovery, so it must not be set speculatively.
+    const p = new URLSearchParams(buildViewerUrl("/v/", "t", true).split("?")[1]);
+    expect(p.get("kasmvnc_mode_preference")).toBeNull();
+    expect(new URLSearchParams(
+      buildViewerUrl("/v/", "t", true, 0, null).split("?")[1],
+    ).get("kasmvnc_mode_preference")).toBeNull();
+  });
+
+  it("passes the server's stream mode through for NVENC", () => {
+    // Without this the client cannot select NVENC at all: its candidate list
+    // is hardcoded to the VAAPI/software variants, so it settles on JPEG/WebP
+    // and the GPU encoder never runs.
+    const p = new URLSearchParams(
+      buildViewerUrl("/v/", "t", true, 3, "-1029|-1027").split("?")[1],
+    );
+    expect(p.get("kasmvnc_mode_preference")).toBe("-1029|-1027");
+  });
+
   it("includes the websockify path override and client flags", () => {
     const url = buildViewerUrl("/viewer/tok-1/", "tok-1", true);
     const [base, qs] = url.split("?");

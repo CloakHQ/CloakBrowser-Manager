@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
 from .browser_manager import LAUNCH_TIMEOUT_S, BrowserManager, ProfileAlreadyRunning
+from .vnc_manager import viewer_stream_mode_preference
 from .models import (
     ClipboardRequest,
     LaunchResponse,
@@ -547,6 +548,7 @@ async def create_viewer_token(profile_id: str):
         token=token,
         viewer_url=f"/viewer/{token}/",
         expires_in=VIEWER_TOKEN_TTL,
+        stream_mode=viewer_stream_mode_preference(),
     )
 
 

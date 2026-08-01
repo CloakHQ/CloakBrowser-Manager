@@ -149,6 +149,10 @@ class ViewerTokenResponse(BaseModel):
     token: str
     viewer_url: str
     expires_in: int
+    # `kasmvnc_mode_preference` for the viewer URL, or None to let the client
+    # choose. Only set when an NVENC codec is configured — the shipped client
+    # cannot auto-select those. See vnc_manager.viewer_stream_mode_preference.
+    stream_mode: str | None = None
 
 
 class ClipboardRequest(BaseModel):

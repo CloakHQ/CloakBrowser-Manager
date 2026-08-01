@@ -108,6 +108,12 @@ export interface ViewerToken {
   token: string;
   viewer_url: string;
   expires_in: number;
+  /**
+   * `kasmvnc_mode_preference` for the client, or null/absent to let it choose.
+   * Only sent when the server is configured for an NVENC codec, which the
+   * bundled client cannot auto-select. See buildViewerUrl.
+   */
+  stream_mode?: string | null;
 }
 
 export interface ProfileStatus {
