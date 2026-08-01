@@ -468,10 +468,21 @@ NGINX_CHECKS = (
 # Both shims reap their own `sleep` on the way out. An orphan that survives the
 # shim keeps the inherited stdout open, and anything waiting on EOF from the
 # entrypoint's output would then block for the sleep's full duration.
+# Both shims journal their own lifecycle when DP_JOURNAL is set. Without it
+# there is no way to tell "shutdown() stopped both children in the documented
+# order" from "shutdown() returned 0" — and the second is what a shutdown()
+# that killed nothing at all would also do.
+SHIM_JOURNAL = """_log() {
+    if [ -n "${DP_JOURNAL:-}" ]; then echo "$(date +%s.%N) $1 $2" >> "$DP_JOURNAL"; fi
+}
+"""
+
 NGINX_SHIM = """#!/bin/bash
+""" + SHIM_JOURNAL + """
 for arg in "$@"; do [ "$arg" = "-t" ] && { sleep "${DP_NGINX_T_DELAY:-0}"; exit 0; }; done
+_log nginx start
 sleep 300 & idle_pid=$!
-trap 'kill "$idle_pid" 2>/dev/null; exit 0' TERM
+trap '_log nginx term; kill "$idle_pid" 2>/dev/null; _log nginx exit; exit 0' TERM
 wait "$idle_pid"
 """
 
@@ -479,10 +490,14 @@ UVICORN_SHIM = """#!/bin/bash
 # Stands in for the lifespan shutdown: cleanup_all closes every profile with a
 # bounded 10s wait each, so the entrypoint really does sit in `wait` for
 # seconds to tens of seconds after the first SIGTERM.
+""" + SHIM_JOURNAL + """
+_log uvicorn start
 sleep 300 & idle_pid=$!
 _bye() {
+    _log uvicorn term
     kill "$idle_pid" 2>/dev/null
     sleep "${DP_UVICORN_TERM_DELAY:-0}"
+    _log uvicorn exit
     exit 0
 }
 trap _bye TERM
@@ -551,9 +566,62 @@ def check_sigterm_before_children_start(entrypoint_path, shim_dir):
                        f"output={output.strip()!r}")
 
 
+def read_journal(journal_path):
+    """Parse the shim journal into {"<who> <event>": timestamp}."""
+    events = {}
+    if not os.path.exists(journal_path):
+        return events
+    with open(journal_path, encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) == 3:
+                events[f"{parts[1]} {parts[2]}"] = float(parts[0])
+    return events
+
+
+def check_shutdown_terminates_children(entrypoint_path, shim_dir):
+    """shutdown() must stop BOTH children, and finish uvicorn before nginx.
+
+    The other two entrypoint checks assert only that the shell exits 0. A
+    shutdown() that killed nothing at all also exits 0 — while the container
+    goes away with Chromium still live and still writing to user_data_dir,
+    which is the precise outcome the ordered teardown exists to prevent. So
+    the children have to be observed dying, not merely inferred.
+
+    The order is the other half. uvicorn's lifespan shutdown is what closes
+    every profile, and it reaches those browsers over the CDP tunnels nginx
+    proxies; tearing nginx down first pulls the data plane out from under the
+    cleanup that is still using it.
+    """
+    journal = os.path.join(shim_dir, "shutdown-journal.txt")
+    if os.path.exists(journal):
+        os.remove(journal)
+    # A measurable gap between uvicorn's TERM and its exit, so "nginx was
+    # signalled after uvicorn had FINISHED" is distinguishable from "both were
+    # signalled at once".
+    code, output = run_entrypoint(
+        entrypoint_path, shim_dir,
+        {"DP_UVICORN_TERM_DELAY": "1", "DP_JOURNAL": journal}, [1.0])
+    events = read_journal(journal)
+
+    missing = [key for key in ("uvicorn term", "uvicorn exit", "nginx term", "nginx exit")
+               if key not in events]
+    if code != 0 or missing:
+        return False, (f"exit={code}, missing={missing}, journal={events}, "
+                       f"output={output.strip()!r}")
+    if events["nginx term"] < events["uvicorn exit"]:
+        return False, ("nginx was signalled "
+                       f"{events['uvicorn exit'] - events['nginx term']:.2f}s before "
+                       "uvicorn finished shutting down; the cleanup reaches the "
+                       f"browsers through nginx. journal={events}")
+    return True, (f"uvicorn term->exit {events['uvicorn exit'] - events['uvicorn term']:.2f}s, "
+                  f"nginx signalled {events['nginx term'] - events['uvicorn exit']:.2f}s after")
+
+
 ENTRYPOINT_CHECKS = (
     ("entrypoint_double_sigterm", check_double_sigterm_during_shutdown),
     ("entrypoint_sigterm_before_children", check_sigterm_before_children_start),
+    ("entrypoint_shutdown_terminates_children", check_shutdown_terminates_children),
 )
 
 

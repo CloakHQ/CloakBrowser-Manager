@@ -58,6 +58,7 @@ PROBE_CHECKS = (
     "healthz",
     "entrypoint_double_sigterm",
     "entrypoint_sigterm_before_children",
+    "entrypoint_shutdown_terminates_children",
 )
 
 
