@@ -34,6 +34,12 @@ export default defineConfig({
         "src/lib/api.ts": {
           statements: 100, branches: 84, functions: 100, lines: 100,
         },
+        // Every branch here is a write the user asked for that silently did
+        // not happen — the hook swallows the rejection and `error` is the only
+        // signal. It sat at 14% branch with all five catch blocks unexercised.
+        "src/hooks/useProfiles.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
       },
     },
   },
