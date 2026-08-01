@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -295,6 +296,30 @@ def _dri_driver(node: str) -> str | None:
         return None
 
 
+def _format_startup_plan(display: int, decisions: list[tuple[str, str, str]]) -> str:
+    """Render every resolved Xvnc decision as one contiguous, greppable block.
+
+    One block rather than a line per decision because launches are concurrent:
+    interleaved single lines from four displays coming up at once cannot be
+    read as a sequence. Every line still carries its display so `grep ':100'`
+    recovers one launch from a busy log.
+
+    The point is that a startup failure should be diagnosable from the log
+    alone. -PublicIP is the case that motivated this: without it Xvnc walks
+    seven hardcoded STUN servers and exit(1)s where there is no egress, and
+    the only evidence was a readiness timeout with no indication that a
+    network lookup had been attempted at all.
+    """
+    label_width = max(len(label) for label, _, _ in decisions)
+    lines = [f"Xvnc :{display} startup plan:"]
+    lines += [
+        f"  :{display}  {label.ljust(label_width)} = {value}"
+        + (f"    <- {reason}" if reason else "")
+        for label, value, reason in decisions
+    ]
+    return "\n".join(lines)
+
+
 def _hw3d_flags() -> list[str]:
     """DRI3 hardware 3D flags per KASM_HW3D (auto/1/true/yes/0) + KASM_DRINODE."""
     raw = os.environ.get("KASM_HW3D", "auto").strip().lower()
@@ -479,20 +504,44 @@ class VNCManager:
             "-httpd", httpd_dir,
         ]
 
+        # Every decision below is recorded as (label, value, why) and logged as
+        # one block before the process starts — see _format_startup_plan.
+        decisions: list[tuple[str, str, str]] = [
+            ("display", f":{display}", ""),
+            ("websocketPort", str(ws_port), "proxied by nginx; not exposed directly"),
+            ("geometry", f"{width}x{height}", "from the profile"),
+            ("interface", "127.0.0.1", "loopback only"),
+            ("httpd", httpd_dir, "serves the native client the viewer iframe loads"),
+        ]
+
         # Quality preset (KASM_QUALITY_PRESET) plus the one flag that decides
         # who owns encoding policy (KASM_ENCODING_POLICY) — see _encoding_flags.
         preset = _quality_preset_name()
         policy = _encoding_policy_name()
-        cmd += _encoding_flags(policy) + _quality_flags(
-            preset, drop=_INERT_UNDER_VIDEO_POLICY if policy == ENCODING_POLICY_VIDEO else (),
-        )
+        dropped = _INERT_UNDER_VIDEO_POLICY if policy == ENCODING_POLICY_VIDEO else ()
+        encoding_flags = _encoding_flags(policy)
+        cmd += encoding_flags + _quality_flags(preset, drop=dropped)
+        decisions += [
+            ("encoding_policy", policy, f"KASM_ENCODING_POLICY -> {' '.join(encoding_flags)}"),
+            ("quality_preset", preset, "KASM_QUALITY_PRESET"),
+            (
+                "preset_flags_dropped",
+                " ".join(dropped) if dropped else "(none)",
+                "inert under the video policy" if dropped else "",
+            ),
+        ]
 
         # Without this the applied/ignored codec decision and the encoder probe
         # results are DEBUG-only, so a session that fell back to Tight because
         # the chosen encoder failed to open looks identical in the logs to one
         # streaming correctly. Level 30 keeps the ordinary INFO lines;
         # KASM_XVNC_LOG_LEVEL=100 surfaces the per-connection encoder decisions.
-        cmd += ["-Log", f"*:stdout:{_xvnc_log_level()}"]
+        log_level = _xvnc_log_level()
+        cmd += ["-Log", f"*:stdout:{log_level}"]
+        decisions.append((
+            "xvnc_log_level", str(log_level),
+            "KASM_XVNC_LOG_LEVEL; 100 shows per-connection encoder decisions",
+        ))
 
         # Mandatory, not a privacy preference. getPublicIP() (iceip.cxx:157-190)
         # runs unconditionally at extension init, and with no -PublicIP it walks
@@ -504,22 +553,39 @@ class VNCManager:
         # UDP/WebRTC listener Kasm still opens on the websocket port is unusable
         # for negotiation.
         cmd += ["-PublicIP", "127.0.0.1"]
+        decisions.append((
+            "PublicIP", "127.0.0.1",
+            "hardcoded so ICE never queries STUN: no egress needed, nothing "
+            "leaked, and Xvnc cannot exit(1) in a network-restricted deployment",
+        ))
 
         # Owner credentials guard Kasm's HTTP layer (static client, WS
         # upgrade, management /api). nginx injects them on behalf of
         # token-authorized viewer requests, so the browser never sees them
         # (and the Manager's stats proxy uses them directly).
         api_password = secrets.token_hex(16)
-        cmd += ["-KasmPasswordFile", await _write_kasm_passwd(display, api_password)]
+        passwd_path = await _write_kasm_passwd(display, api_password)
+        cmd += ["-KasmPasswordFile", passwd_path]
+        decisions.append((
+            "KasmPasswordFile", passwd_path,
+            "owner credentials for Kasm's HTTP layer; nginx injects them",
+        ))
 
         # DRI3 GPU acceleration (KASM_HW3D / KASM_DRINODE)
-        cmd += _hw3d_flags()
+        hw3d = _hw3d_flags()
+        cmd += hw3d
+        decisions.append((
+            "hw3d", " ".join(hw3d) if hw3d else "(disabled)",
+            "KASM_HW3D / KASM_DRINODE; see the log lines above for why",
+        ))
 
         log_path = f"/tmp/xvnc-{display}.log"
-        logger.info(
-            "Starting Xvnc on :%d (ws_port=%d, preset=%s, encoding_policy=%s) log=%s",
-            display, ws_port, preset, policy, log_path,
-        )
+        decisions.append(("xvnc_log", log_path, "Xvnc's own output"))
+        logger.info("%s", _format_startup_plan(display, decisions))
+        # The exact argv, so a failure can be reproduced by pasting one line.
+        # Safe to log in full: the API password reaches Xvnc through
+        # -KasmPasswordFile, so nothing here is a secret.
+        logger.info("Xvnc :%d argv: %s", display, shlex.join(cmd))
 
         log_file = open(log_path, "w")
         proc = subprocess.Popen(
@@ -543,19 +609,43 @@ class VNCManager:
         # A sleep that is merely usually long enough lets launch() proceed
         # against an Xvnc that is not listening (or already dead), and the
         # viewer then loops reconnecting against a port nobody answers.
-        if not await _wait_until_listening(ws_port, proc, XVNC_READY_TIMEOUT_S):
+        logger.info(
+            "Xvnc :%d started as pid %d; waiting up to %.0fs for %d to accept",
+            display, proc.pid, XVNC_READY_TIMEOUT_S, ws_port,
+        )
+        waiting_since = time.monotonic()
+        listening = await _wait_until_listening(ws_port, proc, XVNC_READY_TIMEOUT_S)
+        waited_s = time.monotonic() - waiting_since
+        if not listening:
             try:
                 with open(log_path) as f:
                     err = f.read()
             except Exception as exc:
                 logger.debug("Failed to read Xvnc log %s: %s", log_path, exc)
                 err = ""
+            # Say WHY it is being called a failure, and hand over the argv and
+            # Xvnc's own output together. Xvnc exits for reasons that are
+            # invisible from "the port never opened" alone — a fatal DRI3 init,
+            # a display lock left by a SIGKILLed predecessor, or (without
+            # -PublicIP) seven STUN timeouts followed by exit(1).
+            logger.error(
+                "Xvnc :%d did not accept on %d within %.1fs (pid %d, exit=%s).\n"
+                "  argv: %s\n"
+                "  %s tail:\n%s",
+                display, ws_port, waited_s, proc.pid, proc.poll(),
+                shlex.join(cmd), log_path,
+                "\n".join(f"    {line}" for line in err.strip().splitlines()[-40:]),
+            )
             # Reap here too: a SIGKILLed X server does not remove
             # /tmp/.X<display>-lock, so leaving it unreaped can make the next
             # allocation of this display fail with "Server is already active".
             await self._terminate(proc, display)
             raise RuntimeError(f"Xvnc failed to start on :{display}: {err}")
 
+        logger.info(
+            "Xvnc :%d ready: accepting on %d after %.2fs (pid %d)",
+            display, ws_port, waited_s, proc.pid,
+        )
         return proc
 
     async def stop_vnc(self, display: int):

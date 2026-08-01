@@ -718,6 +718,53 @@ async def test_start_vnc_logs_at_a_level_that_shows_codec_decisions(
 
 
 @pytest.mark.asyncio
+async def test_start_vnc_logs_the_whole_startup_path(
+    vnc: VNCManager, xvnc_cmd, monkeypatch, caplog,
+):
+    """A launch must be diagnosable from the manager log alone.
+
+    Every value here is one that has already cost real debugging time when it
+    was invisible: which policy won, which preset flags were dropped as inert,
+    and whether ICE was pinned or left to query the network.
+    """
+    monkeypatch.setenv("KASM_HW3D", "0")
+    monkeypatch.setenv("KASM_ENCODING_POLICY", "video")
+    with caplog.at_level("INFO", logger="cloakbrowser.manager.vnc"):
+        await vnc.start_vnc(100, 6100, width=1280, height=720)
+    text = caplog.text
+
+    assert "Xvnc :100 startup plan:" in text
+    for expected in (
+        "encoding_policy      = video",
+        "quality_preset       = balanced",
+        "preset_flags_dropped = -MaxVideoResolution",
+        "PublicIP             = 127.0.0.1",
+        "xvnc_log_level       = 30",
+        "geometry             = 1280x720",
+    ):
+        assert expected in text, f"startup plan omitted {expected!r}"
+
+    # The exact argv, so a failed launch can be reproduced by pasting one line.
+    assert "Xvnc :100 argv:" in text
+    assert "-PublicIP 127.0.0.1" in text
+    # ...and the outcome, with how long readiness actually took.
+    assert "Xvnc :100 ready: accepting on 6100" in text
+
+
+def test_format_startup_plan_tags_every_line_with_its_display():
+    """Launches are concurrent, so a plan line without its display is unreadable."""
+    rendered = vnc_manager._format_startup_plan(
+        7, [("alpha", "1", "because"), ("longer_label", "2", "")],
+    )
+    lines = rendered.splitlines()
+    assert lines[0] == "Xvnc :7 startup plan:"
+    assert all(line.startswith("  :7  ") for line in lines[1:])
+    # aligned on the longest label, and a blank reason renders no arrow
+    assert "alpha        = 1    <- because" in lines[1]
+    assert lines[2].endswith("longer_label = 2")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("policy", ["server-authoritative", "video", "nonsense"])
 async def test_start_vnc_never_passes_both_encoding_flags(
     vnc: VNCManager, xvnc_cmd, monkeypatch, policy: str,
@@ -750,9 +797,26 @@ async def test_start_vnc_hw3d_flags(vnc: VNCManager, xvnc_cmd, monkeypatch, dri_
 
 
 @pytest.mark.asyncio
-async def test_start_vnc_public_ip_flag(vnc: VNCManager, xvnc_cmd, monkeypatch):
-    """STUN public-IP discovery must be disabled (no outbound lookups)."""
+@pytest.mark.parametrize("policy", ["server-authoritative", "video", "nonsense"])
+async def test_start_vnc_public_ip_flag(
+    vnc: VNCManager, xvnc_cmd, monkeypatch, policy: str,
+):
+    """Xvnc must never be left to discover its own public IP.
+
+    Not only a privacy preference. getPublicIP() (iceip.cxx) runs
+    unconditionally at extension init and, with no -PublicIP, walks seven
+    hardcoded Google/VoIP STUN servers and then exit(1)s if none answer.
+    Verified against the shipped image under `--network none`: without the flag
+    Xvnc exits 1 before opening the websocket port, so every launch in a
+    network-restricted deployment fails the readiness wait and POST /launch
+    answers 500. With it, Xvnc logs "ICE: Using public IP 127.0.0.1 from args"
+    and is accepting in ~0.05s.
+
+    Parametrized over the encoding policy so the flag cannot come to depend on
+    one branch of that split.
+    """
     monkeypatch.setenv("KASM_HW3D", "0")
+    monkeypatch.setenv("KASM_ENCODING_POLICY", policy)
     await vnc.start_vnc(100, 6100)
     assert _flag_value(xvnc_cmd["cmd"], "-PublicIP") == "127.0.0.1"
 
