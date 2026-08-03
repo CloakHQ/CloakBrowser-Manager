@@ -52,7 +52,7 @@ normal app windows. Set `DATA_DIR` for Manager state and optionally
     "native_profile": "google-001",
     "name": "GOOGLE 1",
     "start_urls": ["https://accounts.google.com/"],
-    "notes": "Account metadata only. Never store secrets here.",
+    "notes": "Account and session notes for this profile.",
     "tags": [{"tag": "native-macos"}, {"tag": "google"}]
   }
 ]
