@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,8 +12,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-from cloakbrowser import launch_persistent_context_async
 
 from .vnc_manager import VNCManager
 
@@ -149,10 +148,12 @@ CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
 @dataclass
 class RunningProfile:
     profile_id: str
-    context: Any  # Playwright BrowserContext
-    display: int
-    ws_port: int
+    context: Any | None
+    display: int | None
+    ws_port: int | None
     cdp_port: int
+    process: asyncio.subprocess.Process | None = None
+    native: bool = False
 
 
 class BrowserManager:
@@ -172,6 +173,17 @@ class BrowserManager:
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
+
+        native_profile = self._native_profile_name(profile)
+        if native_profile:
+            return await self._launch_native(profile_id, native_profile, self._start_urls(profile))
+
+        try:
+            from cloakbrowser import launch_persistent_context_async
+        except BaseException:
+            async with self._lock:
+                self._launching.discard(profile_id)
+            raise
 
         display, ws_port = await self.vnc.allocate()
 
@@ -203,7 +215,10 @@ class BrowserManager:
 
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
-            extra_args += profile.get("launch_args") or []
+            extra_args += [
+                arg for arg in profile.get("launch_args") or []
+                if not arg.startswith(("--native-profile=", "--start-url="))
+            ]
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
@@ -286,6 +301,100 @@ class BrowserManager:
             await self.vnc.stop_vnc(display)
             raise
 
+    @staticmethod
+    def _native_profile_name(profile: dict[str, Any]) -> str | None:
+        for arg in profile.get("launch_args") or []:
+            if arg.startswith("--native-profile="):
+                return arg.partition("=")[2] or None
+        return None
+
+    @staticmethod
+    def _start_urls(profile: dict[str, Any]) -> list[str]:
+        return [
+            arg.partition("=")[2]
+            for arg in profile.get("launch_args") or []
+            if arg.startswith("--start-url=") and arg.partition("=")[2]
+        ]
+
+    @staticmethod
+    def _native_cdp_port(profile_name: str) -> int:
+        digest = hashlib.sha256(profile_name.encode()).digest()
+        return 9400 + (int.from_bytes(digest[:2], "big") % 400)
+
+    async def _launch_native(
+        self,
+        profile_id: str,
+        profile_name: str,
+        start_urls: list[str],
+    ) -> RunningProfile:
+        launcher = os.getenv(
+            "NATIVE_CLOAK_LAUNCHER",
+            str(Path.home() / ".local/bin/cloak-bitwarden-profile"),
+        )
+        cdp_port = self._native_cdp_port(profile_name)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                launcher,
+                "open",
+                profile_name,
+                *start_urls,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await self._wait_for_port(cdp_port, process)
+            running = RunningProfile(
+                profile_id=profile_id,
+                context=None,
+                display=None,
+                ws_port=None,
+                cdp_port=cdp_port,
+                process=process,
+                native=True,
+            )
+            async with self._lock:
+                self.running[profile_id] = running
+                self._launching.discard(profile_id)
+            asyncio.create_task(self._watch_native(profile_id, process))
+            logger.info("Launched native profile %s on CDP port %d", profile_name, cdp_port)
+            return running
+        except BaseException:
+            async with self._lock:
+                self._launching.discard(profile_id)
+            raise
+
+    @staticmethod
+    async def _wait_for_port(
+        port: int,
+        process: asyncio.subprocess.Process,
+        timeout: float = 45,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if process.returncode is not None:
+                error = await process.stderr.read() if process.stderr else b""
+                raise RuntimeError(error.decode().strip() or "Native launcher exited")
+            try:
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                await writer.wait_closed()
+                return
+            except OSError:
+                await asyncio.sleep(0.25)
+        process.terminate()
+        raise TimeoutError(f"Native profile CDP port {port} did not open")
+
+    async def _watch_native(
+        self,
+        profile_id: str,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        await process.wait()
+        async with self._lock:
+            current = self.running.get(profile_id)
+            if current and current.process is process:
+                self.running.pop(profile_id, None)
+
     async def _on_browser_closed(self, profile_id: str):
         """Called when browser exits (crash, user closed via VNC, or stop())."""
         async with self._lock:
@@ -293,7 +402,8 @@ class BrowserManager:
 
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            await self.vnc.stop_vnc(running.display)
+            if running.display is not None:
+                await self.vnc.stop_vnc(running.display)
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance."""
@@ -306,12 +416,23 @@ class BrowserManager:
 
         logger.info("Stopping profile %s", profile_id)
 
-        try:
-            await running.context.close()
-        except Exception as exc:
-            logger.warning("Error closing context for %s: %s", profile_id, exc)
+        if running.native and running.process:
+            running.process.terminate()
+            try:
+                await asyncio.wait_for(running.process.wait(), timeout=10)
+            except TimeoutError:
+                running.process.kill()
+                await running.process.wait()
+            return
 
-        await self.vnc.stop_vnc(running.display)
+        if running.context:
+            try:
+                await running.context.close()
+            except Exception as exc:
+                logger.warning("Error closing context for %s: %s", profile_id, exc)
+
+        if running.display is not None:
+            await self.vnc.stop_vnc(running.display)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status for a profile."""
@@ -320,7 +441,7 @@ class BrowserManager:
             return {
                 "status": "running",
                 "vnc_ws_port": running.ws_port,
-                "display": f":{running.display}",
+                "display": "native-macos" if running.native else f":{running.display}",
                 "cdp_url": f"/api/profiles/{profile_id}/cdp",
             }
         return {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
