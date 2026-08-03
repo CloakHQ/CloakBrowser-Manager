@@ -39,6 +39,29 @@ docker compose up --build
 
 Open [http://localhost:8080](http://localhost:8080) in your browser. Create a profile. Click Launch. Done.
 
+### Native macOS profiles
+
+Run Manager directly on macOS to launch existing local CloakBrowser profiles in
+normal app windows. Set `DATA_DIR` for Manager state and optionally
+`NATIVE_PROFILE_REGISTRY` to a JSON registry. Default registry:
+`~/.cloakbrowser/manager/native-profiles.json`.
+
+```json
+[
+  {
+    "native_profile": "google-001",
+    "name": "GOOGLE 1",
+    "start_urls": ["https://accounts.google.com/"],
+    "notes": "Account metadata only. Never store secrets here.",
+    "tags": [{"tag": "native-macos"}, {"tag": "google"}]
+  }
+]
+```
+
+Native profiles launch through `~/.local/bin/cloak-bitwarden-profile`. Override
+that path with `NATIVE_CLOAK_LAUNCHER`. Chromium data remains under
+`~/.cloakbrowser/profiles`; Manager never copies it into Git or `/data`.
+
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues).
 
 ## Why Not Just Use a VPN?
@@ -119,6 +142,28 @@ Your profiles and session data are stored in the `cloakprofiles` volume and pers
 ## Automation API
 
 Every running profile exposes a CDP (Chrome DevTools Protocol) endpoint. Connect Playwright or Puppeteer to automate a profile while watching it live in the browser.
+
+**Recommended agent path:** use Manager as source of truth. Agent finds profile,
+launches it through Manager, then connects through Manager CDP. Do not open the
+profile directory directly from agent code. This preserves profile locking,
+Bitwarden sync, network policy, and UI status.
+
+```text
+Browser agent -> Manager API -> native launcher -> CloakBrowser profile
+              -> Manager CDP -> same live browser window
+```
+
+Ready-to-copy Python client: `examples/browser_agent.py`.
+
+```bash
+pip install httpx playwright
+CLOAK_MANAGER_URL=http://127.0.0.1:8081 \
+  python examples/browser_agent.py
+```
+
+Change `connect("google-002")` to any `native_profile` value from the local
+registry. For reusable agents, call `connect()` and work with returned
+Playwright context. Manager UI and agent always control the same session.
 
 ```python
 from playwright.async_api import async_playwright

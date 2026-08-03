@@ -228,6 +228,30 @@ def test_allocate_cdp_port_all_occupied_raises():
             s.close()
 
 
+def test_native_profile_name():
+    profile = {"launch_args": ["--native-profile=google-001"]}
+    assert _mgr._native_profile_name(profile) == "google-001"
+
+
+def test_native_profile_name_missing():
+    assert _mgr._native_profile_name({"launch_args": []}) is None
+
+
+def test_start_urls():
+    profile = {
+        "launch_args": [
+            "--native-profile=google-002",
+            "--start-url=https://accounts.google.com/",
+        ]
+    }
+    assert _mgr._start_urls(profile) == ["https://accounts.google.com/"]
+
+
+def test_native_cdp_ports_match_launcher():
+    assert _mgr._native_cdp_port("google-001") == 9558
+    assert _mgr._native_cdp_port("google-002") == 9684
+
+
 # ── _init_profile_defaults ───────────────────────────────────────────────────
 
 

@@ -375,6 +375,9 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    synced = db.sync_native_profiles()
+    if synced:
+        logger.info("Synced %d native profiles", synced)
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
     logger.info("CloakBrowser Manager started")
@@ -542,7 +545,7 @@ async def launch_profile(profile_id: str):
         profile_id=profile_id,
         status="running",
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}",
+        display="native-macos" if running.native else f":{running.display}",
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -569,7 +572,10 @@ async def get_profile_status(profile_id: str):
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    from cloakbrowser.config import CHROMIUM_VERSION
+    try:
+        from cloakbrowser.config import CHROMIUM_VERSION
+    except ModuleNotFoundError:
+        CHROMIUM_VERSION = "native-launcher"
 
     profiles = db.list_profiles()
     return StatusResponse(
@@ -683,6 +689,9 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
+        return
+    if running.ws_port is None:
+        await websocket.close(code=4004, reason="Native profile has no VNC session")
         return
 
     # Accept with client's requested subprotocol (if any) — RFC 6455 requires
