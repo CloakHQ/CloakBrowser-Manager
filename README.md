@@ -100,8 +100,12 @@ A profile with **Headless** enabled starts no Xvnc and allocates no display or W
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
+| `TLS_SANS` | *(unset)* | Extra names/IPs for the self-signed cert on `:8443`, comma separated. `localhost` and `127.0.0.1` are always included. Read only when the cert is first issued — delete `/data/tls` to re-issue. |
+| `CF_TUNNEL_TOKEN` | *(unset = quick tunnel)* | With `docker-compose.tunnel.yml`: run a **named** Cloudflare tunnel with a stable hostname. Unset gives a free `*.trycloudflare.com` quick tunnel that changes every restart. |
+| `CF_TUNNEL_ORIGIN` | `http://manager:8080` | What the tunnel points at inside the compose network. |
+| `TUNNEL_ALLOW_NO_AUTH` | *(unset)* | Allow the tunnel sidecar to start with an empty `AUTH_TOKEN`, i.e. publish an unauthenticated Manager to the internet. |
 | `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
-| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — so `KASM_QUALITY_PRESET` no longer binds. See the note above. |
+| `KASM_ENCODING_POLICY` | `server-authoritative` | `server-authoritative`: clients cannot override encoding/quality; JPEG/WebP only, no video codec can engage. `video`: in-band H.264/H.265/AV1 WebCodecs streaming, at the cost of client-authoritative quality settings — under it `KASM_QUALITY_PRESET` does not bind. See the note above. |
 | `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. Software: `h264`, `h265`, `av1`. VAAPI (Intel/AMD): `h264_vaapi`, `h265_vaapi`, `av1_vaapi`. NVENC (NVIDIA): `h264_nvenc`, `h265_nvenc`/`hevc_nvenc`, `av1_nvenc`. `auto` is refused — it lets the client pick, including software AV1. |
 | `KASM_XVNC_LOG_LEVEL` | `30` | Xvnc log verbosity (0-100). Raise to `100` to see per-connection encoder decisions in `/tmp/xvnc-<display>.log`. |
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
@@ -148,7 +152,7 @@ What it turns on:
 
 Two things are easy to get wrong here, and both fail silently:
 
-- **`--use-angle=gl-egl` is the software path.** NVIDIA's EGL declines the X11 platform on an X server it does not drive, so GLVND falls through to Mesa and you get llvmpipe on the CPU with the GPU attached and idle. Measured on the same host: `gl-egl` → `ANGLE (Mesa, llvmpipe)`; `vulkan` → `ANGLE (NVIDIA, Vulkan 1.4.312 (RTX 3080 Ti))` with GPU compositing enabled. `--use-gl=egl` is worse still — it is deprecated and silently disables WebGL.
+- **`--use-angle=gl-egl` is the software path.** NVIDIA's EGL declines the X11 platform on an X server it does not drive, so GLVND falls through to Mesa and you get llvmpipe on the CPU with the GPU attached and idle. On the same host `gl-egl` gives `ANGLE (Mesa, llvmpipe)` while `vulkan` gives `ANGLE (NVIDIA, Vulkan 1.4.312 (RTX 3080 Ti))` with GPU compositing enabled. `--use-gl=egl` is worse still — it is deprecated and silently disables WebGL.
 - **The bundled KasmVNC client cannot select NVENC by itself.** Its automatic candidate list is hardcoded to the VAAPI and software variants, so against an NVENC server it quietly settles on JPEG/WebP while Xvnc still reports `capability: h264_nvenc`. The Manager works around this by sending `kasmvnc_mode_preference` in the viewer URL, derived from `KASM_VIDEO_CODEC`.
 
 Verify it end to end with the bundled probe (expected to fail without a GPU):
@@ -266,13 +270,87 @@ The CDP URL is available in the toolbar (code icon) when a profile is running. T
 
 ## Remote Access
 
-The container binds to localhost only. To access from a remote server:
+Compose publishes on **all interfaces**: `8080` plain HTTP and `8443` HTTPS with
+a self-signed certificate. Nothing else is exposed — the Xvnc WebSocket and the
+FastAPI control plane stay on loopback inside the container, reached only
+through nginx.
+
+Set `AUTH_TOKEN` before doing this on an untrusted network: it is the only access
+control, and unset means open (see [Authentication](#authentication)).
+
+### Use HTTPS for any viewer that is not on localhost
+
+This is not a preference. The KasmVNC client will not negotiate **any** video
+codec — NVENC, VAAPI, or even software H.264 — outside a *secure context*,
+because it gates them on WebCodecs:
+
+```js
+if (!("VideoDecoder" in window)) return "WebCodecs API not available";
+```
+
+Browsers expose WebCodecs only over `https://` or to `localhost`. A viewer on
+`http://<lan-ip>:8080` therefore reports no decodable codecs, silently settles on
+JPEG/WebP, and the GPU encoder never runs however the server is configured. The
+origin alone decides it, for the same browser and the same viewer URL:
+
+| Origin | Negotiated encoder | NVENC sessions |
+|---|---|---|
+| `http://<lan-ip>:8080` | `-1025` JPEG/WebP | 0 |
+| `https://<lan-ip>:8443` or a tunnel | `-1029` h264_nvenc | 1 |
+
+The certificate is generated on first boot and kept in `/data/tls`, so it
+survives restarts and the browser exception you grant stays valid. Put the
+address you actually connect to in the SAN list — the container cannot discover
+the host's LAN address by itself:
+
+```bash
+TLS_SANS=192.168.1.50,manager.lan docker compose up -d
+```
+
+Delete `/data/tls` to re-issue. Being self-signed, the browser still shows a
+one-time "unknown issuer" warning to click through.
+
+### Cloudflare Tunnel (real certificate, no open ports)
+
+Avoids both the self-signed warning and publishing any port:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d --build
+docker compose logs tunnel | grep trycloudflare.com   # the public URL
+```
+
+With no `CF_TUNNEL_TOKEN` this opens a **free quick tunnel** on a random
+`*.trycloudflare.com` name that is regenerated on every restart — no Cloudflare
+account required. Set `CF_TUNNEL_TOKEN` to run a named tunnel instead, with a
+stable hostname and ingress rules from the Cloudflare dashboard. The overlay
+also drops the manager's published ports, since the tunnel reaches it over the
+compose network. Combine with GPU support by listing both overlays, tunnel last:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
+               -f docker-compose.tunnel.yml up -d --build
+```
+
+The sidecar **refuses to start when `AUTH_TOKEN` is empty** — a tunnel publishes
+the Manager to the internet, and this API launches browsers and proxies CDP into
+them. Override with `TUNNEL_ALLOW_NO_AUTH=1` only if you genuinely want an open
+endpoint.
+
+### Keeping it private
+
+Narrow the bindings in `docker-compose.yml` and use a tunnel:
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
 
 ```bash
 ssh -L 8080:localhost:8080 your-server
 ```
 
-Then open `http://localhost:8080`.
+Reaching it as `http://localhost:8080` this way is also a secure context, so
+hardware encoding works over an SSH tunnel without TLS.
 
 ## Authentication
 

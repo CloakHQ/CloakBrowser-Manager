@@ -1,6 +1,14 @@
 services:
   manager:
-    build: .
+    build:
+      context: .
+      # Decides which Chromium gets baked in: with a key ensure_binary() fetches
+      # the licensed Pro build, without one it silently falls back to the free
+      # binary and the difference only shows up at run time. Belongs here rather
+      # than in an overlay because ./Dockerfile is what runs ensure_binary().
+      # Compose reads the value from the gitignored .env automatically.
+      args:
+        CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
     # The entrypoint exits if nginx or uvicorn dies; this is what turns that
     # into recovery instead of a permanently broken container.
     restart: unless-stopped
@@ -9,8 +17,21 @@ services:
     # mid-cleanup with more than a couple of profiles running, leaving exactly
     # the unclean Chromium shutdown (and restore prompts) that ordering avoids.
     stop_grace_period: 60s
+    # Published on all interfaces so the UI is reachable from other machines
+    # without an SSH tunnel or a reverse proxy in front.
+    #
+    # This is the one setting that decides whether the manager is exposed, and
+    # AUTH_TOKEN is the only thing guarding it: it is OPTIONAL, and when it is
+    # unset the auth middleware short-circuits (backend/main.py) so every API
+    # route — launch, delete, the CDP tunnel — answers unauthenticated. Set
+    # AUTH_TOKEN (the .env below is read automatically) before putting this on
+    # a network you do not control, or narrow the binding back to
+    # "127.0.0.1:8080:8080".
     ports:
-      - "127.0.0.1:8080:8080"
+      - "0.0.0.0:8080:8080"
+      # HTTPS. Use this one from anything that is not localhost — hardware video
+      # encoding needs WebCodecs, and WebCodecs needs a secure context.
+      - "0.0.0.0:8443:8443"
     volumes:
       - ~/.cloakbrowser-manager:/data
     environment:
@@ -18,6 +39,18 @@ services:
       # not. Without these the tuning knobs the README documents have no effect
       # under Compose — they only reached the container via `docker run -e`.
       - AUTH_TOKEN=${AUTH_TOKEN:-}
+      # The Pro binary re-validates at run time too — exit 77 on a missing key,
+      # exit 76 once the plan's concurrent-session limit is taken — so it is
+      # needed here as well as at build time. Setting it here swaps the license
+      # without a rebuild.
+      - CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY:-}
+      # Extra names/addresses to put in the self-signed cert's SAN list, comma
+      # separated (e.g. TLS_SANS=192.168.1.50,manager.lan). localhost and
+      # 127.0.0.1 are always included. The container cannot discover the host's
+      # LAN address by itself, so without this the browser adds a name-mismatch
+      # complaint on top of the unknown-issuer one. Only read when the cert is
+      # first generated — delete /data/tls to re-issue.
+      - TLS_SANS
       - KASM_QUALITY_PRESET
       - KASM_ENCODING_POLICY
       - KASM_VIDEO_CODEC

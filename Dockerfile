@@ -80,10 +80,38 @@ COPY backend/ /app/backend/
 # Frontend build from stage 1
 COPY --from=frontend-builder /build/dist /app/frontend/dist
 
-# Pre-download CloakBrowser binary
+# Pre-download CloakBrowser binary.
+#
+# The key has to be in the environment of THIS stage, and before this RUN.
+# ensure_binary() resolves the licensed Pro build only when it can read a key,
+# and falls back to the free binary silently otherwise — the image then ships
+# one Chromium while the first launch downloads a different one (~337MB) into
+# the /root/.cloakbrowser VOLUME, inside the launch timeout. Measured, same
+# image: no key -> chromium-146.0.7680.177.5, key -> chromium-150.x-pro.
+#
+# Passed as a build ARG sourced from the gitignored .env via compose, so the
+# key stays out of the repo. It is re-exported as ENV because the Pro binary
+# validates its license at RUN time too (a missing key is exit 77), which
+# keeps a plain `docker run <image>` working; compose's `environment:` still
+# overrides it, so a different key needs no rebuild.
+ARG CLOAKBROWSER_LICENSE_KEY
+ENV CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY}
 RUN python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
 
-EXPOSE 8080
+# A placeholder self-signed cert, so the shipped nginx.conf validates in ANY
+# container and not only one the entrypoint has initialised: nginx refuses to
+# start when ssl_certificate names a missing file, and the data-plane probe
+# boots this config directly with no /data volume and no entrypoint. The
+# entrypoint replaces both files at run time with a persistent pair carrying
+# the deployment's real SANs (see TLS_SANS).
+RUN mkdir -p /etc/nginx/tls \
+    && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout /etc/nginx/tls/server.key -out /etc/nginx/tls/server.crt \
+        -subj "/CN=cloakbrowser-manager" \
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null \
+    && chmod 600 /etc/nginx/tls/server.key
+
+EXPOSE 8080 8443
 
 # --start-period: the probe goes through nginx to uvicorn, and uvicorn's
 # lifespan runs cleanup_stale plus auto_launch_all (LAUNCH_TIMEOUT_S=60 per

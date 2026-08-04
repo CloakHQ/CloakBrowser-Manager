@@ -18,6 +18,55 @@ find /data/profiles -maxdepth 2 -name 'SingletonSocket' -delete 2>/dev/null || t
 # Remove X11 lock files from previous displays
 rm -f /tmp/.X1*-lock 2>/dev/null || true
 
+# TLS material for the HTTPS listener.
+#
+# This is not decoration. The KasmVNC client gates EVERY video codec on
+# WebCodecs -- `if (!("VideoDecoder" in window)) return "WebCodecs API not
+# available"` -- and browsers only expose WebCodecs in a secure context. Reached
+# over plain http:// at anything other than localhost, the client therefore
+# reports no decodable codecs at all and quietly settles on JPEG/WebP, so NVENC
+# never engages no matter how the server is configured. Measured, same browser
+# and same viewer URL: via 127.0.0.1 the client negotiated -1029 (h264_nvenc)
+# and nvidia-smi showed an encoder session; via the LAN IP it negotiated -1025
+# (JPEG/WebP) and the encoder stayed at zero.
+#
+# The cert lives on the /data volume so it survives a restart. Regenerating it
+# every boot would work, but self-signed certs are trusted by exception and a
+# new fingerprint invalidates that exception on every single restart.
+TLS_DIR=/data/tls
+NGINX_TLS_DIR=/etc/nginx/tls
+mkdir -p "$TLS_DIR"
+if [ ! -s "$TLS_DIR/server.crt" ] || [ ! -s "$TLS_DIR/server.key" ]; then
+    # Browsers match the address you typed against the SAN list, not the CN.
+    # TLS_SANS carries the address users actually reach this box by, which the
+    # container cannot work out for itself: it only ever sees its bridge
+    # address, never the host's LAN IP.
+    tls_sans="DNS:localhost,IP:127.0.0.1,IP:::1"
+    for tls_entry in $(echo "${TLS_SANS:-}" | tr ',' ' '); do
+        case "$tls_entry" in
+            "") continue ;;
+            # Digits and dots only, or anything containing a colon: an address.
+            # Everything else is a name.
+            *:*)       tls_sans="$tls_sans,IP:$tls_entry" ;;
+            *[!0-9.]*) tls_sans="$tls_sans,DNS:$tls_entry" ;;
+            *)         tls_sans="$tls_sans,IP:$tls_entry" ;;
+        esac
+    done
+    echo "Generating self-signed TLS certificate (SAN: $tls_sans)"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$TLS_DIR/server.key" -out "$TLS_DIR/server.crt" \
+        -subj "/CN=cloakbrowser-manager" \
+        -addext "subjectAltName=$tls_sans" >/dev/null 2>&1
+    chmod 600 "$TLS_DIR/server.key"
+fi
+# Copied into the image rather than read from /data directly, so the shipped
+# nginx.conf points at a path that exists even in a container with no volume
+# (the data-plane probe boots it that way, and nginx refuses to start when
+# ssl_certificate names a missing file).
+install -d -m 755 "$NGINX_TLS_DIR"
+install -m 644 "$TLS_DIR/server.crt" "$NGINX_TLS_DIR/server.crt"
+install -m 600 "$TLS_DIR/server.key" "$NGINX_TLS_DIR/server.key"
+
 # Graceful stop: uvicorn's lifespan shutdown stops the browsers and Xvnc, so
 # let it finish before pulling the data plane out from under it.
 shutdown() {
@@ -67,6 +116,8 @@ uvicorn_pid=$!
 
 echo ""
 echo "  CloakBrowser Manager running at http://localhost:8080 (nginx → uvicorn 127.0.0.1:8081)"
+echo "  HTTPS on :8443 (self-signed). Use it for any non-localhost viewer:"
+echo "  hardware video encoding needs WebCodecs, which needs a secure context."
 echo ""
 
 # First exit wins.
