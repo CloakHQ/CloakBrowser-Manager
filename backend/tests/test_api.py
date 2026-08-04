@@ -1522,6 +1522,72 @@ def test_a_non_ascii_authorization_header_is_unauthenticated_not_a_crash(monkeyp
     ) is False
 
 
+# ── Per-profile capability URLs ──────────────────────────────────────────────
+
+_CAPABILITY_UUID = "308d4c96-cff6-468e-b0c2-93f388220aa4"
+
+
+@pytest.mark.parametrize("path", [
+    f"/api/profiles/{_CAPABILITY_UUID}",
+    f"/api/profiles/{_CAPABILITY_UUID}/cdp",
+    f"/api/profiles/{_CAPABILITY_UUID}/cdp/json/version",
+    f"/api/profiles/{_CAPABILITY_UUID}/cdp/devtools/page/ABC123",
+    f"/api/profiles/{_CAPABILITY_UUID.upper()}/status",
+])
+def test_per_profile_paths_carry_their_own_credential(path: str):
+    """The id authenticates the route, so no CDP client needs a bearer token.
+
+    A WebSocket handshake cannot carry an Authorization header from Playwright,
+    Puppeteer or chrome-remote-interface, so requiring one there means
+    requiring a patched client.
+    """
+    assert main._PROFILE_CAPABILITY_PATH.match(path) is not None
+
+
+@pytest.mark.parametrize("path", [
+    "/api/profiles",           # the listing this whole design exists to protect
+    "/api/profiles/",
+    "/api/profiles/../profiles",
+    "/api/profiles/not-a-uuid",
+    "/api/profiles/308d4c96",                              # truncated
+    f"/api/profiles/{_CAPABILITY_UUID}x",                  # trailing junk
+    f"/api/profiles/{_CAPABILITY_UUID[:-1]}",              # one char short
+    "/api/profiles/308d4c96_cff6_468e_b0c2_93f388220aa4",  # underscores
+    "/api/profiles/zzzzzzzz-cff6-468e-b0c2-93f388220aa4",  # non-hex
+])
+def test_enumeration_paths_are_never_treated_as_a_capability(path: str):
+    """Anything that is not one canonical uuid still needs the token.
+
+    The collection route is the enumeration the capability model depends on
+    keeping shut: with it open, one unauthenticated GET yields every id and
+    therefore every profile's CDP.
+    """
+    assert main._PROFILE_CAPABILITY_PATH.match(path) is None
+
+
+def test_capability_url_reaches_the_route_without_a_token(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """End to end through the middleware: not 401, i.e. the route ran."""
+    monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
+    resp = app_client.get(f"/api/profiles/{_CAPABILITY_UUID}")
+    assert resp.status_code != 401
+    assert resp.status_code == 404  # unknown id, but the handler decided that
+
+
+def test_listing_and_creating_profiles_still_demand_the_token(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """The two routes that would hand out ids stay closed."""
+    monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
+    assert app_client.get("/api/profiles").status_code == 401
+    assert app_client.post("/api/profiles", json={"name": "x"}).status_code == 401
+    # and still work with it
+    assert app_client.get(
+        "/api/profiles", headers={"Authorization": "Bearer test-secret"},
+    ).status_code == 200
+
+
 # ── Clipboard robustness ─────────────────────────────────────────────────────
 
 

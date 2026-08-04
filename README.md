@@ -373,6 +373,51 @@ When `AUTH_TOKEN` is set:
 - API consumers pass the token via `Authorization: Bearer <token>` header.
 - Viewer page + WebSocket connections are authorized through short-lived per-profile viewer tokens issued after login.
 - The `/api/status` endpoint remains unauthenticated (for Docker healthcheck).
+- **`/api/profiles/<id>/...` is a capability URL** — see below.
+
+### Per-profile capability URLs
+
+Every route under `/api/profiles/<id>/` authenticates on the profile id alone
+and needs no token. The id is a `uuid4`, so 122 random bits, and it is the
+credential exactly as it is in a cloud provider's presigned URL.
+
+This is what makes the CDP endpoint work with every CDP client:
+
+```bash
+# no token anywhere
+agent-browser connect "wss://<host>/api/profiles/<id>/cdp"
+playwright.chromium.connect_over_cdp("https://<host>/api/profiles/<id>/cdp")
+```
+
+A WebSocket handshake from Playwright, Puppeteer or chrome-remote-interface
+cannot carry an `Authorization` header, so a bearer token on that route means a
+patched client.
+
+The routes that would hand out ids are the ones the token still guards:
+
+| Route | Without token |
+|---|---|
+| `GET /api/profiles` (list) | **401** |
+| `POST /api/profiles` (create) | **401** |
+| `GET /api/profiles/<id>` | 200 |
+| `GET /api/profiles/<id>/cdp`, `…/status`, `…/viewer-token` | 200 |
+| `GET /api/profiles/<unknown-uuid>` | 404 |
+| `GET /api/profiles/not-a-uuid` | **401** |
+
+Treat the URL as the secret it is:
+
+- The id grants **full control of that profile** — CDP is arbitrary code
+  execution in the browser, plus its cookies and storage — and it also covers
+  `DELETE`.
+- It does not expire and cannot be revoked without deleting the profile.
+- nginx redacts it from the access log (`/api/profiles/_/…`), as it does viewer
+  tokens. nginx's *error* log format is not configurable, so a request that
+  errors can still record the full path there.
+- Anything that sees your URLs sees the credential: browser history, `Referer`,
+  shared terminal scrollback, a pasted curl command.
+
+Cross-origin WebSocket connections are refused regardless (`Origin` must match
+`Host`), so a hostile page cannot drive the CDP socket even knowing the id.
 
 > **Note**: The auth token is transmitted in cleartext over HTTP. If you expose the Manager to the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, Traefik).
 

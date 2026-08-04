@@ -63,6 +63,32 @@ _SHUTTING_DOWN_DETAIL = "Browser is still shutting down; try again"
 # (/api/viewer-auth is exempt: the viewer token in X-Original-URI is the credential)
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status", "/api/viewer-auth"})
 
+# Per-profile routes are a CAPABILITY URL: the profile's own id is the
+# credential, exactly as it is for a cloud provider's presigned URL. This is
+# what keeps the CDP endpoint usable by every CDP client there is — Playwright,
+# Puppeteer, chrome-remote-interface, agent-browser — none of which can attach
+# an Authorization header to a WebSocket handshake, so requiring a bearer token
+# there means requiring a patched client.
+#
+# The id is uuid4 (database.py), so 122 random bits: not enumerable, and the
+# collection routes that WOULD enumerate it — GET/POST /api/profiles — are
+# deliberately NOT matched here and still demand the token. That asymmetry is
+# the entire security model, so the pattern is anchored at both ends and
+# insists on the canonical 8-4-4-4-12 form. A looser match ("starts with
+# /api/profiles/") would exempt /api/profiles/ itself on some routers, and with
+# it the listing this is supposed to protect.
+#
+# Consequences worth stating plainly: the id grants FULL control of that one
+# profile (CDP is arbitrary code execution in the browser, plus its cookies and
+# storage), it does not expire, and it cannot be revoked short of deleting the
+# profile. Treat the URL as the secret it is — nginx.conf redacts it from the
+# access log for the same reason it redacts viewer tokens.
+_PROFILE_CAPABILITY_PATH = re.compile(
+    r"^/api/profiles/"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"(/.*)?$"
+)
+
 
 def _check_auth(scope: Scope) -> bool:
     """Check if the request has a valid auth token (header or cookie).
@@ -183,6 +209,12 @@ class AuthMiddleware:
 
         # Skip auth for exempt endpoints and non-API paths (static frontend)
         if path in _AUTH_EXEMPT or not path.startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+
+        # A per-profile path carries its own credential in the id — see
+        # _PROFILE_CAPABILITY_PATH. Enumeration is what the token still guards.
+        if _PROFILE_CAPABILITY_PATH.match(path):
             await self.app(scope, receive, send)
             return
 
