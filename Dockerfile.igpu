@@ -1,0 +1,79 @@
+# Integrated-GPU variant of the manager image — Intel and AMD, one image.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.igpu.yml up -d --build
+#
+# `FROM base` is not a public image — the compose overlay binds it to the CPU
+# image built from ./Dockerfile (additional_contexts: base: service:manager-base),
+# so both images build from one command and the recipe stays in one file.
+#
+# Why this exists at all, when docker-compose.gpu.yml already maps /dev/dri: that
+# overlay buys KasmVNC's DRI3 screen CAPTURE (-hw3d) and nothing else. Both of
+# the things that actually cost CPU are still software without this layer —
+# KasmVNC negotiates no video codec under the repo-wide default policy, and
+# Chromium has no Mesa userspace to bind, so it falls back to SwiftShader. This
+# image plus its overlay closes both gaps.
+#
+# Deliberately NOT a vendor base image, for the same reason Dockerfile.nvidia is
+# not: everything below is ordinary Mesa userspace out of Debian trixie, which is
+# where the KasmVNC 1.5.0 .deb and the libavcodec61 soname the base image
+# symlinks against both come from. Unlike the NVIDIA path, nothing here is
+# injected at `docker run` time — the open-source stack lives entirely in
+# userspace packages and talks to the kernel driver through the render node, so
+# the whole thing is baked in and the only run-time requirement is that
+# /dev/dri is mapped.
+FROM base
+
+ARG TARGETARCH
+
+# Three groups, and the reason each is load-bearing:
+#
+#   mesa-vulkan-drivers  radv (AMD) and anv (Intel), plus the ICDs in
+#     /usr/share/vulkan/icd.d that libvulkan1 reads. Only needed for
+#     CHROME_ANGLE_BACKEND=vulkan, but it has to be present for that setting to
+#     be TRYABLE at all — and which ANGLE backend reaches a given iGPU is a
+#     per-host question the operator settles with scripts/gpu_probe.py, not one
+#     this Dockerfile can answer. Without it that knob has no effect but to
+#     silently land on llvmpipe. libvulkan1 arrives as a dependency; naming it
+#     is what stops a future base change from dropping the loader.
+#
+#   libglvnd0/libegl1/...  the GLVND loaders, and the DEFAULT path's requirement
+#     rather than a fallback's. ANGLE ships its own libEGL.so beside the
+#     Chromium binary, but its gl-egl backend resolves the *system* libEGL.so.1
+#     to reach libEGL_mesa.so.0 through /usr/share/glvnd/egl_vendor.d — and the
+#     base image has libegl-mesa0 (the vendor) with no loader in front of it.
+#     Missing, ANGLE does not fail: it falls back to SwiftShader on the CPU with
+#     the GPU mapped and idle.
+#
+#   VA drivers  the encoder half. mesa-va-drivers (radeonsi, and Intel's Gallium
+#     driver) is already in the base image; what is missing there is Intel's
+#     media driver, which is what iHD-era hardware (Broadwell and newer) actually
+#     encodes through. i965-va-driver covers Ivy/Haswell. Both are amd64-only in
+#     Debian, hence the arch guard — an arm64 build would otherwise fail on a
+#     package that cannot apply to it, and arm64 has no Intel iGPU to serve.
+#
+# vainfo is already in the base image. mesa-utils and vulkan-tools are the
+# diagnostics the GPU probe's hints tell you to run (glxinfo / vulkaninfo) and
+# are ~3MB together; leaving them out means the first thing you do on a
+# misbehaving host is install them by hand inside a running container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libvulkan1 mesa-vulkan-drivers \
+        libglvnd0 libegl1 libgles2 libglx0 libopengl0 libgl1 \
+        mesa-utils vulkan-tools \
+    && case "${TARGETARCH}" in \
+        amd64) apt-get install -y --no-install-recommends \
+                   intel-media-va-driver i965-va-driver ;; \
+        *) echo "TARGETARCH=${TARGETARCH}: skipping the Intel VA drivers (amd64 only)" ;; \
+       esac \
+    && rm -rf /var/lib/apt/lists/*
+
+# No CLOAKBROWSER_LICENSE_KEY here on purpose: this image is `FROM base`, and
+# the base sets it from its own build ARG alongside the ensure_binary() call
+# that consumes it. Repeating it here would let the two drift, and only the
+# base's value decides which Chromium is actually baked in.
+#
+# No ENV for the GPU either. The NVIDIA image needs NVIDIA_VISIBLE_DEVICES /
+# NVIDIA_DRIVER_CAPABILITIES because a runtime hook reads them to decide what to
+# inject; there is no equivalent hook here. KASM_ENCODING_POLICY,
+# KASM_VIDEO_CODEC and CHROME_GPU_ACCEL are set by docker-compose.igpu.yml so
+# they stay overridable per deployment, and every one of them has a working
+# default in the backend for a plain `docker run --device /dev/dri:/dev/dri`.
