@@ -458,6 +458,20 @@ def viewer_stream_mode_preference() -> str | None:
     return "|".join(modes) or None
 
 
+DRI_RENDER_NODE_DEFAULT = "/dev/dri/renderD128"
+
+
+def _dri_render_node() -> str:
+    """The GPU render node this deployment uses, from KASM_DRINODE.
+
+    One resolver for the whole manager, not one per consumer: Xvnc captures and
+    encodes on this node (-drinode) and Chromium rasterises on it, and a
+    deployment that pointed them at different GPUs would look accelerated on
+    both halves while paying a cross-device copy for every frame.
+    """
+    return os.environ.get("KASM_DRINODE", DRI_RENDER_NODE_DEFAULT)
+
+
 def _dri_driver(node: str) -> str | None:
     """Driver name for a DRI render node, or None if unresolvable in-container."""
     try:
@@ -506,7 +520,7 @@ def _hw3d_flags() -> list[str]:
         # driver without DRI3.
         logger.warning("Unknown KASM_HW3D=%r, falling back to 'auto'", raw)
         mode = "auto"
-    node = os.environ.get("KASM_DRINODE", "/dev/dri/renderD128")
+    node = _dri_render_node()
     if not os.path.exists(node):
         logger.info("KasmVNC hw3d disabled: %s not present", node)
         return []

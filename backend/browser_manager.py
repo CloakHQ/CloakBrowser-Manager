@@ -16,7 +16,12 @@ from typing import Any, Callable
 
 from cloakbrowser import launch_persistent_context_async
 
-from .vnc_manager import VNCManager
+# _dri_driver reads the driver behind a render node, and the node itself comes
+# from the same KASM_DRINODE that Xvnc's -drinode uses. Imported rather than
+# reimplemented precisely so the two cannot disagree about which GPU is in play:
+# Chromium drawing on one device while Xvnc captures and encodes on another is a
+# silent half-accelerated session.
+from .vnc_manager import VNCManager, _dri_driver, _dri_render_node
 from .viewer_tokens import viewer_tokens
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
@@ -36,6 +41,14 @@ class ProfileAlreadyRunning(RuntimeError):
 # that shows up as a blank viewer, so the flag stays the explicit default.
 _GPU_MODE_SWIFTSHADER = "swiftshader"
 _GPU_MODE_NVIDIA = "nvidia"
+# Intel and AMD integrated (or discrete) GPUs driven by the open-source Mesa
+# stack. One mode for both vendors because nothing below this line differs
+# between them: the same ANGLE backend, the same GLVND loader, the same DRI3
+# render node, and — unlike NVIDIA — the same VAAPI encoder name in KasmVNC
+# (h264_vaapi). Only the userspace driver the loader picks up differs (iHD or
+# i965 for Intel, radeonsi for AMD), and that is chosen by the kernel driver
+# behind the render node, not by us.
+_GPU_MODE_IGPU = "igpu"
 
 # Presence of the NVIDIA control device is the detection signal. It is created
 # by the NVIDIA container runtime as part of the same injection that supplies
@@ -109,46 +122,153 @@ _NVIDIA_GPU_ENV = {
     "__EGL_VENDOR_LIBRARY_FILENAMES": "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
 }
 
+# Chromium flags for the Mesa path (Intel/AMD). The shape mirrors the NVIDIA set
+# and the single difference — the ANGLE backend — is the whole difficulty, since
+# it cannot be settled once for "integrated GPUs" the way it was settled for one
+# NVIDIA card:
+#
+#   gl-egl   reaches the GPU through the system libEGL.so.1 -> libEGL_mesa ->
+#            EGL's X11 platform -> DRI3. Under KasmVNC that DRI3 exists only
+#            because Xvnc was started with -hw3d, which _hw3d_flags() enables by
+#            default on any render node that is NOT the closed NVIDIA driver.
+#            That is precisely the asymmetry with the NVIDIA path: gl-egl is the
+#            silent-llvmpipe trap there because there is no DRI3 to reach, and a
+#            live candidate here because there is.
+#   vulkan   reaches it through radv (AMD) or anv (Intel) and needs nothing
+#            GPU-capable from the X server at all. This is what wins on NVIDIA.
+#   gl       ANGLE over desktop GL via GLX; kept selectable because a host whose
+#            Mesa EGL is broken can still have a working GLX.
+#
+# Which one actually binds hardware varies by kernel driver, Mesa version and
+# how much of DRI3 the X server implements, and getting it wrong is SILENT:
+# llvmpipe on the CPU with the GPU attached and idle, which chrome://gpu still
+# reports as "enabled" (see _SOFTWARE_RENDERER_MARKERS in scripts/gpu_probe.py).
+# So this is a knob with a default rather than a constant, and
+# `gpu_probe.py --vendor igpu --angle-backend <name>` is how it gets settled on
+# a host before that host is trusted.
+_IGPU_ANGLE_BACKEND_DEFAULT = "gl-egl"
+# swiftshader is deliberately NOT accepted here. It is a valid --use-angle value
+# and would be taken by Chromium, so allowing it would let a deployment claim
+# CHROME_GPU_ACCEL=igpu while rasterising every frame on the CPU — the exact
+# failure this whole module is arranged to make impossible to have by accident.
+_IGPU_ANGLE_BACKENDS = ("gl-egl", "vulkan", "gl")
+
+# No environment overlay for this mode, unlike NVIDIA's. The NVIDIA one exists
+# because the container runtime injects 10_nvidia.json NEXT TO Mesa's
+# 50_mesa.json and GLVND then has a real choice to get wrong. The iGPU image
+# installs no second EGL vendor, and a host that has both a Mesa render node and
+# an NVIDIA card resolves to _GPU_MODE_NVIDIA below before reaching this path —
+# so there is nothing to disambiguate, and pinning a manifest we did not install
+# would only be able to break EGL outright.
+_IGPU_GPU_ENV: dict[str, str] = {}
+
+# Values that name a mode outright. The truthy generic spellings stay bound to
+# NVIDIA for backwards compatibility — that is what they have always meant, and
+# repointing them at the Mesa path would silently change the backend on an
+# existing NVIDIA deployment that spells it CHROME_GPU_ACCEL=1.
+_GPU_MODE_ALIASES = {
+    "0": _GPU_MODE_SWIFTSHADER, "false": _GPU_MODE_SWIFTSHADER,
+    "no": _GPU_MODE_SWIFTSHADER, "off": _GPU_MODE_SWIFTSHADER,
+    _GPU_MODE_SWIFTSHADER: _GPU_MODE_SWIFTSHADER,
+    "1": _GPU_MODE_NVIDIA, "true": _GPU_MODE_NVIDIA, "yes": _GPU_MODE_NVIDIA,
+    "on": _GPU_MODE_NVIDIA, _GPU_MODE_NVIDIA: _GPU_MODE_NVIDIA,
+    _GPU_MODE_IGPU: _GPU_MODE_IGPU, "vaapi": _GPU_MODE_IGPU,
+    "mesa": _GPU_MODE_IGPU, "intel": _GPU_MODE_IGPU, "amd": _GPU_MODE_IGPU,
+}
+
+
+def _igpu_angle_backend() -> str:
+    """ANGLE backend for the Mesa path, from CHROME_ANGLE_BACKEND."""
+    raw = os.environ.get(
+        "CHROME_ANGLE_BACKEND", _IGPU_ANGLE_BACKEND_DEFAULT,
+    ).strip().lower()
+    if raw not in _IGPU_ANGLE_BACKENDS:
+        logger.warning(
+            "Unknown CHROME_ANGLE_BACKEND=%r (accepted: %s), using %r",
+            raw, ", ".join(_IGPU_ANGLE_BACKENDS), _IGPU_ANGLE_BACKEND_DEFAULT,
+        )
+        return _IGPU_ANGLE_BACKEND_DEFAULT
+    return raw
+
 
 def _chrome_gpu_mode() -> str:
-    """Resolve CHROME_GPU_ACCEL (auto/1/true/yes/nvidia/0/false/no) to a mode."""
+    """Resolve CHROME_GPU_ACCEL to a mode: swiftshader, nvidia or igpu."""
     raw = os.environ.get("CHROME_GPU_ACCEL", "auto").strip().lower()
-    if raw in ("0", "false", "no", "off", _GPU_MODE_SWIFTSHADER):
+    forced = _GPU_MODE_ALIASES.get(raw)
+    if forced == _GPU_MODE_SWIFTSHADER:
         logger.info("Chromium GPU acceleration disabled (CHROME_GPU_ACCEL=%s)", raw)
         return _GPU_MODE_SWIFTSHADER
-    if raw in ("1", "true", "yes", "on", _GPU_MODE_NVIDIA):
+    if forced is not None:
         # Forced: no device check. Someone who passes the GPU in a way this
         # detection does not recognise should still be able to say so.
-        logger.info("Chromium NVIDIA GPU acceleration forced (CHROME_GPU_ACCEL=%s)", raw)
-        return _GPU_MODE_NVIDIA
+        logger.info(
+            "Chromium %s GPU acceleration forced (CHROME_GPU_ACCEL=%s)", forced, raw,
+        )
+        return forced
     if raw != "auto":
         # An unrecognised value used to be impossible to notice: it would fall
         # through to whichever branch happened to be last.
         logger.warning("Unknown CHROME_GPU_ACCEL=%r, falling back to 'auto'", raw)
     if os.path.exists(_NVIDIA_CONTROL_DEVICE):
+        # Tested FIRST, and not merely for tidiness: the NVIDIA container runtime
+        # injects a render node too, so an NVIDIA host also satisfies the DRI
+        # check below — and would then be handed the Mesa flag set, which on the
+        # closed driver means llvmpipe.
         logger.info(
             "Chromium NVIDIA GPU acceleration enabled (auto: %s present)",
             _NVIDIA_CONTROL_DEVICE,
         )
         return _GPU_MODE_NVIDIA
+    node = _dri_render_node()
+    if os.path.exists(node):
+        # An unresolvable driver counts as Mesa. /sys is frequently not
+        # introspectable from inside a container, and the one driver this has to
+        # exclude — nvidia — was already excluded by the device check above,
+        # which the runtime that injects that driver always satisfies.
+        driver = _dri_driver(node)
+        if driver != "nvidia":
+            logger.info(
+                "Chromium integrated-GPU acceleration enabled (auto: %s present, "
+                "driver=%s, ANGLE backend=%s)",
+                node, driver or "unknown", _igpu_angle_backend(),
+            )
+            return _GPU_MODE_IGPU
+        logger.info(
+            "Chromium GPU acceleration off (auto: %s is driven by the closed "
+            "nvidia driver but %s is absent, so Mesa cannot use it and the "
+            "NVIDIA userspace was not injected)",
+            node, _NVIDIA_CONTROL_DEVICE,
+        )
+        return _GPU_MODE_SWIFTSHADER
     logger.info(
-        "Chromium GPU acceleration off (auto: no %s, so no GPU was passed in)",
-        _NVIDIA_CONTROL_DEVICE,
+        "Chromium GPU acceleration off (auto: neither %s nor %s, so no GPU was "
+        "passed in)", _NVIDIA_CONTROL_DEVICE, node,
     )
     return _GPU_MODE_SWIFTSHADER
 
 
 def _chrome_gpu_flags() -> list[str]:
     """Chromium GL flags for the resolved GPU mode."""
-    if _chrome_gpu_mode() == _GPU_MODE_NVIDIA:
+    mode = _chrome_gpu_mode()
+    if mode == _GPU_MODE_NVIDIA:
         return list(_NVIDIA_GPU_FLAGS)
+    if mode == _GPU_MODE_IGPU:
+        return [
+            "--use-gl=angle",
+            f"--use-angle={_igpu_angle_backend()}",
+            "--enable-gpu-rasterization",
+            "--ignore-gpu-blocklist",
+        ]
     return ["--use-angle=swiftshader"]
 
 
 def _chrome_gpu_env() -> dict[str, str]:
     """Environment overlay for the resolved GPU mode (see _NVIDIA_GPU_ENV)."""
-    if _chrome_gpu_mode() == _GPU_MODE_NVIDIA:
+    mode = _chrome_gpu_mode()
+    if mode == _GPU_MODE_NVIDIA:
         return dict(_NVIDIA_GPU_ENV)
+    if mode == _GPU_MODE_IGPU:
+        return dict(_IGPU_GPU_ENV)
     return {}
 
 

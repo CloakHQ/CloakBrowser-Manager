@@ -17,6 +17,7 @@ import pytest
 import socket
 
 from backend import browser_manager as bm
+from backend.vnc_manager import DRI_RENDER_NODE_DEFAULT
 from backend.browser_manager import (
     BASE_CDP_PORT,
     CDP_PORT_RANGE,
@@ -217,6 +218,145 @@ def test_nvidia_backend_is_vulkan_not_gl_egl():
     """
     assert "--use-angle=vulkan" in bm._NVIDIA_GPU_FLAGS
     assert "--use-angle=gl-egl" not in bm._NVIDIA_GPU_FLAGS
+
+
+# ── the Mesa / integrated-GPU mode ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("value", ["igpu", "vaapi", "mesa", "intel", "amd"])
+def test_gpu_mode_igpu_forced_values_skip_device_detection(
+    monkeypatch: pytest.MonkeyPatch, value: str,
+):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", value)
+    monkeypatch.setattr(bm.os.path, "exists", lambda _: False)
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_IGPU
+
+
+@pytest.mark.parametrize("driver", ["amdgpu", "i915", "xe", None])
+def test_gpu_mode_auto_detects_a_mesa_render_node(
+    monkeypatch: pytest.MonkeyPatch, driver: str | None,
+):
+    """An unresolvable driver counts as Mesa.
+
+    /sys is often not introspectable from inside a container, and the only
+    driver this has to exclude is nvidia — whose runtime always creates
+    /dev/nvidiactl, which is checked first.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "auto")
+    monkeypatch.setattr(
+        bm.os.path, "exists", lambda p: p == DRI_RENDER_NODE_DEFAULT,
+    )
+    monkeypatch.setattr(bm, "_dri_driver", lambda _n: driver)
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_IGPU
+
+
+def test_gpu_mode_auto_prefers_nvidia_when_both_devices_exist(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The NVIDIA runtime injects a render node too.
+
+    So an NVIDIA host satisfies the DRI check as well, and testing it second is
+    what stops it being handed the Mesa flag set — which on the closed driver
+    means llvmpipe with the GPU idle.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "auto")
+    monkeypatch.setattr(bm.os.path, "exists", lambda _: True)
+    monkeypatch.setattr(bm, "_dri_driver", lambda _n: "amdgpu")
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_NVIDIA
+
+
+def test_gpu_mode_auto_nvidia_render_node_without_the_control_device(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A render node Mesa cannot drive, and no injected NVIDIA userspace.
+
+    Neither path can reach this GPU, so claiming acceleration would be the
+    silent-llvmpipe failure rather than a degraded version of it.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "auto")
+    monkeypatch.setattr(
+        bm.os.path, "exists", lambda p: p == DRI_RENDER_NODE_DEFAULT,
+    )
+    monkeypatch.setattr(bm, "_dri_driver", lambda _n: "nvidia")
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_SWIFTSHADER
+
+
+def test_gpu_mode_auto_honours_kasm_drinode(monkeypatch: pytest.MonkeyPatch):
+    """Chromium must probe the SAME node Xvnc encodes on.
+
+    Two GPUs and two different nodes would look accelerated on both halves
+    while paying a cross-device copy per frame, which is why one resolver
+    (vnc_manager._dri_render_node) serves both.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "auto")
+    monkeypatch.setenv("KASM_DRINODE", "/dev/dri/renderD129")
+    monkeypatch.setattr(
+        bm.os.path, "exists", lambda p: p == "/dev/dri/renderD129",
+    )
+    monkeypatch.setattr(bm, "_dri_driver", lambda _n: "amdgpu")
+    assert bm._chrome_gpu_mode() == bm._GPU_MODE_IGPU
+
+
+def test_igpu_flags_default_to_gl_egl(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "igpu")
+    monkeypatch.delenv("CHROME_ANGLE_BACKEND", raising=False)
+    flags = bm._chrome_gpu_flags()
+    assert flags == [
+        "--use-gl=angle", "--use-angle=gl-egl",
+        "--enable-gpu-rasterization", "--ignore-gpu-blocklist",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["gl-egl", "vulkan", "gl"])
+def test_igpu_angle_backend_is_selectable(
+    monkeypatch: pytest.MonkeyPatch, backend: str,
+):
+    """Which backend reaches the GPU varies by driver and Mesa version.
+
+    And the wrong one fails silently, so it has to be changeable on a host
+    without a rebuild.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "igpu")
+    monkeypatch.setenv("CHROME_ANGLE_BACKEND", backend)
+    flags = bm._chrome_gpu_flags()
+    assert f"--use-angle={backend}" in flags
+    # Chromium takes the LAST --use-angle, so exactly one may be emitted.
+    assert len([f for f in flags if f.startswith("--use-angle=")]) == 1
+
+
+def test_igpu_angle_backend_refuses_swiftshader(
+    monkeypatch: pytest.MonkeyPatch, caplog,
+):
+    """The one value that would make CHROME_GPU_ACCEL=igpu a lie.
+
+    swiftshader is a legal --use-angle value, so without the allow-list it
+    would be passed through and every frame would rasterise on the CPU under a
+    configuration that says otherwise.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "igpu")
+    monkeypatch.setenv("CHROME_ANGLE_BACKEND", "swiftshader")
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.browser"):
+        flags = bm._chrome_gpu_flags()
+    assert "--use-angle=swiftshader" not in flags
+    assert f"--use-angle={bm._IGPU_ANGLE_BACKEND_DEFAULT}" in flags
+    assert "Unknown CHROME_ANGLE_BACKEND" in caplog.text
+
+
+def test_igpu_mode_sets_no_egl_vendor_override(monkeypatch: pytest.MonkeyPatch):
+    """NVIDIA's pin exists because its ICD lands beside Mesa's.
+
+    The iGPU image installs no second EGL vendor, so pinning a manifest it did
+    not install could only break EGL outright.
+    """
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "igpu")
+    assert bm._chrome_gpu_env() == {}
+
+
+def test_build_args_uses_igpu_flags_when_selected(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "igpu")
+    args = _mgr._build_fingerprint_args({})
+    assert "--use-gl=angle" in args
+    assert "--use-angle=swiftshader" not in args
 
 
 def test_build_args_seed():
