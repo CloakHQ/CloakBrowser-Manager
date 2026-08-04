@@ -123,30 +123,36 @@ _NVIDIA_GPU_ENV = {
 }
 
 # Chromium flags for the Mesa path (Intel/AMD). The shape mirrors the NVIDIA set
-# and the single difference — the ANGLE backend — is the whole difficulty, since
-# it cannot be settled once for "integrated GPUs" the way it was settled for one
-# NVIDIA card:
+# and the single difference is the ANGLE backend — which lands on the SAME answer
+# as NVIDIA for a different reason, and that is worth knowing because the obvious
+# expectation is the opposite.
 #
-#   gl-egl   reaches the GPU through the system libEGL.so.1 -> libEGL_mesa ->
-#            EGL's X11 platform -> DRI3. Under KasmVNC that DRI3 exists only
-#            because Xvnc was started with -hw3d, which _hw3d_flags() enables by
-#            default on any render node that is NOT the closed NVIDIA driver.
-#            That is precisely the asymmetry with the NVIDIA path: gl-egl is the
-#            silent-llvmpipe trap there because there is no DRI3 to reach, and a
-#            live candidate here because there is.
-#   vulkan   reaches it through radv (AMD) or anv (Intel) and needs nothing
-#            GPU-capable from the X server at all. This is what wins on NVIDIA.
-#   gl       ANGLE over desktop GL via GLX; kept selectable because a host whose
-#            Mesa EGL is broken can still have a working GLX.
+# Measured headed on KasmVNC's Xvnc (-hw3d on), AMD Raphael iGPU, Mesa 25.0.7,
+# via CDP SystemInfo.getInfo — all three ANGLE backends, same host, same session:
 #
-# Which one actually binds hardware varies by kernel driver, Mesa version and
-# how much of DRI3 the X server implements, and getting it wrong is SILENT:
-# llvmpipe on the CPU with the GPU attached and idle, which chrome://gpu still
-# reports as "enabled" (see _SOFTWARE_RENDERER_MARKERS in scripts/gpu_probe.py).
-# So this is a knob with a default rather than a constant, and
-# `gpu_probe.py --vendor igpu --angle-backend <name>` is how it gets settled on
-# a host before that host is trusted.
-_IGPU_ANGLE_BACKEND_DEFAULT = "gl-egl"
+#   gl-egl   ANGLE (AMD, ... radeonsi raphael_mendocino ..., OpenGL ES 3.2 Mesa)
+#            webgl=enabled_READBACK, gpu_compositing=DISABLED_SOFTWARE
+#   vulkan   ANGLE (AMD, Vulkan 1.4.305 (RADV RAPHAEL_MENDOCINO), radv-25.0.7)
+#            webgl=enabled,          gpu_compositing=ENABLED,
+#            rasterization=enabled_force, webgpu=enabled
+#   gl       Chromium never reached CDP at all — the probe timed out at 45s
+#
+# So gl-egl is not the silent-llvmpipe trap here that it is on NVIDIA: DRI3 does
+# exist on an open-source driver (that is what -hw3d supplies, and _hw3d_flags()
+# enables it by default on any render node that is not the closed NVIDIA one), so
+# EGL's X11 platform genuinely reaches radeonsi. It just stops one step short —
+# the renderer is the GPU and the compositor still reads every frame back through
+# the CPU. Vulkan gets both halves, exactly as on NVIDIA, so it is the default.
+#
+# It stays a knob rather than becoming a constant because the failure mode is
+# SILENT and the answer is per-host: a GPU whose Mesa build has no Vulkan driver
+# does not fall back to gl-egl, it falls back to llvmpipe on the CPU — which
+# chrome://gpu still reports as "enabled" (see _SOFTWARE_RENDERER_MARKERS in
+# scripts/gpu_probe.py). `gpu_probe.py --vendor igpu --angle-backend <name>` is
+# how a new host gets settled before it is trusted. gl is kept selectable despite
+# failing outright above: that failure is LOUD (no browser at all), which makes
+# it a safe thing to leave available and a useless thing to fall back to.
+_IGPU_ANGLE_BACKEND_DEFAULT = "vulkan"
 # swiftshader is deliberately NOT accepted here. It is a valid --use-angle value
 # and would be taken by Chromium, so allowing it would let a deployment claim
 # CHROME_GPU_ACCEL=igpu while rasterising every frame on the CPU — the exact

@@ -19,10 +19,12 @@
 #     _hw3d_flags() enables it automatically on any render node whose driver is
 #     not `nvidia`. Nothing to configure; KASM_HW3D=0 turns it off.
 #
-#   Chromium GPU         — YES, through Mesa. Which ANGLE backend actually
-#     reaches the GPU is host-specific and fails SILENTLY when wrong (llvmpipe
-#     on the CPU, which chrome://gpu still calls "enabled"), so it is a knob:
-#     CHROME_ANGLE_BACKEND, default gl-egl, and
+#   Chromium GPU         — YES, through Mesa, on ANGLE's Vulkan backend (radv or
+#     anv). Measured on an AMD Raphael iGPU: vulkan gives webgl=enabled +
+#     gpu_compositing=enabled, while the more obvious gl-egl reaches radeonsi and
+#     then composites every frame back through the CPU
+#     (gpu_compositing=disabled_software). Host-specific and silent when wrong, so
+#     it stays a knob: CHROME_ANGLE_BACKEND, and
 #     `gpu_probe.py --vendor igpu --angle-backend <name>` settles it.
 #
 #   Chromium video decode — no. Left alone deliberately: VA-API decode in

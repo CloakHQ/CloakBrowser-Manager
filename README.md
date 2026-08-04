@@ -111,7 +111,7 @@ A profile with **Headless** enabled starts no Xvnc and allocates no display or W
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
 | `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI. Chromium probes the same node, so both halves stay on one GPU. |
 | `CHROME_GPU_ACCEL` | `auto` | Chromium GL backend. `auto` picks the NVIDIA path when `/dev/nvidiactl` is present, else the Mesa path when `KASM_DRINODE` exists and is not driven by `nvidia`, else SwiftShader. `1`/`nvidia` forces the NVIDIA path without the device check; `igpu`/`vaapi`/`mesa`/`intel`/`amd` force the Mesa one; `0` forces SwiftShader. |
-| `CHROME_ANGLE_BACKEND` | `gl-egl` | ANGLE backend for the Mesa path only: `gl-egl`, `vulkan`, `gl`. Which one reaches the GPU is per-driver and fails silently — settle it with `gpu_probe.py --vendor igpu --angle-backend <name>`. `swiftshader` is refused. |
+| `CHROME_ANGLE_BACKEND` | `vulkan` | ANGLE backend for the Mesa path only: `vulkan`, `gl-egl`, `gl`. Which one reaches the GPU is per-driver and fails silently — settle it with `gpu_probe.py --vendor igpu --angle-backend <name>`. `swiftshader` is refused. |
 | `KASM_RECT_THREADS` | *(ignored)* | No effect on KasmVNC 1.5.0 — `-RectThreads` parses but nothing reads it; encoder threads are sized to the host core count. Cap encoder CPU with the container's `--cpus`/cpuset. |
 
 ### GPU acceleration (optional)
@@ -161,13 +161,20 @@ What it turns on:
 
 Two things to know, and both fail silently:
 
-- **The ANGLE backend is per-host.** `gl-egl` (the default) reaches the GPU through
-  the system `libEGL.so.1` → `libEGL_mesa` → EGL's X11 platform → DRI3, which only
-  exists because `-hw3d` is on. `vulkan` reaches it through radv/anv and needs
-  nothing from the X server. Which one binds hardware varies by kernel driver and
-  Mesa version, and the wrong one gives you `ANGLE (Mesa, llvmpipe)` on the CPU —
-  which `chrome://gpu` still reports as "enabled". Settle it with the probe before
-  trusting a new host.
+- **`gl-egl` reaches the GPU and still composites on the CPU.** Measured headed on
+  Xvnc with `-hw3d`, AMD Raphael iGPU, Mesa 25.0.7 — all three backends, same host:
+
+  | `CHROME_ANGLE_BACKEND` | renderer bound | `webgl` | `gpu_compositing` |
+  |---|---|---|---|
+  | `gl-egl` | `ANGLE (AMD, … radeonsi raphael_mendocino …, OpenGL ES 3.2 Mesa)` | `enabled_readback` | `disabled_software` |
+  | `vulkan` (default) | `ANGLE (AMD, Vulkan 1.4.305 (RADV RAPHAEL_MENDOCINO), radv-25.0.7)` | `enabled` | `enabled` |
+  | `gl` | Chromium never reached CDP (45s timeout) | — | — |
+
+  Unlike the NVIDIA path, `gl-egl` is not a software trap here — DRI3 genuinely
+  exists on an open-source driver, which is what `-hw3d` supplies — it just stops
+  one step short. `vulkan` gets both halves. Keep it unless the probe says
+  otherwise on your hardware; a Mesa build with no Vulkan driver falls back to
+  llvmpipe on the CPU, not to `gl-egl`.
 - **`llvmpipe` is Mesa too.** Any check that looks for "Mesa" in the renderer
   string passes on the software rasteriser. The probe keys on the vendor name
   (`AMD`, `Intel`) *and* the absence of a software marker.

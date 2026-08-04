@@ -297,12 +297,21 @@ def test_gpu_mode_auto_honours_kasm_drinode(monkeypatch: pytest.MonkeyPatch):
     assert bm._chrome_gpu_mode() == bm._GPU_MODE_IGPU
 
 
-def test_igpu_flags_default_to_gl_egl(monkeypatch: pytest.MonkeyPatch):
+def test_igpu_flags_default_to_vulkan(monkeypatch: pytest.MonkeyPatch):
+    """gl-egl reaches the GPU here and still composites through the CPU.
+
+    Measured on an AMD Raphael iGPU under Xvnc with -hw3d, Mesa 25.0.7:
+    gl-egl bound radeonsi but reported webgl=enabled_readback and
+    gpu_compositing=disabled_software; vulkan bound radv and reported
+    webgl=enabled with gpu_compositing=enabled. So the default is not the
+    "obvious" Mesa EGL path — asserting the exact list is what keeps a
+    plausible-looking edit from quietly halving the acceleration.
+    """
     monkeypatch.setenv("CHROME_GPU_ACCEL", "igpu")
     monkeypatch.delenv("CHROME_ANGLE_BACKEND", raising=False)
     flags = bm._chrome_gpu_flags()
     assert flags == [
-        "--use-gl=angle", "--use-angle=gl-egl",
+        "--use-gl=angle", "--use-angle=vulkan",
         "--enable-gpu-rasterization", "--ignore-gpu-blocklist",
     ]
 
