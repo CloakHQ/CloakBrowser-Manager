@@ -109,8 +109,9 @@ A profile with **Headless** enabled starts no Xvnc and allocates no display or W
 | `KASM_VIDEO_CODEC` | `h264` | Encoder offered under `KASM_ENCODING_POLICY=video`. Software: `h264`, `h265`, `av1`. VAAPI (Intel/AMD): `h264_vaapi`, `h265_vaapi`, `av1_vaapi`. NVENC (NVIDIA): `h264_nvenc`, `h265_nvenc`/`hevc_nvenc`, `av1_nvenc`. `auto` is refused — it lets the client pick, including software AV1. |
 | `KASM_XVNC_LOG_LEVEL` | `30` | Xvnc log verbosity (0-100). Raise to `100` to see per-connection encoder decisions in `/tmp/xvnc-<display>.log`. |
 | `KASM_HW3D` | `auto` | DRI3 GPU acceleration: `auto` (enable unless NVIDIA proprietary), `1` (force), `0` (disable) |
-| `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI |
-| `CHROME_GPU_ACCEL` | `auto` | Chromium GL backend. `auto` uses the NVIDIA GPU when one is present in the container (`/dev/nvidiactl`), else SwiftShader. `1`/`nvidia` forces it without the device check, `0` forces SwiftShader. |
+| `KASM_DRINODE` | `/dev/dri/renderD128` | GPU render node for DRI3/VAAPI. Chromium probes the same node, so both halves stay on one GPU. |
+| `CHROME_GPU_ACCEL` | `auto` | Chromium GL backend. `auto` picks the NVIDIA path when `/dev/nvidiactl` is present, else the Mesa path when `KASM_DRINODE` exists and is not driven by `nvidia`, else SwiftShader. `1`/`nvidia` forces the NVIDIA path without the device check; `igpu`/`vaapi`/`mesa`/`intel`/`amd` force the Mesa one; `0` forces SwiftShader. |
+| `CHROME_ANGLE_BACKEND` | `gl-egl` | ANGLE backend for the Mesa path only: `gl-egl`, `vulkan`, `gl`. Which one reaches the GPU is per-driver and fails silently — settle it with `gpu_probe.py --vendor igpu --angle-backend <name>`. `swiftshader` is refused. |
 | `KASM_RECT_THREADS` | *(ignored)* | No effect on KasmVNC 1.5.0 — `-RectThreads` parses but nothing reads it; encoder threads are sized to the host core count. Cap encoder CPU with the container's `--cpus`/cpuset. |
 
 ### GPU acceleration (optional)
@@ -129,7 +130,67 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 
 Without a GPU everything still works (software encoding).
 
-VAAPI hardware *video* encode only comes into play with `KASM_ENCODING_POLICY=video`; under the default policy the GPU accelerates screen capture only, because no video codec is negotiated.
+This overlay buys DRI3 screen **capture** and nothing else. Hardware *video encode*
+needs `KASM_ENCODING_POLICY=video` (no codec is negotiated at all under the
+default policy), and Chromium needs Mesa userspace the base image does not carry
+— use `docker-compose.igpu.yml` below for either.
+
+### Intel / AMD integrated GPU (VAAPI encode + Chromium acceleration)
+
+Needs a `/dev/dri` render node driven by the open-source stack — `i915`/`xe` for
+Intel, `amdgpu` for AMD. Nothing else on the host: unlike the NVIDIA path, the
+whole userspace is baked into the image and reaches the GPU through the mapped
+render node.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.igpu.yml up -d --build
+```
+
+This overlay defaults to `KASM_ENCODING_POLICY=video` and
+`KASM_VIDEO_CODEC=h264_vaapi,h264`, because under the repo-wide default policy no
+video codec is ever negotiated and the GPU encoder could not engage at all.
+
+What it turns on:
+
+| | Accelerated? | Notes |
+|---|---|---|
+| KasmVNC video encode | **Yes — VAAPI** | Xvnc encodes the framebuffer on the GPU (`h264_vaapi`). Needs `VAProfileH264*` + `VAEntrypointEncSlice` on the device — check with `vainfo`. |
+| KasmVNC `-hw3d` screen capture | **Yes — DRI3** | Implemented by the open-source drivers, so `KASM_HW3D=auto` enables it. This is also what gives the X server the DRI3 that ANGLE's `gl-egl` backend needs. |
+| Chromium WebGL / raster / compositing | **Yes — ANGLE + Mesa** | Backend selected by `CHROME_ANGLE_BACKEND`; see below. |
+| Chromium video *decode* | No | Left off deliberately — VA-API decode in Chromium wants to import the decoded frame for compositing, and through a virtual X server that trades working playback for a benchmark. |
+
+Two things to know, and both fail silently:
+
+- **The ANGLE backend is per-host.** `gl-egl` (the default) reaches the GPU through
+  the system `libEGL.so.1` → `libEGL_mesa` → EGL's X11 platform → DRI3, which only
+  exists because `-hw3d` is on. `vulkan` reaches it through radv/anv and needs
+  nothing from the X server. Which one binds hardware varies by kernel driver and
+  Mesa version, and the wrong one gives you `ANGLE (Mesa, llvmpipe)` on the CPU —
+  which `chrome://gpu` still reports as "enabled". Settle it with the probe before
+  trusting a new host.
+- **`llvmpipe` is Mesa too.** Any check that looks for "Mesa" in the renderer
+  string passes on the software rasteriser. The probe keys on the vendor name
+  (`AMD`, `Intel`) *and* the absence of a software marker.
+
+Verify it end to end (expected to fail without a render node):
+
+```bash
+docker run --rm --device /dev/dri:/dev/dri -v "$PWD":/repo:ro \
+  --entrypoint python cloakbrowser-manager-manager:latest \
+  /repo/scripts/gpu_probe.py --vendor igpu
+```
+
+It asserts libva and the EGL loader, that the driver has an H.264 **encode**
+entrypoint (`vainfo`), the encoder KasmVNC actually selected, and the renderer
+Chromium actually bound. Add `--angle-backend vulkan` (or `gl`) to compare
+backends on a host where the default lands on llvmpipe.
+
+Two live checks on a running session:
+
+```bash
+docker exec <container> grep "acceleration capability" /tmp/xvnc-100.log   # must not say "none"
+docker exec <container> grep -c FFMPEGHWEncoder /tmp/xvnc-100.log          # frames on the GPU encoder
+```
 
 ### NVIDIA GPU (NVENC encode + Chromium acceleration)
 
@@ -159,7 +220,8 @@ Verify it end to end with the bundled probe (expected to fail without a GPU):
 
 ```bash
 docker run --rm --gpus all -v "$PWD":/repo:ro \
-  --entrypoint python cloakbrowser-manager-manager:latest /repo/scripts/gpu_probe.py
+  --entrypoint python cloakbrowser-manager-manager:latest \
+  /repo/scripts/gpu_probe.py --vendor nvidia
 ```
 
 It asserts the driver libraries, the EGL loader, the encoder KasmVNC actually selected, and the renderer Chromium actually bound — not `chrome://gpu`'s feature table, which reports "enabled" for llvmpipe and SwiftShader alike.
@@ -328,6 +390,10 @@ compose network. Combine with GPU support by listing both overlays, tunnel last:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
+               -f docker-compose.tunnel.yml up -d --build
+
+# or, on an Intel/AMD integrated GPU
+docker compose -f docker-compose.yml -f docker-compose.igpu.yml \
                -f docker-compose.tunnel.yml up -d --build
 ```
 

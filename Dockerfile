@@ -74,12 +74,6 @@ WORKDIR /app
 COPY backend/requirements.txt /app/backend/
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Backend code
-COPY backend/ /app/backend/
-
-# Frontend build from stage 1
-COPY --from=frontend-builder /build/dist /app/frontend/dist
-
 # Pre-download CloakBrowser binary.
 #
 # The key has to be in the environment of THIS stage, and before this RUN.
@@ -97,6 +91,15 @@ COPY --from=frontend-builder /build/dist /app/frontend/dist
 ARG CLOAKBROWSER_LICENSE_KEY
 ENV CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY}
 RUN python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
+
+# Application code AFTER the download above, not before it. ensure_binary()
+# needs only the pip layer (the `cloakbrowser` package), never this source, so
+# copying it first bought nothing and cost the whole 337MB download on every
+# edit of a Python file — which is most edits, and which turns a 20s rebuild
+# into a 2.5 minute one. Same reasoning as the nginx.conf/entrypoint.sh copies
+# at the bottom of this file, one layer earlier.
+COPY backend/ /app/backend/
+COPY --from=frontend-builder /build/dist /app/frontend/dist
 
 # A placeholder self-signed cert, so the shipped nginx.conf validates in ANY
 # container and not only one the entrypoint has initialised: nginx refuses to
