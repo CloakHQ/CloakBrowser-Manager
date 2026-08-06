@@ -21,6 +21,7 @@ vi.mock("./lib/api", () => {
       profileStatus: vi.fn(),
       createViewerToken: vi.fn(),
       launchProfile: vi.fn(),
+      stopProfile: vi.fn(),
       logout: vi.fn(),
       // ProfileForm (rendered by the "edit"/"create" views) fetches these on
       // mount regardless of what a given test is exercising.
@@ -189,6 +190,88 @@ describe("cookie warmup control in the top bar", () => {
     });
     await flush();
     expect(screen.queryByRole("button", { name: /warm up cookies/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("Restart button", () => {
+  it("shows Restart for a running profile, not for a stopped one", async () => {
+    mockApi.listProfiles.mockResolvedValue([profile("running")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.getByRole("button", { name: /^restart$/i })).toBeInTheDocument();
+
+    mockApi.listProfiles.mockResolvedValue([profile("stopped")]);
+    await act(async () => {
+      vi.advanceTimersByTime(3_000);
+    });
+    await flush();
+    expect(screen.queryByRole("button", { name: /^restart$/i })).not.toBeInTheDocument();
+  });
+
+  it("stops then relaunches, showing one Restarting state throughout", async () => {
+    mockApi.listProfiles.mockResolvedValue([profile("running")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+
+    let resolveStop: () => void = () => {};
+    mockApi.stopProfile.mockImplementation(
+      () => new Promise<{ ok: boolean }>((resolve) => {
+        resolveStop = () => resolve({ ok: true });
+      }),
+    );
+    mockApi.launchProfile.mockResolvedValue({ profile_id: "p1", status: "running" });
+    mockApi.createViewerToken.mockResolvedValue({
+      token: "tok-restart", viewer_url: "/viewer/tok-restart/", expires_in: 3600,
+    });
+
+    const clickPromise = act(async () => {
+      screen.getByRole("button", { name: /^restart$/i }).click();
+    });
+    await flush();
+
+    // Mid-flight: exactly one busy control, not Stop/Launch flashing too.
+    expect(screen.getByRole("button", { name: /restarting/i })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^launch$/i })).not.toBeInTheDocument();
+
+    resolveStop();
+    await clickPromise;
+    await flush();
+
+    expect(mockApi.stopProfile).toHaveBeenCalledWith("p1");
+    expect(mockApi.launchProfile).toHaveBeenCalledWith("p1");
+    expect(screen.getByRole("button", { name: /^restart$/i })).not.toBeDisabled();
+  });
+
+  it("headless: restarting stays on the edit form instead of opening a viewer", async () => {
+    mockApi.listProfiles.mockResolvedValue([
+      { ...profile("running"), headless: true, vnc_ws_port: null, cdp_url: "/api/profiles/p1/cdp" },
+    ]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+
+    mockApi.stopProfile.mockResolvedValue({ ok: true });
+    mockApi.launchProfile.mockResolvedValue({ profile_id: "p1", status: "running" });
+
+    await act(async () => {
+      screen.getByRole("button", { name: /^restart$/i }).click();
+    });
+    await flush();
+
+    expect(screen.queryByTitle("Browser session")).not.toBeInTheDocument();
+    expect(mockApi.createViewerToken).not.toHaveBeenCalled();
   });
 });
 

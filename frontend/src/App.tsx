@@ -9,6 +9,7 @@ import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
 import { LaunchButton } from "./components/LaunchButton";
+import { RestartButton } from "./components/RestartButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { LoginPage } from "./components/LoginPage";
 import { BinaryDownloadBanner } from "./components/BinaryDownloadBanner";
@@ -117,6 +118,11 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   /** bumped on relaunch to remount the viewer with a fresh session. */
   const [viewerEpoch, setViewerEpoch] = useState(0);
+  /** True for the whole stop-then-launch sequence a Restart click runs —
+   *  drives the top bar to show ONE "Restarting..." button instead of
+   *  LaunchButton flashing Stop -> Launch -> Stop as the 3s poll catches up
+   *  with each half of the sequence. */
+  const [restarting, setRestarting] = useState(false);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
   const resourceUsage = useResourceUsage(selected?.id ?? null, selected?.status === "running");
@@ -194,6 +200,28 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     setView("edit");
   }, [selectedId, stop]);
 
+  // Same post-launch view logic as handleLaunch (headless stays on the form,
+  // a headed profile gets a fresh viewer) — duplicated rather than shared
+  // because handleLaunch's own success branch is entangled with `view`
+  // already being "edit" from the Launch button, which is not true here.
+  const handleRestart = useCallback(async () => {
+    if (!selectedId) return;
+    setRestarting(true);
+    try {
+      await stop(selectedId);
+      const result = await launch(selectedId);
+      if (!result) return;
+      if (selected?.headless) {
+        setView("edit");
+      } else {
+        setViewerEpoch((n) => n + 1);
+        setView("view");
+      }
+    } finally {
+      setRestarting(false);
+    }
+  }, [selectedId, stop, launch, selected?.headless]);
+
   // Only terminal session end navigates away — transient network drops are
   // handled by the viewer's own reconnect state machine while the view stays.
   const handleSessionEnded = useCallback(() => {
@@ -259,12 +287,18 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             {selected && selected.status === "running" && (
               <CookieWarmupPanel profileId={selected.id} isRunning compact />
             )}
-            {selected && (
-              <LaunchButton
-                status={selected.status}
-                onLaunch={handleLaunch}
-                onStop={handleStop}
-              />
+            {selected && restarting && <RestartButton busy onClick={() => {}} />}
+            {selected && !restarting && (
+              <>
+                {selected.status === "running" && (
+                  <RestartButton busy={false} onClick={handleRestart} />
+                )}
+                <LaunchButton
+                  status={selected.status}
+                  onLaunch={handleLaunch}
+                  onStop={handleStop}
+                />
+              </>
             )}
             {authRequired && (
               <button
