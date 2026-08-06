@@ -581,6 +581,28 @@ describe("toolbar controls", () => {
     expect(screen.getByTitle("Fullscreen")).toBeInTheDocument();
   });
 
+  it("opens the same viewer URL the iframe uses in a new tab", async () => {
+    const { container } = await mountViewer();
+    const iframe = container.querySelector("iframe")!;
+    const iframeSrc = iframe.getAttribute("src")!;
+    const windowOpen = vi.fn();
+    vi.stubGlobal("open", windowOpen);
+
+    act(() => screen.getByTitle("Open in new tab").click());
+
+    expect(windowOpen).toHaveBeenCalledWith(iframeSrc, "_blank");
+    vi.unstubAllGlobals();
+  });
+
+  it("does not offer Open in new tab before a viewer session exists", () => {
+    // No token fetch has resolved yet — iframeSrc is still null.
+    mockApi.createViewerToken.mockReturnValue(new Promise(() => {})); // never settles
+    render(
+      <ProfileViewer profileId="p1" cdpUrl={null} clipboardSync={false} onSessionEnded={() => {}} />,
+    );
+    expect(screen.queryByTitle("Open in new tab")).not.toBeInTheDocument();
+  });
+
   it("copies the CDP endpoint as an absolute URL and confirms it briefly", async () => {
     // cdp_url is a path; pasting it into a CDP client needs the origin.
     vi.useFakeTimers();

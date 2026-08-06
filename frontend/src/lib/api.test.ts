@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { api, ApiError, setOnUnauthorized, PROFILE_LIFECYCLES } from "./api";
+import {
+  api, ApiError, setOnUnauthorized, PROFILE_LIFECYCLES,
+  downloadFileUrl, downloadsZipUrl,
+} from "./api";
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -128,6 +131,24 @@ describe("request bounding", () => {
       expect(init.signal!.aborted).toBe(false);
     },
   );
+});
+
+// ── standalone URL builders ──────────────────────────────────────────────────
+// downloadFileUrl/downloadsZipUrl are plain functions, not `api` members (see
+// their own comments in api.ts for why), so they're outside the exhaustiveness
+// loop above and need their own direct coverage — components that use them
+// mock the whole module, which never executes the real bodies here.
+
+describe("downloadFileUrl", () => {
+  it("builds a path under the profile's downloads route", () => {
+    expect(downloadFileUrl("p1", "/report.pdf")).toBe("/api/profiles/p1/downloads/report.pdf");
+  });
+});
+
+describe("downloadsZipUrl", () => {
+  it("builds the bulk-zip route for the profile", () => {
+    expect(downloadsZipUrl("p1")).toBe("/api/profiles/p1/downloads-zip");
+  });
 });
 
 // ── lifecycle union ─────────────────────────────────────────────────────────

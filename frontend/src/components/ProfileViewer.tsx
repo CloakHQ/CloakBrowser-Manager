@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ClipboardCopy,
   Code2,
+  ExternalLink,
   Maximize2,
   Minimize2,
   MonitorOff,
@@ -226,6 +227,15 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           >
             {fullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
           </button>
+          {session.iframeSrc && (
+            <button
+              onClick={() => window.open(session.iframeSrc as string, "_blank")}
+              className="text-gray-500 hover:text-gray-300 p-1"
+              title="Open in new tab"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
       </div>
 

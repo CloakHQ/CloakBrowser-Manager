@@ -8,6 +8,7 @@ vi.mock("../lib/api", () => ({
     listProfiles: vi.fn(),
     createProfile: vi.fn(),
     updateProfile: vi.fn(),
+    duplicateProfile: vi.fn(),
     deleteProfile: vi.fn(),
     launchProfile: vi.fn(),
     stopProfile: vi.fn(),
@@ -20,6 +21,7 @@ const mockApi = api as {
   listProfiles: ReturnType<typeof vi.fn>;
   createProfile: ReturnType<typeof vi.fn>;
   updateProfile: ReturnType<typeof vi.fn>;
+  duplicateProfile: ReturnType<typeof vi.fn>;
   deleteProfile: ReturnType<typeof vi.fn>;
   launchProfile: ReturnType<typeof vi.fn>;
   stopProfile: ReturnType<typeof vi.fn>;
@@ -89,6 +91,21 @@ describe("useProfiles", () => {
     });
 
     expect(result.current.profiles[0].id).toBe("new-1");
+  });
+
+  it("duplicate prepends the copy to the list", async () => {
+    const copy = { ...fakeProfile, id: "copy-1", name: "Test (copy)" };
+    mockApi.duplicateProfile.mockResolvedValue(copy);
+
+    const { result } = renderHook(() => useProfiles());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.duplicate("abc-123");
+    });
+
+    expect(result.current.profiles[0].id).toBe("copy-1");
+    expect(result.current.profiles).toHaveLength(2);
   });
 
   it("update touches only the profile it names", async () => {
@@ -185,6 +202,20 @@ describe("useProfiles failure paths", () => {
 
     expect(returned).toBeUndefined();
     expect(result.current.error).toBe("name taken");
+    expect(result.current.profiles).toEqual([fakeProfile]);
+  });
+
+  it("reports a failed duplicate and does not add anything to the list", async () => {
+    mockApi.duplicateProfile.mockRejectedValue(new Error("disk full"));
+    const { result } = await mounted();
+
+    let returned: unknown = "unset";
+    await act(async () => {
+      returned = await result.current.duplicate("abc-123");
+    });
+
+    expect(returned).toBeUndefined();
+    expect(result.current.error).toBe("disk full");
     expect(result.current.profiles).toEqual([fakeProfile]);
   });
 
@@ -290,6 +321,12 @@ describe("useProfiles failure paths", () => {
       await result.current.update("abc-123", { name: "x" });
     });
     expect(result.current.error).toBe("Failed to update profile");
+
+    mockApi.duplicateProfile.mockRejectedValue("nope");
+    await act(async () => {
+      await result.current.duplicate("abc-123");
+    });
+    expect(result.current.error).toBe("Failed to duplicate profile");
 
     mockApi.deleteProfile.mockRejectedValue(undefined);
     await act(async () => {
