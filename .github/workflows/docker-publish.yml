@@ -49,7 +49,14 @@ jobs:
         run: python -m pytest -q
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          # 20 didn't have Object.groupBy (added in 21) — @cubone/react-file-manager's
+          # bundled dist code calls it directly with no polyfill, so `npm test`
+          # crashed here (jsdom+Node actually executes that code) while `vite
+          # build` never did (a browser bundler doesn't execute the app it
+          # bundles, and the shipped app only ever runs in a modern Chromium
+          # via KasmVNC, which has had it since Chrome 117). 24 matches the
+          # Active LTS this was developed and tested against locally.
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
