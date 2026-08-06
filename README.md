@@ -501,6 +501,8 @@ Cross-origin WebSocket connections are refused regardless (`Origin` must match
 
 The GUI application requires the CloakBrowser Chromium binary to function. The binary is automatically downloaded on first launch and is governed by its own license terms. If you fork or redistribute this application, your users must comply with the [CloakBrowser Binary License](BINARY-LICENSE.md).
 
+The Docker images also install third-party components (KasmVNC, cloudflared, Microsoft core fonts) under their own licenses — see [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
+
 ## Contributing
 
 Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues) first to discuss what you'd like to change.
