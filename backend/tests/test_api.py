@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 import io
 import json
+import os
 import pathlib
 import socket
 import zipfile
@@ -125,6 +126,43 @@ def test_delete_profile(app_client: TestClient):
 
 def test_delete_profile_not_found(app_client: TestClient):
     resp = app_client.delete("/api/profiles/nonexistent")
+    assert resp.status_code == 404
+
+
+# ── Per-profile resource usage ───────────────────────────────────────────────
+
+
+def test_get_profile_resources_for_a_running_profile(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResourceTest"})
+    pid = create.json()["id"]
+
+    stat = bm._proc_stat(os.getpid())
+    proc = bm.BrowserProcess(
+        pid=os.getpid(), starttime=stat[2], user_data_dir="/tmp", cdp_port=5100,
+    )
+    running = MagicMock(spec=RunningProfile)
+    running.proc = proc
+    main.browser_mgr.running[pid] = running
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["process_count"] >= 1
+        assert data["memory_mb"] > 0
+        assert data["cpu_percent"] >= 0.0
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_profile_resources_404_when_not_running(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NotRunning"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/resources")
+    assert resp.status_code == 404
+
+
+def test_get_profile_resources_404_for_unknown_profile(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/resources")
     assert resp.status_code == 404
 
 

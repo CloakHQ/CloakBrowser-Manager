@@ -64,10 +64,12 @@ from .models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ResourceUsageResponse,
     StatusResponse,
     TagResponse,
     ViewerTokenResponse,
 )
+from .resources import get_resource_usage
 from .viewer_tokens import VIEWER_TOKEN_TTL, viewer_tokens
 
 logger = logging.getLogger("cloakbrowser.manager")
@@ -612,6 +614,22 @@ async def get_profile_status(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not found")
     status = await browser_mgr.get_liveness_async(profile_id)
     return ProfileStatusResponse(**status)
+
+
+@app.get("/api/profiles/{profile_id}/resources", response_model=ResourceUsageResponse)
+async def get_profile_resources(profile_id: str):
+    """CPU/memory for a profile's whole Chromium process tree (root browser
+    process plus every renderer/GPU/utility subprocess), not just the root.
+
+    Takes ~CPU_SAMPLE_INTERVAL_S (200ms) to answer — see resources.py for
+    why that is the deliberately simple alternative to caching psutil
+    Process objects across polls.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if not running or running.proc is None:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    usage = await get_resource_usage(running.proc)
+    return ResourceUsageResponse(**usage)
 
 
 # ── Viewer Sessions (KasmVNC native client) ──────────────────────────────────

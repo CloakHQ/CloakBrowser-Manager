@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from "react";
 import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { useBinaryDownload } from "./hooks/useBinaryDownload";
+import { useResourceUsage } from "./hooks/useResourceUsage";
 import { api, setOnUnauthorized, type ProfileCreateData, type ProfileLifecycle } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
@@ -117,6 +118,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [viewerEpoch, setViewerEpoch] = useState(0);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
+  const resourceUsage = useResourceUsage(selected?.id ?? null, selected?.status === "running");
 
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
@@ -236,6 +238,14 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 <StatusIndicator status={selected.status} size="md" />
                 <span className="text-sm font-medium">{selected.name}</span>
                 <span className="text-xs text-gray-500 capitalize">{selected.platform}</span>
+                {resourceUsage?.cpu_percent != null && resourceUsage.memory_mb != null && (
+                  <span
+                    className="text-xs text-gray-500"
+                    title={`Whole Chromium process tree: ${resourceUsage.process_count} process(es). CPU is per-core (top's convention) — over 100% means more than one core busy.`}
+                  >
+                    · {resourceUsage.cpu_percent.toFixed(1)}% CPU · {resourceUsage.memory_mb.toFixed(0)} MB
+                  </span>
+                )}
               </div>
             )}
           </div>

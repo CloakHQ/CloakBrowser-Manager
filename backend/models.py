@@ -207,3 +207,12 @@ class ExtensionInstallFromUrlRequest(BaseModel):
     # A chromewebstore.google.com/detail/<name>/<id> URL, or a bare 32-char
     # extension id — extensions.extract_extension_id() accepts either.
     url: str = Field(min_length=1, max_length=2048)
+
+
+class ResourceUsageResponse(BaseModel):
+    # None for all three when the profile's browser process is gone (a
+    # crash between the caller's own liveness check and this one) — distinct
+    # from 0, which would misreport a genuinely idle-but-alive profile.
+    cpu_percent: float | None = None
+    memory_mb: float | None = None
+    process_count: int = 0

@@ -154,6 +154,15 @@ export interface ProfileStatus {
   browser_alive: boolean | null;
 }
 
+export interface ResourceUsage {
+  /** Un-normalized per-core percent (top's convention): three fully-busy
+   *  renderer processes can legitimately sum past 100. null (not 0) means
+   *  the browser process is already gone — distinct from genuinely idle. */
+  cpu_percent: number | null;
+  memory_mb: number | null;
+  process_count: number;
+}
+
 export interface ViewerAttached {
   /**
    * Whether a viewer WebSocket is attached, or null if the probe could not
@@ -315,6 +324,9 @@ export const api = {
 
   profileStatus: (id: string) =>
     request<ProfileStatus>(`/api/profiles/${id}/status`),
+
+  profileResources: (id: string) =>
+    request<ResourceUsage>(`/api/profiles/${id}/resources`),
 
   viewerAttached: (id: string) =>
     request<ViewerAttached>(`/api/profiles/${id}/viewer-attached`),
