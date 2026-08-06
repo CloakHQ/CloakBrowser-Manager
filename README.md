@@ -116,6 +116,14 @@ mkdir -p ~/.cloakbrowser-manager/extensions/my-extension
 unzip ext.zip -d ~/.cloakbrowser-manager/extensions/my-extension
 ```
 
+### Downloads
+
+Every profile has a real `Downloads` folder on the host with no configuration: `~/.cloakbrowser-manager/profiles/<profile-id>/Downloads/`, writable by any host user regardless of the Docker UID mapping. Files land there under their real name (`invoice.pdf`, not a GUID) — Chrome-style numbering (`file (1).txt`, `file (2).txt`, …) avoids clobbering an existing file with the same name.
+
+This needs explicit handling because Playwright intercepts every download via CDP once a browser is under its control — including ones a human triggers by clicking in the VNC-visible window, not just scripted automation — and by default saves the artifact under a random GUID name in a directory that's deleted the moment the profile stops. `browser_manager.py` points that artifact path at a hidden staging directory (`.pw-downloads`) inside the profile and copies each completed download out to the real `Downloads` folder under its suggested filename as it completes.
+
+Verified for the primary case this exists for: a human downloading a file while watching a headed profile over VNC, with no other CDP client attached. A **headless** profile driven only by a raw CDP client that never establishes a Playwright driver session can report the download canceled — a Chromium headless-mode quirk, not something this fix controls either way. A real automation script connecting via `connect_over_cdp()` (see [Automation API](#automation-api)) should manage its own downloads with Playwright's own `download.save_as()` — a second Playwright driver connecting resets the browser's download destination to its own default, so relying on this Manager's handler from external automation isn't guaranteed.
+
 ### Widevine / DRM
 
 Every profile can play DRM-protected video (Netflix, Spotify Web, etc.) with no per-profile configuration. On first boot the container fetches the Widevine CDM straight from Google's own component-update server (the same source Chrome uses — Linux x86-64 only, SHA-256 + CRX3-signature verified) in the background, without blocking startup, and caches it on the `/data` volume so it's fetched once ever, not once per container. From then on, `cloakbrowser`'s own `launch_persistent_context_async()` (already what this Manager calls for every launch) automatically seeds the CDM hint into each profile on its very first launch — nothing else to configure. See CloakBrowser's own [Widevine / DRM](https://github.com/CloakHQ/CloakBrowser#widevine--drm) docs for the underlying mechanism.

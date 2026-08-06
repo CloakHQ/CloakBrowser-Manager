@@ -6,6 +6,7 @@ import atexit
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -2281,6 +2282,121 @@ async def test_a_successful_launch_drops_the_launch_phase_claim(monkeypatch, tmp
     assert running.session_epoch                # a nonce, not a recycled port
     assert mgr.peek_wedged("p1") is False
     assert mgr.get_status("p1")["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_launch_creates_a_permissioned_downloads_dir_and_wires_it_up(
+    monkeypatch, tmp_path,
+):
+    """Every profile gets a real, writable Downloads folder with no per-profile config.
+
+    downloads_path must point at a STAGING dir, not the visible Downloads
+    folder directly: Playwright deletes everything under downloads_path when
+    the context closes (true even when downloads_path is explicitly set —
+    see launch_persistent_context's own docs), so the visible folder can only
+    ever hold what _finalize_download's save_as() explicitly copied there.
+    """
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.pages = []
+    context.on = MagicMock()
+    context.add_init_script = AsyncMock()
+
+    launch_mock = AsyncMock(return_value=context)
+    monkeypatch.setattr(bm, "launch_persistent_context_async", launch_mock)
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
+    monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    user_data_dir = tmp_path / "p1"
+    await mgr.launch({"id": "p1", "user_data_dir": str(user_data_dir)})
+
+    downloads_dir = user_data_dir / "Downloads"
+    staging_dir = user_data_dir / ".pw-downloads"
+    assert downloads_dir.is_dir()
+    assert staging_dir.is_dir()
+    assert stat.S_IMODE(downloads_dir.stat().st_mode) == 0o777
+    assert stat.S_IMODE(staging_dir.stat().st_mode) == 0o777
+
+    # downloads_path points at the hidden staging dir, never the visible one.
+    assert launch_mock.call_args.kwargs["downloads_path"] == str(staging_dir)
+
+    # Registered for pages opened from here on, and any already open now.
+    assert context.on.call_args.args[0] == "page"
+
+
+@pytest.mark.asyncio
+async def test_launch_attaches_download_handler_to_pages_already_open(monkeypatch, tmp_path):
+    """about:blank created before this point must not be missed — same
+    two-part registration as the clipboard init script just above it."""
+    from unittest.mock import AsyncMock
+
+    mgr = bm.BrowserManager()
+    existing_page = MagicMock()
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.pages = [existing_page]
+    context.on = MagicMock()
+    context.add_init_script = AsyncMock()
+
+    monkeypatch.setattr(bm, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(bm, "discover_browser_process_async", _discovers(_live_proc()))
+    monkeypatch.setattr(mgr.vnc, "start_vnc", AsyncMock())
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+
+    await mgr.launch({"id": "p1", "user_data_dir": str(tmp_path / "p1")})
+
+    download_calls = [c for c in existing_page.on.call_args_list if c.args[0] == "download"]
+    assert len(download_calls) == 1
+
+
+# ── downloads: real filenames, not Playwright's GUID artifacts ──────────────
+
+
+def test_dedupe_download_path_returns_the_plain_name_when_free(tmp_path):
+    assert bm._dedupe_download_path(tmp_path, "file.txt") == tmp_path / "file.txt"
+
+
+def test_dedupe_download_path_chrome_style_numbering(tmp_path):
+    (tmp_path / "file.txt").write_text("x")
+    assert bm._dedupe_download_path(tmp_path, "file.txt") == tmp_path / "file (1).txt"
+
+    (tmp_path / "file (1).txt").write_text("x")
+    assert bm._dedupe_download_path(tmp_path, "file.txt") == tmp_path / "file (2).txt"
+
+
+def test_dedupe_download_path_preserves_extension_with_dots_in_stem(tmp_path):
+    (tmp_path / "archive.tar.gz").write_text("x")
+    assert bm._dedupe_download_path(tmp_path, "archive.tar.gz") == tmp_path / "archive.tar (1).gz"
+
+
+@pytest.mark.asyncio
+async def test_finalize_download_saves_under_the_suggested_filename(tmp_path):
+    from unittest.mock import AsyncMock
+
+    download = MagicMock()
+    download.suggested_filename = "invoice.pdf"
+    download.save_as = AsyncMock()
+
+    await bm._finalize_download(download, tmp_path)
+
+    download.save_as.assert_awaited_once_with(tmp_path / "invoice.pdf")
+
+
+@pytest.mark.asyncio
+async def test_finalize_download_never_raises_on_a_broken_download(tmp_path):
+    """A failed/cancelled download must not take the page's event loop down
+    with it — this runs from a fire-and-forget asyncio.ensure_future()."""
+    from unittest.mock import AsyncMock
+
+    download = MagicMock()
+    download.suggested_filename = "ghost.bin"
+    download.save_as = AsyncMock(side_effect=RuntimeError("download was cancelled"))
+
+    await bm._finalize_download(download, tmp_path)  # must not raise
 
 
 @pytest.mark.asyncio

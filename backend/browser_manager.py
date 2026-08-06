@@ -414,6 +414,59 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
         logger.info("Set DuckDuckGo as default search for %s", user_data_dir.name)
 
 
+def _dedupe_download_path(downloads_dir: Path, filename: str) -> Path:
+    """Chrome's own collision convention: file.txt, file (1).txt, file (2).txt…
+
+    Two downloads of the same suggested filename in one profile must not
+    silently overwrite each other — save_as() would happily clobber an
+    existing file otherwise.
+    """
+    candidate = downloads_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    n = 1
+    while True:
+        candidate = downloads_dir / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+async def _finalize_download(download: Any, downloads_dir: Path) -> None:
+    """Copy a Playwright download to its real filename in `downloads_dir`.
+
+    Playwright's own download.path() is a random GUID with no extension —
+    intentional on their side (see the downloads_path docs: "the downloads
+    are deleted when the browser context they were created in is closed",
+    even when downloads_path is set) — so without this, every download a
+    user makes through the VNC-visible browser turns into an unnamed file
+    that vanishes the moment the profile stops. Never raises: a broken
+    download must not take down the page's event loop.
+
+    Verified live for a headed profile with no other CDP client attached
+    (the pure human-via-VNC case this exists for): real filename, real
+    bytes, correct permissions. A HEADLESS profile driven ONLY by a raw CDP
+    client with no Playwright driver ever attached can report the download
+    "canceled" — a Chromium headless-mode behavior this file does not
+    control, not a regression (there was no working download path for that
+    narrow combination before this either). A real automation script
+    connecting via connect_over_cdp() should manage its own downloads with
+    Playwright's own API rather than rely on this handler, since a second
+    Playwright driver connecting resets the browser's download destination
+    to its own default artifacts directory.
+    """
+    try:
+        dest = _dedupe_download_path(downloads_dir, download.suggested_filename)
+        await download.save_as(dest)
+        logger.info("Download saved: %s", dest)
+    except Exception as exc:
+        logger.warning(
+            "Failed to save download %r: %s",
+            getattr(download, "suggested_filename", "<unknown>"), exc,
+        )
+
+
 # A wedged Playwright connection makes context.close() hang. Cleanup paths run
 # under cancellation (auto_launch_all's wait_for) and under Docker's stop
 # deadline, so a best-effort close must never be able to outlive either.
@@ -929,6 +982,21 @@ class BrowserManager:
             # Set up bookmarks and search engine on first launch
             _init_profile_defaults(user_data_dir)
 
+            # Downloads land in <user_data_dir>/Downloads with their real
+            # filename — see the download handler wired up after launch below
+            # for why a plain downloads_path alone is not enough. chmod 777
+            # rather than relying on the container's default umask: this
+            # directory is bind-mounted onto the host (the whole /data volume
+            # is), and a host whose Docker is not user-namespace-remapped
+            # would otherwise hand back root-owned files the host user can
+            # read but not delete.
+            downloads_dir = user_data_dir / "Downloads"
+            downloads_staging_dir = user_data_dir / ".pw-downloads"
+            downloads_dir.mkdir(exist_ok=True)
+            downloads_staging_dir.mkdir(exist_ok=True)
+            os.chmod(downloads_dir, 0o777)
+            os.chmod(downloads_staging_dir, 0o777)
+
             # Start KasmVNC on the allocated display (headed profiles only)
             if display is not None:
                 await self.vnc.start_vnc(
@@ -985,6 +1053,7 @@ class BrowserManager:
                 color_scheme=profile.get("color_scheme") or None,
                 license_key=profile_license_key,
                 extension_paths=extension_paths,
+                downloads_path=str(downloads_staging_dir),
                 user_agent=profile.get("user_agent") or None,
                 viewport={
                     "width": profile.get("screen_width", 1920),
@@ -1051,6 +1120,27 @@ class BrowserManager:
                     await p.evaluate(_clipboard_init_js)
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
+
+            # Finalize downloads with their real filename in the visible
+            # Downloads folder. Playwright intercepts every download via CDP
+            # once a browser is under its control — including ones a human
+            # triggers by clicking in the VNC-visible window, not just
+            # automation — and downloads_path alone only relocates the
+            # GUID-named artifact (still deleted when this context closes);
+            # it does not rename it. _finalize_download does that rename by
+            # copying it out to `downloads_dir` under its suggested filename.
+            # "page" covers tabs opened after this point; the loop covers
+            # about:blank created before it — same two-part pattern as the
+            # clipboard init script just above.
+            context.on("page", lambda new_page: new_page.on(
+                "download", lambda download: asyncio.ensure_future(
+                    _finalize_download(download, downloads_dir)
+                ),
+            ))
+            for p in context.pages:
+                p.on("download", lambda download: asyncio.ensure_future(
+                    _finalize_download(download, downloads_dir)
+                ))
 
             idle_timeout_seconds = profile.get("idle_timeout_seconds")
             if idle_timeout_seconds is None:
