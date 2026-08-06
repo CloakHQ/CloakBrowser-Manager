@@ -1,6 +1,6 @@
 import { Save, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { Profile, ProfileCreateData } from "../lib/api";
+import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
@@ -75,6 +75,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
+  const [extensions, setExtensions] = useState<Extension[]>([]);
 
   useEffect(() => {
     if (profile) {
@@ -99,12 +100,30 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         auto_launch: profile.auto_launch,
         color_scheme: profile.color_scheme,
         license_key: profile.license_key,
+        enabled_extensions: profile.enabled_extensions ?? [],
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
       });
     }
   }, [profile?.id]);
+
+  // Extensions are scanned once at container startup (see
+  // backend/extensions.py) and don't change without a restart, so a single
+  // fetch on mount — no polling — is correct, not a shortcut. A brand-new
+  // profile (profile === null) starts with every extension enabled; an
+  // existing one keeps whatever the effect above loaded from profile.
+  // enabled_extensions, which this must not stomp on.
+  useEffect(() => {
+    api.listExtensions()
+      .then((exts) => {
+        setExtensions(exts);
+        if (!isEdit) {
+          setForm((prev) => ({ ...prev, enabled_extensions: exts.map((e) => e.id) }));
+        }
+      })
+      .catch((err) => console.warn("[extensions] failed to load:", err));
+  }, []);
 
   const set = <K extends keyof ProfileCreateData>(key: K, value: ProfileCreateData[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -170,6 +189,14 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
 
   const removeLaunchArg = (idx: number) => {
     set("launch_args", (form.launch_args ?? []).filter((_, i) => i !== idx));
+  };
+
+  const toggleExtension = (id: string, enabled: boolean) => {
+    const current = form.enabled_extensions ?? [];
+    set(
+      "enabled_extensions",
+      enabled ? [...current, id] : current.filter((x) => x !== id),
+    );
   };
 
   return (
@@ -564,10 +591,48 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           </div>
         </section>
 
+        {/* Extensions */}
+        <section>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
+          {extensions.length === 0 ? (
+            <p className="text-xs text-gray-500">
+              None found. Drop an unpacked extension (a directory with manifest.json at its root)
+              into ~/.cloakbrowser-manager/extensions on the host, then `docker compose restart` —
+              extensions are only scanned once, at startup.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {extensions.map((ext) => (
+                <label
+                  key={ext.id}
+                  className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={(form.enabled_extensions ?? []).includes(ext.id)}
+                    onChange={(e) => toggleExtension(ext.id, e.target.checked)}
+                    className="rounded border-border bg-surface-2 mt-0.5"
+                  />
+                  <span>
+                    {ext.name}
+                    {ext.version && <span className="text-gray-500"> v{ext.version}</span>}
+                    {ext.description && (
+                      <span className="block text-xs text-gray-500">{ext.description}</span>
+                    )}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+        </section>
+
         {/* Launch Args */}
         <section>
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Launch Args</h3>
-          <p className="text-xs text-gray-500 mb-2">Custom Chromium flags passed at launch (e.g. --load-extension, --disable-features)</p>
+          <p className="text-xs text-gray-500 mb-2">
+            Custom Chromium flags passed at launch (e.g. --disable-features). For extensions, use
+            the Extensions section above — a manual --load-extension here is overridden by it.
+          </p>
           {(form.launch_args ?? []).length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-3">
               {(form.launch_args ?? []).map((arg, idx) => (
@@ -593,7 +658,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               value={launchArgInput}
               onChange={(e) => setLaunchArgInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addLaunchArg(); } }}
-              placeholder="--load-extension=/data/extensions/ublock"
+              placeholder="--disable-features=Translate"
             />
             <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">
               Add

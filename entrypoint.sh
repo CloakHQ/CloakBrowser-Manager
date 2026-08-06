@@ -8,6 +8,16 @@ mkdir -p /data/profiles
 # binary lives on the /data volume and survives container recreation instead
 # of being re-fetched on every new container.
 mkdir -p /data/cloakbrowser
+# Extensions the operator drops in on the host (~/.cloakbrowser-manager/extensions
+# by default), one unpacked extension per subdirectory. backend/extensions.py
+# scans this ONCE per process start and caches the result for the container's
+# whole lifetime — see the README note next to EXTENSIONS_DIR for why
+# (predictable per-profile state: an extension can't disappear out from under
+# a running profile's checkbox mid-session). Adding, removing, or editing an
+# extension here needs a `docker compose restart` (or recreate) to be picked
+# up; this mkdir is what makes an empty/missing host dir a no-op instead of a
+# startup error.
+mkdir -p /data/extensions
 
 # Kill stale processes from previous container runs
 pkill -f 'Xvnc :[0-9]' 2>/dev/null || true

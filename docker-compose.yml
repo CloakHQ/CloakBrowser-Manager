@@ -27,6 +27,17 @@ services:
       - "0.0.0.0:8443:8443"
     volumes:
       - ~/.cloakbrowser-manager:/data
+      # Drop unpacked Chrome extensions (one directory per extension,
+      # manifest.json at its root) into ~/.cloakbrowser-manager/extensions on
+      # the host and they show up as per-profile checkboxes in the UI — see
+      # backend/extensions.py. Not a separate bind mount: it's a subdirectory
+      # of the /data mount above, covered by every Dockerfile/overlay in this
+      # repo automatically since none of them override `volumes:`.
+      #
+      # Scanned ONCE per container start, not watched: adding, removing, or
+      # editing an extension needs `docker compose restart` (or recreate) to
+      # show up in the UI. Deliberate, not a limitation — see extensions.py's
+      # own comment for why.
     environment:
       # Bare names pass the host value through when set and are ignored when
       # not. Without these the tuning knobs the README documents have no effect

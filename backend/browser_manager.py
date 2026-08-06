@@ -19,6 +19,7 @@ from cloakbrowser import launch_persistent_context_async
 from cloakbrowser.download import ensure_binary
 
 from . import binary_status
+from .extensions import extension_paths_for
 
 # _dri_driver reads the driver behind a render node, and the node itself comes
 # from the same KASM_DRINODE that Xvnc's -drinode uses. Imported rather than
@@ -898,6 +899,12 @@ class BrowserManager:
             extra_args += profile.get("launch_args") or []
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
+            # Resolved against the set extensions.py discovered at startup —
+            # an enabled id for an extension since removed (or not yet
+            # picked up because the container hasn't restarted) is silently
+            # dropped rather than erroring the launch. See extensions.py.
+            extension_paths = extension_paths_for(profile.get("enabled_extensions") or [])
+
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
@@ -933,6 +940,7 @@ class BrowserManager:
                 geoip=bool(profile.get("geoip", False)),
                 color_scheme=profile.get("color_scheme") or None,
                 license_key=profile_license_key,
+                extension_paths=extension_paths,
                 user_agent=profile.get("user_agent") or None,
                 viewport={
                     "width": profile.get("screen_width", 1920),

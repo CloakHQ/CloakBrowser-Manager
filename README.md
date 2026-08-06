@@ -57,7 +57,7 @@ Each CloakBrowser profile generates a completely different device identity. To t
 ## Features
 
 - **Profile management** — create, edit, delete browser profiles with unique fingerprints
-- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform, CloakBrowser license key override
+- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform, CloakBrowser license key override, Chrome extensions
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
 - **In-browser viewing** — interact with launched browsers via KasmVNC's native web client, directly in the web GUI (server-authoritative JPEG/WebP by default, opt-in H.264/H.265/AV1 WebCodecs streaming)
@@ -94,6 +94,27 @@ CloakBrowser/Chromium
 ### Headless profiles
 
 A profile with **Headless** enabled starts no Xvnc and allocates no display or WebSocket port — there is nothing to view, so the viewer is not offered and `POST /api/profiles/<id>/viewer-token` answers `409`. Drive it over CDP instead (`/api/profiles/<id>/cdp`). Everything else — profiles, proxies, fingerprints, lifecycle — behaves identically.
+
+### Extensions
+
+Drop unpacked Chrome extensions — one directory per extension, `manifest.json` at its root — into `~/.cloakbrowser-manager/extensions` on the host. Each one shows up as a checkbox under **Extensions** in the profile form, with its name/description/version read from `manifest.json` (including `__MSG_..__` localized strings, resolved via `_locales/<default_locale>/messages.json`). A brand-new profile starts with every extension checked; existing profiles keep whatever they were last saved with.
+
+**Extensions are scanned once, at container startup, and cached for the container's whole lifetime — not watched for changes.** Adding, removing, or editing an extension under that directory needs `docker compose restart` (or recreate) before it shows up in the UI or takes effect on the next launch. This is deliberate: it keeps a profile's checkboxes from having an extension disappear out from under them mid-session, and avoids re-reading every manifest on every request for something that, by design, never changes without a restart anyway.
+
+To get an extension from the Chrome Web Store as an unpacked directory, fetch its CRX and unzip it (strip the 12+header-length-byte CRX3 header, the rest is a normal zip):
+
+```bash
+EXT_ID=edibdbjcniadpccecjdfdjjppcpchdlm  # from the store URL
+curl -L -o ext.crx "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120.0.0.0&acceptformat=crx2,crx3&x=id%3D${EXT_ID}%26uc"
+python3 -c "
+import struct
+data = open('ext.crx','rb').read()
+header_len = struct.unpack('<I', data[8:12])[0]
+open('ext.zip','wb').write(data[12+header_len:])
+"
+mkdir -p ~/.cloakbrowser-manager/extensions/my-extension
+unzip ext.zip -d ~/.cloakbrowser-manager/extensions/my-extension
+```
 
 ### Environment variables
 

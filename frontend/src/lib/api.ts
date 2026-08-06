@@ -57,6 +57,9 @@ export interface Profile {
    *  the container's CLOAKBROWSER_LICENSE_KEY is (or free tier if it has
    *  none either) — it does not force free tier over a container-wide key. */
   license_key: string | null;
+  /** Ids (Extension.id) of the extensions this profile loads, from the set
+   *  GET /api/extensions returns. */
+  enabled_extensions: string[];
   launch_args: string[];
   notes: string | null;
   user_data_dir: string;
@@ -89,6 +92,7 @@ export interface ProfileCreateData {
   auto_launch?: boolean;
   color_scheme?: string | null;
   license_key?: string | null;
+  enabled_extensions?: string[] | null;
   launch_args?: string[];
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
@@ -113,6 +117,15 @@ export interface SystemStatus {
   binary_downloading: boolean;
   binary_download_percent: number | null;
   binary_download_state: string | null;
+}
+
+/** An unpacked extension found under EXTENSIONS_DIR at container startup —
+ *  see backend/extensions.py. The set never changes without a restart. */
+export interface Extension {
+  id: string;
+  name: string;
+  description: string | null;
+  version: string | null;
 }
 
 export interface ViewerToken {
@@ -251,6 +264,8 @@ export const api = {
     ),
 
   getStatus: () => request<SystemStatus>("/api/status"),
+
+  listExtensions: () => request<Extension[]>("/api/extensions"),
 
   setClipboard: (id: string, text: string) =>
     request<{ ok: boolean }>(`/api/profiles/${id}/clipboard`, {

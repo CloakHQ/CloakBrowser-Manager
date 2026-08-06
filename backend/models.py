@@ -44,6 +44,13 @@ class ProfileCreate(BaseModel):
     # the container has none either) — it does NOT force free tier when a
     # container-wide key is set. See binary_status.py / browser_manager.py.
     license_key: str | None = None
+    # Ids (extensions.py's directory-name ids) of the extensions this profile
+    # loads, from the set discovered at container startup. None (the
+    # default — distinct from an explicit []) means "not specified": the API
+    # layer fills it in with every currently-available extension id, so a
+    # freshly created profile starts with every extension enabled rather
+    # than none. See main.py's create_profile.
+    enabled_extensions: list[str] | None = None
     launch_args: list[str] = Field(default_factory=list)
     notes: str | None = None
     tags: list[TagCreate] | None = None
@@ -70,6 +77,7 @@ class ProfileUpdate(BaseModel):
     auto_launch: bool | None = None
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
     license_key: str | None = Field(default=None)
+    enabled_extensions: list[str] | None = None
     launch_args: list[str] | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
@@ -113,6 +121,7 @@ class ProfileResponse(BaseModel):
 
     color_scheme: str | None = None
     license_key: str | None = None
+    enabled_extensions: list[str] = []
     launch_args: list[str] = []
     notes: str | None = None
     user_data_dir: str
@@ -166,6 +175,13 @@ class ViewerTokenResponse(BaseModel):
     # choose. Only set when an NVENC codec is configured — the shipped client
     # cannot auto-select those. See vnc_manager.viewer_stream_mode_preference.
     stream_mode: str | None = None
+
+
+class ExtensionResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    version: str | None = None
 
 
 class ClipboardRequest(BaseModel):

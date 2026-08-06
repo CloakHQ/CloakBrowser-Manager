@@ -84,6 +84,7 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   launchProfile: ["p1"],
   stopProfile: ["p1"],
   getStatus: [],
+  listExtensions: [],
   setClipboard: ["p1", "hello"],
   getClipboard: ["p1"],
   createViewerToken: ["p1"],

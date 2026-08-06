@@ -28,9 +28,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import database as db
 from .binary_status import snapshot as binary_status_snapshot
 from .browser_manager import LAUNCH_TIMEOUT_S, BrowserManager, ProfileAlreadyRunning
+from .extensions import list_available_extensions
 from .vnc_manager import viewer_stream_mode_preference
 from .models import (
     ClipboardRequest,
+    ExtensionResponse,
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
@@ -266,6 +268,10 @@ def _demote_abandoned_driver_errors(loop, context: dict) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Scanned here, eagerly, rather than lazily on first request — see
+    # extensions.py's module docstring for why this only ever happens once
+    # per process (i.e. per container start/restart).
+    list_available_extensions()
     asyncio.get_running_loop().set_exception_handler(_demote_abandoned_driver_errors)
     browser_mgr.add_display_released_hook(_reap_xclip_for_display)
     await browser_mgr.cleanup_stale()
@@ -367,6 +373,11 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
+    # Unspecified (None, not an explicit []) defaults to every extension
+    # available right now, not none — a new profile starts with everything
+    # the operator has staged already enabled rather than opted out.
+    if data.get("enabled_extensions") is None:
+        data["enabled_extensions"] = [e["id"] for e in list_available_extensions()]
     return _profile_response(db.create_profile(**data))
 
 
@@ -838,6 +849,16 @@ async def get_system_status():
         binary_download_percent=binary["percent"],
         binary_download_state=binary["state"],
     )
+
+
+# ── Extensions ────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/extensions", response_model=list[ExtensionResponse])
+async def get_extensions():
+    # list_available_extensions() is cached from the scan lifespan already
+    # did at startup — this is a plain in-memory read, not a filesystem scan.
+    return [ExtensionResponse(**e) for e in list_available_extensions()]
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────

@@ -22,6 +22,9 @@ vi.mock("./lib/api", () => {
       createViewerToken: vi.fn(),
       launchProfile: vi.fn(),
       logout: vi.fn(),
+      // ProfileForm (rendered by the "edit"/"create" views) fetches this on
+      // mount regardless of what a given test is exercising.
+      listExtensions: vi.fn().mockResolvedValue([]),
     },
     setOnUnauthorized: vi.fn(),
     ApiError,

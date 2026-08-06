@@ -53,6 +53,7 @@ def init_db():
                 auto_launch BOOLEAN DEFAULT 0,
                 color_scheme TEXT,
                 license_key TEXT,
+                enabled_extensions TEXT DEFAULT '[]',
                 notes TEXT,
                 user_data_dir TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -82,6 +83,9 @@ def init_db():
         if "license_key" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN license_key TEXT")
             conn.commit()
+        if "enabled_extensions" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN enabled_extensions TEXT DEFAULT '[]'")
+            conn.commit()
 
 
 def _now() -> str:
@@ -105,9 +109,10 @@ def create_profile(
                 id, name, fingerprint_seed, proxy, timezone, locale, platform,
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
-                clipboard_sync, auto_launch, color_scheme, license_key, launch_args, notes,
+                clipboard_sync, auto_launch, color_scheme, license_key,
+                enabled_extensions, launch_args, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
                 fields.get("proxy"),
@@ -128,6 +133,7 @@ def create_profile(
                 fields.get("auto_launch", False),
                 fields.get("color_scheme"),
                 fields.get("license_key"),
+                json.dumps(fields.get("enabled_extensions") or []),
                 json.dumps(fields.get("launch_args") or []),
                 fields.get("notes"),
                 user_data_dir, now, now,
@@ -150,6 +156,7 @@ def get_profile(profile_id: str) -> dict[str, Any] | None:
             return None
         profile = dict(row)
         profile["launch_args"] = json.loads(profile.get("launch_args") or "[]")
+        profile["enabled_extensions"] = json.loads(profile.get("enabled_extensions") or "[]")
         tags = conn.execute(
             "SELECT tag, color FROM profile_tags WHERE profile_id = ?",
             (profile_id,),
@@ -165,6 +172,7 @@ def list_profiles() -> list[dict[str, Any]]:
         for row in rows:
             profile = dict(row)
             profile["launch_args"] = json.loads(profile.get("launch_args") or "[]")
+            profile["enabled_extensions"] = json.loads(profile.get("enabled_extensions") or "[]")
             tags = conn.execute(
                 "SELECT tag, color FROM profile_tags WHERE profile_id = ?",
                 (profile["id"],),
@@ -184,15 +192,18 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     # Only update fields that were explicitly provided
     update_cols = []
     update_vals = []
-    # Pre-serialize launch_args to JSON before the generic update loop
+    # Pre-serialize JSON-list columns to text before the generic update loop
     if "launch_args" in fields:
         fields["launch_args"] = json.dumps(fields["launch_args"] or [])
+    if "enabled_extensions" in fields:
+        fields["enabled_extensions"] = json.dumps(fields["enabled_extensions"] or [])
 
     for col in (
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
-        "clipboard_sync", "auto_launch", "color_scheme", "license_key", "launch_args", "notes",
+        "clipboard_sync", "auto_launch", "color_scheme", "license_key",
+        "enabled_extensions", "launch_args", "notes",
     ):
         if col in fields:
             update_cols.append(f"{col} = ?")
