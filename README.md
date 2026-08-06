@@ -57,7 +57,7 @@ Each CloakBrowser profile generates a completely different device identity. To t
 ## Features
 
 - **Profile management** — create, edit, delete browser profiles with unique fingerprints
-- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform, CloakBrowser license key override, Chrome extensions
+- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform, CloakBrowser license key override, Chrome extensions, idle timeout override
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
 - **In-browser viewing** — interact with launched browsers via KasmVNC's native web client, directly in the web GUI (server-authoritative JPEG/WebP by default, opt-in H.264/H.265/AV1 WebCodecs streaming)
@@ -116,11 +116,20 @@ mkdir -p ~/.cloakbrowser-manager/extensions/my-extension
 unzip ext.zip -d ~/.cloakbrowser-manager/extensions/my-extension
 ```
 
+### Idle timeout
+
+A profile with no attached VNC viewer and no CDP traffic for too long is stopped automatically — closing Chromium cleanly and releasing its CloakBrowser license claim, the same as clicking **Stop**. The default is **60 minutes** (`PROFILE_IDLE_TIMEOUT_SECONDS`, in seconds); each profile can override it in the form (**Idle Timeout (minutes)**, under Behavior) — leave it blank to inherit the container default, or set it to `0` to disable idle timeout for that profile entirely.
+
+"Idle" combines both signals the Manager can see: an attached VNC viewer (probed against KasmVNC every sweep) and CDP messages actually forwarded through the proxy (a client attached but issuing no commands still counts as idle — only real traffic resets the clock, not the WebSocket's own keepalive pings).
+
+Hitting a stopped profile's CDP endpoint (`/api/profiles/<id>/cdp` or any of its `/cdp/json/*` routes) launches it automatically rather than answering 404 — a safeguard for a CDP client (Playwright, Puppeteer, `chrome-remote-interface`) that dials in cold, on the assumption that the profile is normally already running because something launched it first.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
+| `PROFILE_IDLE_TIMEOUT_SECONDS` | `3600` | Stop a profile automatically after this many idle seconds (no VNC viewer, no CDP traffic), releasing its license claim. Per-profile override in the form; `0` disables idle timeout for that profile. |
 | `TLS_SANS` | *(unset)* | Extra names/IPs for the self-signed cert on `:8443`, comma separated. `localhost` and `127.0.0.1` are always included. Read only when the cert is first issued — delete `/data/tls` to re-issue. |
 | `CF_TUNNEL_TOKEN` | *(unset = quick tunnel)* | With `docker-compose.tunnel.yml`: run a **named** Cloudflare tunnel with a stable hostname. Unset gives a free `*.trycloudflare.com` quick tunnel that changes every restart. |
 | `CF_TUNNEL_ORIGIN` | `http://manager:8080` | What the tunnel points at inside the compose network. |

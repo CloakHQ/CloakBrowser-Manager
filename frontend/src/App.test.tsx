@@ -22,9 +22,14 @@ vi.mock("./lib/api", () => {
       createViewerToken: vi.fn(),
       launchProfile: vi.fn(),
       logout: vi.fn(),
-      // ProfileForm (rendered by the "edit"/"create" views) fetches this on
+      // ProfileForm (rendered by the "edit"/"create" views) fetches these on
       // mount regardless of what a given test is exercising.
       listExtensions: vi.fn().mockResolvedValue([]),
+      getStatus: vi.fn().mockResolvedValue({
+        running_count: 0, binary_version: "0.0.0-test", profiles_total: 0,
+        binary_downloading: false, binary_download_percent: null,
+        binary_download_state: null, default_idle_timeout_seconds: 3600,
+      }),
     },
     setOnUnauthorized: vi.fn(),
     ApiError,

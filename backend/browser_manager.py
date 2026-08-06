@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
+
 from cloakbrowser import launch_persistent_context_async
 from cloakbrowser.download import ensure_binary
 
@@ -443,6 +445,39 @@ CLOSING_SIGKILL_AFTER_S = 15.0
 # all refusing, until the user happened to click something.
 CLAIM_SWEEP_INTERVAL_S = 5.0
 
+# A profile with no VNC viewer attached and no CDP traffic for this long is
+# stopped automatically — releasing its CloakBrowser license claim rather than
+# holding a Chromium (and a GPU/display) open indefinitely. Per-profile
+# idle_timeout_seconds overrides this; 0 disables idle timeout for that
+# profile. See reap_idle_profiles().
+DEFAULT_IDLE_TIMEOUT_S = int(os.environ.get("PROFILE_IDLE_TIMEOUT_SECONDS", "3600"))
+# The viewer-liveness probe hits 127.0.0.1 and Kasm answers it in ~3ms without
+# touching the frame clock (see _viewer_attached below), so anything slower
+# means the control plane is sick, not busy — give up rather than let one
+# stuck profile stall the whole idle sweep.
+KASM_VIEWER_PROBE_TIMEOUT_S = 2.0
+
+
+def _viewer_attached(bottleneck: Any) -> bool | None:
+    """Whether a viewer WebSocket is attached, or None if we cannot tell.
+
+    /api/get_bottleneck_stats is the only exact liveness signal Kasm exposes:
+    entries are keyed by peerEndpoint, written per client per framebuffer
+    update (VNCSConnectionST::sendStats) and erased in ~VNCSConnectionST, so
+    the object goes empty the moment the last viewer socket dies. Verified
+    live going empty -> populated -> empty across a connect/disconnect while
+    /api/get_sessions stayed stale on the same run.
+
+    None means "no answer" — a 401/5xx, an unreachable port or a body we
+    could not parse. Callers must not treat that as "no viewer": only a
+    definitively empty object is evidence of a dead socket, and acting on a
+    control-plane blip would tear down a perfectly healthy session (or, for
+    the idle reaper, stop a profile someone is actively watching).
+    """
+    if not isinstance(bottleneck, dict):
+        return None
+    return len(bottleneck) > 0
+
 BASE_CDP_PORT = 5100
 CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
 # Loopback liveness probe: a live Chromium answers instantly, a dead one
@@ -729,6 +764,15 @@ class RunningProfile:
     # hands back the identical pair and a stale viewer token would authorise
     # against the new session. A nonce cannot be recycled.
     session_epoch: str = field(default_factory=lambda: secrets.token_hex(8))
+    # Resolved once at launch from the profile's idle_timeout_seconds (or
+    # DEFAULT_IDLE_TIMEOUT_S) — a later edit takes effect on the next launch,
+    # the same restart-required contract extensions.py already documents.
+    # <= 0 disables idle timeout for this running instance.
+    idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_S
+    # Bumped by touch_activity() on real VNC-viewer or CDP traffic; compared
+    # against idle_timeout_seconds by reap_idle_profiles(). monotonic, not
+    # wall-clock, so it cannot be upset by a clock step.
+    last_active: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -1008,6 +1052,10 @@ class BrowserManager:
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
 
+            idle_timeout_seconds = profile.get("idle_timeout_seconds")
+            if idle_timeout_seconds is None:
+                idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_S
+
             running = RunningProfile(
                 profile_id=profile_id,
                 context=context,
@@ -1016,6 +1064,7 @@ class BrowserManager:
                 cdp_port=cdp_port,
                 user_data_dir=profile["user_data_dir"],
                 proc=proc,
+                idle_timeout_seconds=idle_timeout_seconds,
             )
 
             async with self._lock:
@@ -1416,13 +1465,88 @@ class BrowserManager:
             # checked, so a concurrent real close is idempotent.
             await self._on_browser_closed(profile_id, running.context)
 
+    def touch_activity(self, profile_id: str) -> None:
+        """Reset a running profile's idle clock. Safe to call for anything.
+
+        Called from main.py's CDP proxy on every message forwarded in either
+        direction (a real command or event, never just a protocol-level
+        ping/pong — those are handled below the app layer and never reach
+        here) and from _probe_viewer_activity below on a live VNC viewer.
+        """
+        running = self.running.get(profile_id)
+        if running is not None:
+            running.last_active = time.monotonic()
+
+    async def _probe_viewer_activity(self, running: RunningProfile) -> None:
+        """Touch activity for `running` if a VNC viewer is attached right now.
+
+        Headless profiles and VNC traffic in general never reach this process
+        — nginx proxies /viewer/ straight to Kasm's ws_port (see
+        docker/nginx.conf) — so this is the only way the idle reaper can see
+        a viewer at all. Reuses the exact probe /api/viewer-attached already
+        uses, on the theory that a second definition of "attached" would
+        eventually disagree with the first.
+        """
+        if running.display is None or running.ws_port is None:
+            return
+        try:
+            auth = self.vnc.get_api_credentials(running.display)
+            async with httpx.AsyncClient(
+                timeout=KASM_VIEWER_PROBE_TIMEOUT_S, auth=auth,
+            ) as client:
+                resp = await client.get(
+                    f"http://127.0.0.1:{running.ws_port}/api/get_bottleneck_stats"
+                )
+            if resp.status_code >= 400:
+                return
+            bottleneck = resp.json()
+        except Exception as exc:
+            logger.debug(
+                "Idle sweep: viewer probe unavailable for %s: %s", running.profile_id, exc,
+            )
+            return
+        if _viewer_attached(bottleneck):
+            self.touch_activity(running.profile_id)
+
+    async def reap_idle_profiles(self) -> None:
+        """Stop profiles idle past their timeout, releasing their license claim.
+
+        "Idle" is the absence of BOTH signals this manager can see: a VNC
+        viewer attached (probed fresh every pass, since that traffic never
+        reaches this process) and CDP traffic (touched directly by the proxy
+        as it happens). Neither implies the other — a profile driven purely
+        by Playwright has no viewer, and one only ever watched over VNC has no
+        CDP client — so a profile is idle only when both have been silent.
+        """
+        for profile_id, running in list(self.running.items()):
+            if running.idle_timeout_seconds <= 0:
+                continue  # 0 disables idle timeout for this profile
+            try:
+                await self._probe_viewer_activity(running)
+            except Exception as exc:
+                logger.warning("Idle sweep: viewer probe failed for %s: %s", profile_id, exc)
+            if self.running.get(profile_id) is not running:
+                continue  # stopped/relaunched by something else mid-probe
+            idle_for = time.monotonic() - running.last_active
+            if idle_for < running.idle_timeout_seconds:
+                continue
+            logger.info(
+                "Profile %s idle for %.0fs (timeout %ds) — stopping to release "
+                "its license claim", profile_id, idle_for, running.idle_timeout_seconds,
+            )
+            try:
+                await self.stop(profile_id)
+            except Exception as exc:
+                logger.warning("Idle sweep: stop failed for %s: %s", profile_id, exc)
+
     async def run_maintenance(self) -> None:
-        """Background loop: resolve teardown claims and reap dead browsers."""
+        """Background loop: resolve teardown claims, reap dead/idle browsers."""
         while True:
             await asyncio.sleep(CLAIM_SWEEP_INTERVAL_S)
             try:
                 await self.sweep_teardown_claims()
                 await self.reap_dead_browsers()
+                await self.reap_idle_profiles()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

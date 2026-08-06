@@ -54,6 +54,7 @@ def init_db():
                 color_scheme TEXT,
                 license_key TEXT,
                 enabled_extensions TEXT DEFAULT '[]',
+                idle_timeout_seconds INTEGER,
                 notes TEXT,
                 user_data_dir TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -86,6 +87,9 @@ def init_db():
         if "enabled_extensions" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN enabled_extensions TEXT DEFAULT '[]'")
             conn.commit()
+        if "idle_timeout_seconds" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN idle_timeout_seconds INTEGER")
+            conn.commit()
 
 
 def _now() -> str:
@@ -110,9 +114,9 @@ def create_profile(
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
                 clipboard_sync, auto_launch, color_scheme, license_key,
-                enabled_extensions, launch_args, notes,
+                enabled_extensions, idle_timeout_seconds, launch_args, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
                 fields.get("proxy"),
@@ -134,6 +138,7 @@ def create_profile(
                 fields.get("color_scheme"),
                 fields.get("license_key"),
                 json.dumps(fields.get("enabled_extensions") or []),
+                fields.get("idle_timeout_seconds"),
                 json.dumps(fields.get("launch_args") or []),
                 fields.get("notes"),
                 user_data_dir, now, now,
@@ -203,7 +208,7 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
         "clipboard_sync", "auto_launch", "color_scheme", "license_key",
-        "enabled_extensions", "launch_args", "notes",
+        "enabled_extensions", "idle_timeout_seconds", "launch_args", "notes",
     ):
         if col in fields:
             update_cols.append(f"{col} = ?")

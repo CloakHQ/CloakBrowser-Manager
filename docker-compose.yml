@@ -50,6 +50,11 @@ services:
       # missing key, exit 76 once the plan's concurrent-session limit is
       # taken. Swapping the license needs no rebuild, just a restart.
       - CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY:-}
+      # Bare, NOT `=${...:-}`: browser_manager.py does
+      # int(os.environ.get("PROFILE_IDLE_TIMEOUT_SECONDS", "3600")), and the
+      # `:-` form would inject an empty string when unset rather than leaving
+      # the var absent — int("") crashes the app on startup.
+      - PROFILE_IDLE_TIMEOUT_SECONDS
       # Extra names/addresses to put in the self-signed cert's SAN list, comma
       # separated (e.g. TLS_SANS=192.168.1.50,manager.lan). localhost and
       # 127.0.0.1 are always included. The container cannot discover the host's

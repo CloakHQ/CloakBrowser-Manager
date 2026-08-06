@@ -60,6 +60,10 @@ export interface Profile {
   /** Ids (Extension.id) of the extensions this profile loads, from the set
    *  GET /api/extensions returns. */
   enabled_extensions: string[];
+  /** Seconds of no VNC-viewer/CDP activity before this profile auto-stops.
+   *  null defers to SystemStatus.default_idle_timeout_seconds; 0 disables
+   *  idle timeout for this profile. */
+  idle_timeout_seconds: number | null;
   launch_args: string[];
   notes: string | null;
   user_data_dir: string;
@@ -93,6 +97,7 @@ export interface ProfileCreateData {
   color_scheme?: string | null;
   license_key?: string | null;
   enabled_extensions?: string[] | null;
+  idle_timeout_seconds?: number | null;
   launch_args?: string[];
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
@@ -117,6 +122,9 @@ export interface SystemStatus {
   binary_downloading: boolean;
   binary_download_percent: number | null;
   binary_download_state: string | null;
+  /** PROFILE_IDLE_TIMEOUT_SECONDS as actually resolved — what a blank
+   *  per-profile idle timeout field means. */
+  default_idle_timeout_seconds: number;
 }
 
 /** An unpacked extension found under EXTENSIONS_DIR at container startup —

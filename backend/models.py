@@ -51,6 +51,12 @@ class ProfileCreate(BaseModel):
     # freshly created profile starts with every extension enabled rather
     # than none. See main.py's create_profile.
     enabled_extensions: list[str] | None = None
+    # Seconds of no VNC-viewer/CDP activity before this profile is stopped
+    # automatically (releasing its CloakBrowser license claim). None (the
+    # default) defers to PROFILE_IDLE_TIMEOUT_SECONDS (60 min if unset); 0
+    # disables idle timeout for this profile. See browser_manager.py's
+    # reap_idle_profiles.
+    idle_timeout_seconds: int | None = None
     launch_args: list[str] = Field(default_factory=list)
     notes: str | None = None
     tags: list[TagCreate] | None = None
@@ -78,6 +84,7 @@ class ProfileUpdate(BaseModel):
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
     license_key: str | None = Field(default=None)
     enabled_extensions: list[str] | None = None
+    idle_timeout_seconds: int | None = Field(default=None)
     launch_args: list[str] | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
@@ -122,6 +129,7 @@ class ProfileResponse(BaseModel):
     color_scheme: str | None = None
     license_key: str | None = None
     enabled_extensions: list[str] = []
+    idle_timeout_seconds: int | None = None
     launch_args: list[str] = []
     notes: str | None = None
     user_data_dir: str
@@ -156,6 +164,9 @@ class StatusResponse(BaseModel):
     binary_downloading: bool = False
     binary_download_percent: int | None = None
     binary_download_state: str | None = None
+    # PROFILE_IDLE_TIMEOUT_SECONDS as actually resolved, so the profile form
+    # can show what "leave blank" means instead of a hardcoded guess.
+    default_idle_timeout_seconds: int = 3600
 
 
 class ProfileStatusResponse(BaseModel):

@@ -76,6 +76,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
   const [extensions, setExtensions] = useState<Extension[]>([]);
+  const [defaultIdleTimeoutSeconds, setDefaultIdleTimeoutSeconds] = useState(3600);
 
   useEffect(() => {
     if (profile) {
@@ -100,6 +101,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         auto_launch: profile.auto_launch,
         color_scheme: profile.color_scheme,
         license_key: profile.license_key,
+        idle_timeout_seconds: profile.idle_timeout_seconds,
         enabled_extensions: profile.enabled_extensions ?? [],
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
@@ -123,6 +125,15 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         }
       })
       .catch((err) => console.warn("[extensions] failed to load:", err));
+  }, []);
+
+  // Just for the placeholder below — shows what "leave blank" actually
+  // resolves to instead of a hardcoded guess that could drift from
+  // PROFILE_IDLE_TIMEOUT_SECONDS.
+  useEffect(() => {
+    api.getStatus()
+      .then((s) => setDefaultIdleTimeoutSeconds(s.default_idle_timeout_seconds))
+      .catch((err) => console.warn("[status] failed to load:", err));
   }, []);
 
   const set = <K extends keyof ProfileCreateData>(key: K, value: ProfileCreateData[K]) => {
@@ -498,6 +509,29 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               />
               Launch automatically when container starts
             </label>
+            <div>
+              <label className="label">Idle Timeout (minutes)</label>
+              <input
+                className="input no-spin"
+                type="number"
+                min={0}
+                value={form.idle_timeout_seconds != null ? form.idle_timeout_seconds / 60 : ""}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  set(
+                    "idle_timeout_seconds",
+                    raw === "" ? null : Math.max(0, Math.round(Number(raw) * 60)),
+                  );
+                }}
+                placeholder={`Container default (${Math.round(defaultIdleTimeoutSeconds / 60)} min)`}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Stops this profile automatically after this many minutes with no attached
+                VNC viewer and no CDP traffic, releasing its CloakBrowser license claim.
+                Leave blank to use the container's default; enter 0 to disable idle
+                timeout for this profile.
+              </p>
+            </div>
             {/* The form has always SUBMITTED headless; it just never rendered a
                 control for it, so the option was unreachable from the UI. */}
             <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">

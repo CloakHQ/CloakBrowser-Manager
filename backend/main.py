@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -27,7 +28,15 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
 from .binary_status import snapshot as binary_status_snapshot
-from .browser_manager import LAUNCH_TIMEOUT_S, BrowserManager, ProfileAlreadyRunning
+from .browser_manager import (
+    DEFAULT_IDLE_TIMEOUT_S,
+    KASM_VIEWER_PROBE_TIMEOUT_S,
+    LAUNCH_TIMEOUT_S,
+    BrowserManager,
+    ProfileAlreadyRunning,
+    RunningProfile,
+    _viewer_attached,
+)
 from .extensions import list_available_extensions
 from .vnc_manager import viewer_stream_mode_preference
 from .models import (
@@ -662,30 +671,10 @@ async def viewer_auth(request: Request):
 # so this request is expected to time out; keep it well under the client-wide
 # timeout so a stats poll stays cheap.
 KASM_FRAME_STATS_TIMEOUT_S = 1.5
-# The viewer-liveness probe hits 127.0.0.1 and Kasm answers it in ~3ms without
-# touching the frame clock, so anything slower means the control plane is sick,
-# not busy — report "unknown" rather than making the caller wait.
-KASM_VIEWER_PROBE_TIMEOUT_S = 2.0
-
-
-def _viewer_attached(bottleneck) -> bool | None:
-    """Whether a viewer WebSocket is attached, or None if we cannot tell.
-
-    /api/get_bottleneck_stats is the only exact liveness signal Kasm exposes:
-    entries are keyed by peerEndpoint, written per client per framebuffer update
-    (VNCSConnectionST::sendStats) and erased in ~VNCSConnectionST, so the object
-    goes empty the moment the last viewer socket dies. Verified live going
-    empty -> populated -> empty across a connect/disconnect while
-    /api/get_sessions stayed stale on the same run.
-
-    None means "no answer" — a 401/5xx, an unreachable port or a body we could
-    not parse. Callers must not treat that as "no viewer": only a definitively
-    empty object is evidence of a dead socket, and acting on a control-plane
-    blip would tear down a perfectly healthy session.
-    """
-    if not isinstance(bottleneck, dict):
-        return None
-    return len(bottleneck) > 0
+# KASM_VIEWER_PROBE_TIMEOUT_S and _viewer_attached live in browser_manager.py
+# (imported above) — reap_idle_profiles needs the exact same "is a viewer
+# attached" definition this endpoint uses, and a second copy would eventually
+# disagree with the first.
 
 
 def _viewer_client_count(bottleneck) -> int | None:
@@ -848,6 +837,7 @@ async def get_system_status():
         binary_downloading=binary["downloading"],
         binary_download_percent=binary["percent"],
         binary_download_state=binary["state"],
+        default_idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_S,
     )
 
 
@@ -1056,12 +1046,69 @@ async def get_clipboard(profile_id: str):
 # Simple bidirectional passthrough — CDP is standard JSON over WebSocket.
 
 
+async def _ensure_running_for_cdp(profile_id: str) -> tuple[RunningProfile | None, str]:
+    """Auto-launch a profile on its first CDP hit if it isn't already running.
+
+    A safeguard, not the primary flow: whoever holds a profile id is expected
+    to have launched it through the UI/API already, exactly like the idle
+    reaper expects them to have stopped watching it before it goes idle. But a
+    CDP client (Playwright, Puppeteer, chrome-remote-interface) that dials
+    straight into a stopped profile id should get a working session, not a
+    404 for a profile that plainly exists and could serve one — the same
+    capability-URL model that already lets that id skip the bearer token
+    (see _PROFILE_CAPABILITY_PATH above) covers launching it too.
+
+    Returns (running, "") on success, or (None, <reason>) — the reason is
+    "Profile not found" only when the id has no profile at all; every other
+    failure is a launch problem, not a 404.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if running:
+        return running, ""
+
+    profile = db.get_profile(profile_id)
+    if not profile:
+        return None, "Profile not found"
+
+    if browser_mgr.is_starting(profile_id):
+        # Something else already kicked off a launch (e.g. a concurrent CDP
+        # hit, or the UI). Wait it out instead of racing a second launch.
+        deadline = time.monotonic() + LAUNCH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            running = browser_mgr.running.get(profile_id)
+            if running:
+                return running, ""
+            if not browser_mgr.is_starting(profile_id):
+                break
+        running = browser_mgr.running.get(profile_id)
+        return (running, "") if running else (None, "Launch timed out")
+
+    try:
+        running = await asyncio.wait_for(
+            browser_mgr.launch(profile), timeout=LAUNCH_TIMEOUT_S,
+        )
+        return running, ""
+    except asyncio.TimeoutError:
+        logger.error("CDP auto-launch timed out for %s", profile_id)
+        return None, "Launch timed out"
+    except ProfileAlreadyRunning:
+        # Lost a race with a concurrent launch; its result is what we want.
+        running = browser_mgr.running.get(profile_id)
+        return (running, "") if running else (None, "Launch failed")
+    except Exception as exc:
+        logger.error("CDP auto-launch failed for %s: %s", profile_id, exc)
+        return None, "Failed to launch browser"
+
+
 @app.get("/api/profiles/{profile_id}/cdp")
 async def cdp_info(profile_id: str, request: Request):
     """Return CDP connection info. Prevents SPA catch-all from serving index.html."""
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+        raise HTTPException(
+            status_code=404 if error == "Profile not found" else 502, detail=error,
+        )
     # Scheme and host from the ORIGINAL request, like the neighbouring
     # /json/version endpoint. A hardcoded http://<host> behind a TLS terminator
     # is a snippet that cannot work: an https-only ingress either refuses it or
@@ -1081,9 +1128,11 @@ async def cdp_info(profile_id: str, request: Request):
 @app.get("/api/profiles/{profile_id}/cdp/json/version")
 async def cdp_json_version(profile_id: str, request: Request):
     """Proxy Chrome's /json/version, rewriting WS URLs to go through our proxy."""
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+        raise HTTPException(
+            status_code=404 if error == "Profile not found" else 502, detail=error,
+        )
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1108,9 +1157,11 @@ async def cdp_json_version(profile_id: str, request: Request):
 @app.get("/api/profiles/{profile_id}/cdp/json")
 async def cdp_json_list(profile_id: str, request: Request):
     """Proxy Chrome's /json/list, rewriting WS URLs."""
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+        raise HTTPException(
+            status_code=404 if error == "Profile not found" else 502, detail=error,
+        )
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1134,11 +1185,16 @@ async def cdp_json_list(profile_id: str, request: Request):
 
 
 async def _proxy_cdp_websocket(
-    websocket: WebSocket, target_url: str, label: str,
+    websocket: WebSocket, target_url: str, label: str, profile_id: str,
 ) -> None:
     """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
 
-    Used by both browser-level and page-level CDP proxy endpoints.
+    Used by both browser-level and page-level CDP proxy endpoints. Touches the
+    profile's idle clock on every forwarded message (either direction) — but
+    NOT on the protocol-level ping/pong uvicorn and this proxy exchange to
+    keep the socket open, which never reaches `receive()`/`async for` as an
+    app-level message. A CDP client attached but issuing no real commands is
+    exactly the case reap_idle_profiles is meant to catch.
     """
     import websockets
 
@@ -1155,8 +1211,10 @@ async def _proxy_cdp_websocket(
                         if msg.get("type") == "websocket.disconnect":
                             break
                         if "text" in msg and msg["text"]:
+                            browser_mgr.touch_activity(profile_id)
                             await cdp_ws.send(msg["text"])
                         elif "bytes" in msg and msg["bytes"]:
+                            browser_mgr.touch_activity(profile_id)
                             await cdp_ws.send(msg["bytes"])
                 except WebSocketDisconnect:
                     pass
@@ -1166,6 +1224,7 @@ async def _proxy_cdp_websocket(
             async def cdp_to_client():
                 try:
                     async for msg in cdp_ws:
+                        browser_mgr.touch_activity(profile_id)
                         if isinstance(msg, str):
                             await websocket.send_text(msg)
                         else:
@@ -1199,9 +1258,11 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
     if not await _check_websocket_origin(websocket):
         return
 
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        await websocket.close(code=4004, reason="Profile not running")
+        await websocket.close(
+            code=4004 if error == "Profile not found" else 4005, reason=error,
+        )
         return
 
     await websocket.accept()
@@ -1218,7 +1279,7 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4005, reason="CDP not available")
         return
 
-    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]")
+    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]", profile_id)
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
@@ -1227,15 +1288,19 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     if not await _check_websocket_origin(websocket):
         return
 
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        await websocket.close(code=4004, reason="Profile not running")
+        await websocket.close(
+            code=4004 if error == "Profile not found" else 4005, reason=error,
+        )
         return
 
     await websocket.accept()
 
     target_url = f"ws://127.0.0.1:{running.cdp_port}/devtools/{path}"
-    await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
+    await _proxy_cdp_websocket(
+        websocket, target_url, f"CDP page proxy [{profile_id}]", profile_id,
+    )
 
 
 # ── Static Frontend ───────────────────────────────────────────────────────────
