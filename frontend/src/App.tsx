@@ -3,6 +3,7 @@ import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { useBinaryDownload } from "./hooks/useBinaryDownload";
 import { useResourceUsage } from "./hooks/useResourceUsage";
+import { useIdleCountdown, formatCountdown } from "./hooks/useIdleCountdown";
 import { api, setOnUnauthorized, type ProfileCreateData, type ProfileLifecycle } from "./lib/api";
 import { CookieWarmupPanel } from "./components/CookieWarmupPanel";
 import { ProfileList } from "./components/ProfileList";
@@ -128,6 +129,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
   const resourceUsage = useResourceUsage(selected?.id ?? null, selected?.status === "running");
+  const idleRemaining = useIdleCountdown(resourceUsage?.idle_remaining_seconds ?? null);
 
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
@@ -275,6 +277,14 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                     title={`Whole Chromium process tree: ${resourceUsage.process_count} process(es). CPU is per-core (top's convention) — over 100% means more than one core busy.`}
                   >
                     · {resourceUsage.cpu_percent.toFixed(1)}% CPU · {resourceUsage.memory_mb.toFixed(0)} MB
+                  </span>
+                )}
+                {idleRemaining !== null && (
+                  <span
+                    className={idleRemaining <= 60 ? "text-xs text-amber-400" : "text-xs text-gray-500"}
+                    title="Time until this profile auto-stops from inactivity (no VNC viewer or CDP traffic)"
+                  >
+                    · auto-stop in {formatCountdown(idleRemaining)}
                   </span>
                 )}
               </div>

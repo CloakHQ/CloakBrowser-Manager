@@ -177,6 +177,10 @@ export interface ResourceUsage {
   cpu_percent: number | null;
   memory_mb: number | null;
   process_count: number;
+  /** Seconds until the idle-timeout reaper auto-stops this profile, computed
+   *  fresh on every poll. null when idle timeout is disabled for it (<= 0).
+   *  Never negative. See useIdleCountdown for the client-side ticking. */
+  idle_remaining_seconds: number | null;
 }
 
 export interface SystemCheck {

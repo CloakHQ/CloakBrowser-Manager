@@ -226,6 +226,13 @@ class ResourceUsageResponse(BaseModel):
     cpu_percent: float | None = None
     memory_mb: float | None = None
     process_count: int = 0
+    # Seconds until browser_manager.reap_idle_profiles() auto-stops this
+    # profile for inactivity, computed fresh from the same
+    # idle_timeout_seconds/last_active fields that reaper itself checks.
+    # None when idle timeout is disabled for this profile (<= 0), never
+    # negative — clamped to 0 rather than going below it while the reaper's
+    # own 5s sweep interval catches up.
+    idle_remaining_seconds: int | None = None
 
 
 class SystemCheckResponse(BaseModel):

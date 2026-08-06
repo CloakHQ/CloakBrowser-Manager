@@ -14,7 +14,7 @@ const mockApi = api as unknown as { profileResources: ReturnType<typeof vi.fn> }
 
 beforeEach(() => {
   mockApi.profileResources.mockResolvedValue({
-    cpu_percent: 12.3, memory_mb: 256, process_count: 5,
+    cpu_percent: 12.3, memory_mb: 256, process_count: 5, idle_remaining_seconds: null,
   });
 });
 
@@ -36,7 +36,9 @@ describe("useResourceUsage", () => {
   it("polls and returns usage for a running profile", async () => {
     const { result } = renderHook(() => useResourceUsage("p1", true));
     await waitFor(() => expect(result.current).not.toBeNull());
-    expect(result.current).toEqual({ cpu_percent: 12.3, memory_mb: 256, process_count: 5 });
+    expect(result.current).toEqual({
+      cpu_percent: 12.3, memory_mb: 256, process_count: 5, idle_remaining_seconds: null,
+    });
     expect(mockApi.profileResources).toHaveBeenCalledWith("p1");
   });
 

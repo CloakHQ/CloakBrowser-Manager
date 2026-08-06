@@ -22,6 +22,7 @@ vi.mock("./lib/api", () => {
       createViewerToken: vi.fn(),
       launchProfile: vi.fn(),
       stopProfile: vi.fn(),
+      profileResources: vi.fn(),
       logout: vi.fn(),
       // ProfileForm (rendered by the "edit"/"create" views) fetches these on
       // mount regardless of what a given test is exercising.
@@ -221,6 +222,62 @@ describe("Container self-check panel", () => {
     await flush();
 
     expect(screen.getByText("150.0.0")).toBeInTheDocument();
+  });
+});
+
+describe("Idle-timeout countdown", () => {
+  async function selectRunningProfile() {
+    mockApi.listProfiles.mockResolvedValue([profile("running")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+  }
+
+  it("shows a countdown when the profile has idle timeout enabled", async () => {
+    mockApi.profileResources.mockResolvedValue({
+      cpu_percent: 1, memory_mb: 100, process_count: 2, idle_remaining_seconds: 125,
+    });
+    await selectRunningProfile();
+    expect(screen.getByText(/auto-stop in 2m05s/)).toBeInTheDocument();
+  });
+
+  it("shows nothing when idle timeout is disabled for the profile", async () => {
+    mockApi.profileResources.mockResolvedValue({
+      cpu_percent: 1, memory_mb: 100, process_count: 2, idle_remaining_seconds: null,
+    });
+    await selectRunningProfile();
+    expect(screen.queryByText(/auto-stop in/)).not.toBeInTheDocument();
+  });
+
+  it("ticks down between the 5s resource polls", async () => {
+    mockApi.profileResources.mockResolvedValue({
+      cpu_percent: 1, memory_mb: 100, process_count: 2, idle_remaining_seconds: 10,
+    });
+    await selectRunningProfile();
+    expect(screen.getByText(/auto-stop in 0m10s/)).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByText(/auto-stop in 0m07s/)).toBeInTheDocument();
+  });
+
+  it("disappears once the profile stops running", async () => {
+    mockApi.profileResources.mockResolvedValue({
+      cpu_percent: 1, memory_mb: 100, process_count: 2, idle_remaining_seconds: 30,
+    });
+    await selectRunningProfile();
+    expect(screen.getByText(/auto-stop in/)).toBeInTheDocument();
+
+    mockApi.listProfiles.mockResolvedValue([profile("stopped")]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    await flush();
+    expect(screen.queryByText(/auto-stop in/)).not.toBeInTheDocument();
   });
 });
 

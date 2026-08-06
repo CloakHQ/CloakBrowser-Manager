@@ -363,6 +363,8 @@ def test_get_profile_resources_for_a_running_profile(app_client: TestClient):
     )
     running = MagicMock(spec=RunningProfile)
     running.proc = proc
+    running.idle_timeout_seconds = 3600
+    running.last_active = time.monotonic()
     main.browser_mgr.running[pid] = running
     try:
         resp = app_client.get(f"/api/profiles/{pid}/resources")
@@ -385,6 +387,65 @@ def test_get_profile_resources_404_when_not_running(app_client: TestClient):
 def test_get_profile_resources_404_for_unknown_profile(app_client: TestClient):
     resp = app_client.get("/api/profiles/nonexistent/resources")
     assert resp.status_code == 404
+
+
+def _mock_running_for_resources(pid: str, idle_timeout_seconds: int, last_active: float):
+    stat = bm._proc_stat(os.getpid())
+    proc = bm.BrowserProcess(
+        pid=os.getpid(), starttime=stat[2], user_data_dir="/tmp", cdp_port=5100,
+    )
+    running = MagicMock(spec=RunningProfile)
+    running.proc = proc
+    running.idle_timeout_seconds = idle_timeout_seconds
+    running.last_active = last_active
+    main.browser_mgr.running[pid] = running
+    return running
+
+
+def test_get_profile_resources_reports_idle_remaining_seconds(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "IdleRemaining"})
+    pid = create.json()["id"]
+    now = time.monotonic()
+    _mock_running_for_resources(pid, idle_timeout_seconds=600, last_active=now - 100)
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        remaining = resp.json()["idle_remaining_seconds"]
+        # Not exact: real wall-clock elapses between last_active and the
+        # request. Bounded rather than pinned to 500 so this isn't flaky.
+        assert 490 <= remaining <= 500
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_profile_resources_idle_remaining_seconds_is_null_when_disabled(
+    app_client: TestClient,
+):
+    create = app_client.post("/api/profiles", json={"name": "IdleDisabled"})
+    pid = create.json()["id"]
+    _mock_running_for_resources(pid, idle_timeout_seconds=0, last_active=time.monotonic())
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        assert resp.json()["idle_remaining_seconds"] is None
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_profile_resources_idle_remaining_seconds_clamps_at_zero(app_client: TestClient):
+    # The reaper's own sweep runs every 5s, so a request in that window can
+    # land after the deadline has technically passed; a negative number here
+    # would read as "N seconds ago" in the UI instead of "any moment now".
+    create = app_client.post("/api/profiles", json={"name": "IdleOverdue"})
+    pid = create.json()["id"]
+    now = time.monotonic()
+    _mock_running_for_resources(pid, idle_timeout_seconds=60, last_active=now - 9999)
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        assert resp.json()["idle_remaining_seconds"] == 0
+    finally:
+        main.browser_mgr.running.pop(pid, None)
 
 
 # ── Extensions upload ────────────────────────────────────────────────────────

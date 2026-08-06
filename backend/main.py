@@ -774,7 +774,11 @@ async def get_profile_resources(profile_id: str):
     if not running or running.proc is None:
         raise HTTPException(status_code=404, detail="Profile not running")
     usage = await get_resource_usage(running.proc)
-    return ResourceUsageResponse(**usage)
+    idle_remaining = None
+    if running.idle_timeout_seconds > 0:
+        elapsed = time.monotonic() - running.last_active
+        idle_remaining = max(0, round(running.idle_timeout_seconds - elapsed))
+    return ResourceUsageResponse(**usage, idle_remaining_seconds=idle_remaining)
 
 
 # ── Tab manager ──────────────────────────────────────────────────────────────
