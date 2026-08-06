@@ -154,6 +154,16 @@ export interface ProfileStatus {
   browser_alive: boolean | null;
 }
 
+export interface DownloadFile {
+  name: string;
+  isDirectory: boolean;
+  /** cubone/react-file-manager's own convention: "/<filename>", relative to
+   *  the profile's Downloads dir (which is flat — no subfolders). */
+  path: string;
+  size: number | null;
+  updatedAt: string;
+}
+
 export interface ResourceUsage {
   /** Un-normalized per-core percent (top's convention): three fully-busy
    *  renderer processes can legitimately sum past 100. null (not 0) means
@@ -328,8 +338,25 @@ export const api = {
   profileResources: (id: string) =>
     request<ResourceUsage>(`/api/profiles/${id}/resources`),
 
+  listDownloads: (id: string) =>
+    request<DownloadFile[]>(`/api/profiles/${id}/downloads`),
+
+  deleteDownload: (id: string, path: string) =>
+    request<{ ok: boolean }>(`/api/profiles/${id}/downloads${path}`, { method: "DELETE" }),
+
   viewerAttached: (id: string) =>
     request<ViewerAttached>(`/api/profiles/${id}/viewer-attached`),
 };
+
+// Not a JSON fetch — a URL for window.open()/an <a href>, so the browser's
+// own download flow handles the FileResponse(..., filename=...) the server
+// sends (Content-Disposition: attachment). `path` already carries its own
+// leading "/" (cubone/react-file-manager's convention), hence no separator
+// here. A plain function, not a member of `api`, so it isn't swept into
+// api.test.ts's "every api method bounds its fetch" exhaustiveness check —
+// it never calls fetch at all.
+export function downloadFileUrl(id: string, path: string): string {
+  return `/api/profiles/${id}/downloads${path}`;
+}
 
 export { ApiError };

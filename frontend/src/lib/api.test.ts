@@ -94,6 +94,8 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   createViewerToken: ["p1"],
   profileStatus: ["p1"],
   profileResources: ["p1"],
+  listDownloads: ["p1"],
+  deleteDownload: ["p1", "/file.txt"],
   viewerAttached: ["p1"],
 };
 

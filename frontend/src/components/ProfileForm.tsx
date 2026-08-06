@@ -1,6 +1,7 @@
 import { Copy, RefreshCw, Save, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
+import { DownloadsBrowser } from "./DownloadsBrowser";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
@@ -856,6 +857,14 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
             placeholder="Optional notes about this profile..."
           />
         </section>
+
+        {/* Downloads — only once a profile (and its Downloads folder) exists */}
+        {isEdit && profile && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Downloads</h3>
+            <DownloadsBrowser profileId={profile.id} />
+          </section>
+        )}
       </div>
 
     </form>

@@ -129,6 +129,136 @@ def test_delete_profile_not_found(app_client: TestClient):
     assert resp.status_code == 404
 
 
+# ── Profile downloads ─────────────────────────────────────────────────────────
+
+
+def test_list_downloads_empty_when_directory_absent(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NoDownloadsYet"})
+    pid = create.json()["id"]
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_downloads_404_for_unknown_profile(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/downloads")
+    assert resp.status_code == 404
+
+
+def test_list_downloads_reports_real_files(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "HasDownloads"})
+    pid = create.json()["id"]
+    user_data_dir = pathlib.Path(create.json()["user_data_dir"])
+    downloads_dir = user_data_dir / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "invoice.pdf").write_bytes(b"pdf-bytes-here")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["name"] == "invoice.pdf"
+    assert data[0]["path"] == "/invoice.pdf"
+    assert data[0]["isDirectory"] is False
+    assert data[0]["size"] == len(b"pdf-bytes-here")
+    assert data[0]["updatedAt"]
+
+
+def test_download_profile_file_returns_the_real_content(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "DownloadMe"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "report.txt").write_bytes(b"the actual file content")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads/report.txt")
+
+    assert resp.status_code == 200
+    assert resp.content == b"the actual file content"
+
+
+def test_download_profile_file_404_when_missing(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NoSuchFile"})
+    pid = create.json()["id"]
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads/ghost.txt")
+
+    assert resp.status_code == 404
+
+
+def test_delete_profile_download_removes_the_file(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "DeleteMe"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    target = downloads_dir / "old.zip"
+    target.write_bytes(b"stale archive")
+
+    resp = app_client.delete(f"/api/profiles/{pid}/downloads/old.zip")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert not target.exists()
+
+
+def test_delete_profile_download_404_when_missing(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "DeleteGhost"})
+    pid = create.json()["id"]
+
+    resp = app_client.delete(f"/api/profiles/{pid}/downloads/ghost.txt")
+
+    assert resp.status_code == 404
+
+
+# _resolve_download_path unit tests, not HTTP-level: an HTTP client (httpx,
+# a browser, TestClient) normalizes ".." out of a URL path client-side before
+# the request is even sent, so "GET .../downloads/../Preferences" never
+# reaches this function with a literal ".." in it over that path — a raw
+# request bypassing that normalization (a hand-crafted %2e%2e, a non-
+# normalizing HTTP client) does, and this is what actually stops it.
+def test_resolve_download_path_rejects_parent_traversal(tmp_path):
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+
+    assert main._resolve_download_path(downloads_dir, "../Preferences") is None
+
+
+def test_resolve_download_path_treats_a_leading_slash_as_the_virtual_root(tmp_path):
+    """The listing endpoint hands out "path": "/<filename>" (cubone's own
+    convention — see list_profile_downloads), so a leading "/" here means
+    "relative to downloads_dir", not "OS-absolute" — stripped, not rejected.
+    It is still fully contained: this can only ever land back inside
+    downloads_dir, never escape it, which is what actually matters.
+    """
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "file.txt").write_text("x")
+
+    resolved = main._resolve_download_path(downloads_dir, "/file.txt")
+
+    assert resolved == (downloads_dir / "file.txt").resolve()
+
+
+def test_resolve_download_path_accepts_a_plain_filename(tmp_path):
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "file.txt").write_text("x")
+
+    resolved = main._resolve_download_path(downloads_dir, "file.txt")
+
+    assert resolved == (downloads_dir / "file.txt").resolve()
+
+
+def test_resolve_download_path_rejects_empty_string(tmp_path):
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+
+    assert main._resolve_download_path(downloads_dir, "") is None
+
+
 # ── Per-profile resource usage ───────────────────────────────────────────────
 
 

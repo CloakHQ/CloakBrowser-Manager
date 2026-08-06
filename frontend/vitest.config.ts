@@ -1,8 +1,33 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      // @cubone/react-file-manager's package.json "main" points at raw,
+      // unbuilt src/index.js, which itself imports "./FileManager/FileManager"
+      // — a path that only exists in the pre-build source tree, not in what's
+      // actually published. `vite build` and the dev server never hit this:
+      // both resolve bare-package imports through "module" (the real, working
+      // ESM bundle) by default. Vitest's SSR module graph does not share that
+      // preference and resolves "main" instead, so this aliases the bare
+      // specifier straight at the built file everywhere, tests included.
+      "@cubone/react-file-manager/dist/style.css": fileURLToPath(
+        new URL(
+          "./node_modules/@cubone/react-file-manager/dist/style.css",
+          import.meta.url,
+        ),
+      ),
+      "@cubone/react-file-manager": fileURLToPath(
+        new URL(
+          "./node_modules/@cubone/react-file-manager/dist/react-file-manager.es.js",
+          import.meta.url,
+        ),
+      ),
+    },
+  },
   test: {
     environment: "jsdom",
     globals: true,

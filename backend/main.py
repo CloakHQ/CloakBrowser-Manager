@@ -7,6 +7,7 @@ for browser profile management with live VNC viewing.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hmac
 import json
 import logging
@@ -458,6 +459,102 @@ async def duplicate_profile(profile_id: str):
     ]
     new_profile = db.create_profile(name=_dedupe_profile_name(source["name"]), **fields)
     return _profile_response(new_profile)
+
+
+# ── Profile Downloads ─────────────────────────────────────────────────────────
+# browser_manager.py's download handler (see _finalize_download) is what
+# populates this directory with real filenames in the first place. These
+# routes are a plain, flat file browser over it — no folder navigation, since
+# nothing this Manager writes here ever creates a subdirectory.
+
+
+def _profile_downloads_dir(profile_id: str) -> Path | None:
+    """<user_data_dir>/Downloads for an existing profile, or None if the
+    profile id itself doesn't exist. Distinct from the directory not existing
+    yet (a profile that has never launched) — callers treat that as empty,
+    not missing.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        return None
+    return Path(profile["user_data_dir"]) / "Downloads"
+
+
+def _resolve_download_path(downloads_dir: Path, rel_path: str) -> Path | None:
+    """Containment-checked path under a profile's Downloads dir, or None.
+
+    Same approach as _resolve_spa_file below: Path.__truediv__ discards the
+    left side when the right is absolute, so an absolute rel_path must be
+    rejected explicitly rather than relying on resolve() containment alone.
+    """
+    if not rel_path:
+        return None
+    candidate = Path(rel_path.lstrip("/"))
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        resolved = (downloads_dir / candidate).resolve()
+        root = downloads_dir.resolve()
+    except OSError:
+        return None
+    if resolved != root and root not in resolved.parents:
+        return None
+    return resolved
+
+
+@app.get("/api/profiles/{profile_id}/downloads")
+async def list_profile_downloads(profile_id: str):
+    """Flat file listing in the shape @cubone/react-file-manager's `files`
+    prop expects — see frontend/src/components/DownloadsBrowser.tsx.
+    """
+    downloads_dir = _profile_downloads_dir(profile_id)
+    if downloads_dir is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not downloads_dir.is_dir():
+        return []
+
+    entries = []
+    for entry in sorted(downloads_dir.iterdir()):
+        try:
+            info = entry.stat()
+        except OSError as exc:
+            # A file mid-write, or removed between iterdir() and stat() —
+            # skip it rather than fail the whole listing over one entry.
+            logger.debug("Skipping %s in downloads listing: %s", entry, exc)
+            continue
+        entries.append({
+            "name": entry.name,
+            "isDirectory": entry.is_dir(),
+            "path": f"/{entry.name}",
+            "size": info.st_size if entry.is_file() else None,
+            "updatedAt": datetime.datetime.fromtimestamp(
+                info.st_mtime, tz=datetime.timezone.utc,
+            ).isoformat(),
+        })
+    return entries
+
+
+@app.get("/api/profiles/{profile_id}/downloads/{file_path:path}")
+async def download_profile_file(profile_id: str, file_path: str):
+    downloads_dir = _profile_downloads_dir(profile_id)
+    if downloads_dir is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    resolved = _resolve_download_path(downloads_dir, file_path)
+    if resolved is None or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(resolved, filename=resolved.name)
+
+
+@app.delete("/api/profiles/{profile_id}/downloads/{file_path:path}")
+async def delete_profile_download(profile_id: str, file_path: str):
+    downloads_dir = _profile_downloads_dir(profile_id)
+    if downloads_dir is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    resolved = _resolve_download_path(downloads_dir, file_path)
+    if resolved is None or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    resolved.unlink()
+    return {"ok": True}
 
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
