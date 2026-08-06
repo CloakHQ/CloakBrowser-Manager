@@ -2,13 +2,6 @@ services:
   manager:
     build:
       context: .
-      # Decides which Chromium gets baked in: with a key ensure_binary() fetches
-      # the licensed Pro build, without one it silently falls back to the free
-      # binary and the difference only shows up at run time. Belongs here rather
-      # than in an overlay because ./Dockerfile is what runs ensure_binary().
-      # Compose reads the value from the gitignored .env automatically.
-      args:
-        CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
     # The entrypoint exits if nginx or uvicorn dies; this is what turns that
     # into recovery instead of a permanently broken container.
     restart: unless-stopped
@@ -39,10 +32,12 @@ services:
       # not. Without these the tuning knobs the README documents have no effect
       # under Compose — they only reached the container via `docker run -e`.
       - AUTH_TOKEN=${AUTH_TOKEN:-}
-      # The Pro binary re-validates at run time too — exit 77 on a missing key,
-      # exit 76 once the plan's concurrent-session limit is taken — so it is
-      # needed here as well as at build time. Setting it here swaps the license
-      # without a rebuild.
+      # Not a build arg: the binary is downloaded at container launch (see
+      # Dockerfile), so this is the only place the key is ever needed. It
+      # decides which binary ensure_binary() fetches on first launch, and the
+      # Pro binary re-validates it on every later launch too — exit 77 on a
+      # missing key, exit 76 once the plan's concurrent-session limit is
+      # taken. Swapping the license needs no rebuild, just a restart.
       - CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY:-}
       # Extra names/addresses to put in the self-signed cert's SAN list, comma
       # separated (e.g. TLS_SANS=192.168.1.50,manager.lan). localhost and

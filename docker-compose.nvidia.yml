@@ -46,12 +46,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # Repeated from docker-compose.yml because this is a DIFFERENT service:
-      # build args are per-service, and this is the one that runs
-      # ensure_binary() on the GPU path. Without it the NVIDIA image would
-      # silently ship the free binary while the plain image ships the Pro one.
-      args:
-        CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
     image: cloakbrowser-manager-base:latest
     deploy:
       replicas: 0

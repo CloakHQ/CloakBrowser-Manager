@@ -3,6 +3,11 @@ set -e
 
 # Initialize data directories
 mkdir -p /data/profiles
+# CLOAKBROWSER_CACHE_DIR (set in Dockerfile) points ensure_binary()'s download
+# at this path instead of the default ~/.cloakbrowser, so the ~337MB Chromium
+# binary lives on the /data volume and survives container recreation instead
+# of being re-fetched on every new container.
+mkdir -p /data/cloakbrowser
 
 # Kill stale processes from previous container runs
 pkill -f 'Xvnc :[0-9]' 2>/dev/null || true

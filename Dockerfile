@@ -78,30 +78,37 @@ WORKDIR /app
 COPY backend/requirements.txt /app/backend/
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Pre-download CloakBrowser binary.
+# The CloakBrowser Chromium binary is deliberately NOT downloaded at build
+# time. Two reasons:
 #
-# The key has to be in the environment of THIS stage, and before this RUN.
-# ensure_binary() resolves the licensed Pro build only when it can read a key,
-# and falls back to the free binary silently otherwise — the image then ships
-# one Chromium while the first launch downloads a different one (~337MB) into
-# the /root/.cloakbrowser VOLUME, inside the launch timeout. Measured, same
-# image: no key -> chromium-146.0.7680.177.5, key -> chromium-150.x-pro.
+#   1. License. BINARY-LICENSE.md's "Cloud, Container & Integration Use"
+#      section permits storing the unmodified Binary in an internal Docker
+#      image, but bundling/pre-installing it into an image distributed to
+#      third parties needs a separate OEM/SaaS license. Baking it in here
+#      would make every build of this (public, distributable) image do
+#      exactly that. Downloading at container launch means the image itself
+#      never contains the Binary — each deployment fetches it directly from
+#      CloakHQ under its own key, which is the "dependency listing, not
+#      redistribution" case the same section says needs no commercial
+#      license.
 #
-# Passed as a build ARG sourced from the gitignored .env via compose, so the
-# key stays out of the repo. It is re-exported as ENV because the Pro binary
-# validates its license at RUN time too (a missing key is exit 77), which
-# keeps a plain `docker run <image>` working; compose's `environment:` still
-# overrides it, so a different key needs no rebuild.
-ARG CLOAKBROWSER_LICENSE_KEY
-ENV CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY}
-RUN python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
+#   2. It matches what README.md already documents ("automatically
+#      downloaded on first launch") and what ensure_binary() already does
+#      today when the build-time key differs from the run-time one (see git
+#      history on this comment) — this just makes that the only path instead
+#      of a fallback for a mismatch.
+#
+# CLOAKBROWSER_CACHE_DIR points the download at the /data volume (declared
+# below) instead of the default ~/.cloakbrowser, so the ~337MB binary
+# survives container recreation and is fetched once per deployment, not once
+# per container. entrypoint.sh creates the directory before uvicorn starts.
+ENV CLOAKBROWSER_CACHE_DIR=/data/cloakbrowser
 
-# Application code AFTER the download above, not before it. ensure_binary()
-# needs only the pip layer (the `cloakbrowser` package), never this source, so
-# copying it first bought nothing and cost the whole 337MB download on every
-# edit of a Python file — which is most edits, and which turns a 20s rebuild
-# into a 2.5 minute one. Same reasoning as the nginx.conf/entrypoint.sh copies
-# at the bottom of this file, one layer earlier.
+# Application code. No CLOAKBROWSER_LICENSE_KEY build ARG here any more —
+# nothing at build time consumes it. It still needs to be set at container
+# run time (docker-compose.yml's `environment:`), both to pick the Pro binary
+# on first download and because the Pro binary re-validates its license at
+# every launch (a missing key is exit 77).
 COPY backend/ /app/backend/
 COPY --from=frontend-builder /build/dist /app/frontend/dist
 
@@ -132,8 +139,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=90s \
 VOLUME /data
 
 # Config and entrypoint last: both are tiny and change often, and anything
-# copied above them invalidates the 119MB pip layer and the 337MB
-# ensure_binary download on every edit (~2.5 min of a 3 min build).
+# copied above them invalidates the 119MB pip layer on every edit.
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

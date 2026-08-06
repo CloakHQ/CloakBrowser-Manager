@@ -66,10 +66,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        esac \
     && rm -rf /var/lib/apt/lists/*
 
-# No CLOAKBROWSER_LICENSE_KEY here on purpose: this image is `FROM base`, and
-# the base sets it from its own build ARG alongside the ensure_binary() call
-# that consumes it. Repeating it here would let the two drift, and only the
-# base's value decides which Chromium is actually baked in.
+# No CLOAKBROWSER_LICENSE_KEY here, and none in the base either: the binary is
+# downloaded at container launch (see Dockerfile), not baked into either
+# image, so the key only ever needs to be set at `docker run`/compose time.
 #
 # No ENV for the GPU either. The NVIDIA image needs NVIDIA_VISIBLE_DEVICES /
 # NVIDIA_DRIVER_CAPABILITIES because a runtime hook reads them to decide what to
