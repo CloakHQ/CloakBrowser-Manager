@@ -116,6 +116,12 @@ mkdir -p ~/.cloakbrowser-manager/extensions/my-extension
 unzip ext.zip -d ~/.cloakbrowser-manager/extensions/my-extension
 ```
 
+### Widevine / DRM
+
+Every profile can play DRM-protected video (Netflix, Spotify Web, etc.) with no per-profile configuration. On first boot the container fetches the Widevine CDM straight from Google's own component-update server (the same source Chrome uses — Linux x86-64 only, SHA-256 + CRX3-signature verified) in the background, without blocking startup, and caches it on the `/data` volume so it's fetched once ever, not once per container. From then on, `cloakbrowser`'s own `launch_persistent_context_async()` (already what this Manager calls for every launch) automatically seeds the CDM hint into each profile on its very first launch — nothing else to configure. See CloakBrowser's own [Widevine / DRM](https://github.com/CloakHQ/CloakBrowser#widevine--drm) docs for the underlying mechanism.
+
+Set `CLOAKBROWSER_FETCH_WIDEVINE=0` to disable the fetch (e.g. an air-gapped host, or arm64 where Google doesn't publish the CDM and it would just log a skip every boot). A profile launched before the fetch completes simply doesn't get DRM that one time — a later launch, after the CDM lands, does.
+
 ### Idle timeout
 
 A profile with no attached VNC viewer and no CDP traffic for too long is stopped automatically — closing Chromium cleanly and releasing its CloakBrowser license claim, the same as clicking **Stop**. The default is **60 minutes** (`PROFILE_IDLE_TIMEOUT_SECONDS`, in seconds); each profile can override it in the form (**Idle Timeout (minutes)**, under Behavior) — leave it blank to inherit the container default, or set it to `0` to disable idle timeout for that profile entirely.
@@ -130,6 +136,7 @@ Hitting a stopped profile's CDP endpoint (`/api/profiles/<id>/cdp` or any of its
 |----------|---------|---------|
 | `AUTH_TOKEN` | *(auto-generated if unset)* | Protects the web UI + API. Always required — if unset, entrypoint.sh generates a random 32-character token on first boot, prints it to `docker compose logs manager`, and saves it to `/data/auth_token` so it survives a restart. |
 | `PROFILE_IDLE_TIMEOUT_SECONDS` | `3600` | Stop a profile automatically after this many idle seconds (no VNC viewer, no CDP traffic), releasing its license claim. Per-profile override in the form; `0` disables idle timeout for that profile. |
+| `CLOAKBROWSER_FETCH_WIDEVINE` | `1` | Auto-fetch the Widevine DRM CDM in the background on boot (Linux x86-64 only). Set to `0` to disable. See [Widevine / DRM](#widevine--drm). |
 | `TLS_SANS` | *(unset)* | Extra names/IPs for the self-signed cert on `:8443`, comma separated. `localhost` and `127.0.0.1` are always included. Read only when the cert is first issued — delete `/data/tls` to re-issue. |
 | `CF_TUNNEL_TOKEN` | *(unset = quick tunnel)* | The `tunnel` sidecar (on by default) runs a **named** Cloudflare tunnel with a stable hostname when set. Unset gives a free `*.trycloudflare.com` quick tunnel that changes every restart. |
 | `CF_TUNNEL_ORIGIN` | `http://manager:8080` | What the tunnel points at inside the compose network. |

@@ -141,6 +141,7 @@ VOLUME /data
 # Config and entrypoint last: both are tiny and change often, and anything
 # copied above them invalidates the 119MB pip layer on every edit.
 COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY docker/fetch-widevine.py /fetch-widevine.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

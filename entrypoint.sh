@@ -58,6 +58,33 @@ echo "#  Set AUTH_TOKEN in .env to pin this value across recreations."
 echo "################################################################"
 echo ""
 
+# Widevine DRM CDM — on by default, best-effort, and backgrounded so it never
+# blocks nginx/uvicorn startup or the healthcheck. Fetches straight from
+# Google's own component-update server (the same source Chrome uses) into
+# CLOAKBROWSER_CACHE_DIR/WidevineCdm (set to /data/cloakbrowser above, on the
+# persistent volume — fetched once ever across every container, not once per
+# container). cloakbrowser's own launch_persistent_context_async() already
+# seeds the CDM hint file into every profile's user_data_dir on first launch
+# once the CDM is present (see cloakbrowser/widevine.py) — nothing else is
+# needed for DRM playback (Netflix, Spotify Web, etc.) to work per profile.
+# Linux x86-64 only (Google does not publish the CDM for arm64); the fetcher
+# exits non-zero there and that is treated as a soft, logged failure.
+fetch_widevine_lc=$(printf '%s' "${CLOAKBROWSER_FETCH_WIDEVINE:-1}" | tr '[:upper:]' '[:lower:]')
+case "$fetch_widevine_lc" in
+    0|false|off|no)
+        echo "Widevine CDM auto-fetch disabled (CLOAKBROWSER_FETCH_WIDEVINE=$CLOAKBROWSER_FETCH_WIDEVINE)"
+        ;;
+    *)
+        (
+            if out="$(python3 /fetch-widevine.py --quiet 2>&1)"; then
+                echo "Widevine CDM ready: $out"
+            else
+                echo "Widevine CDM fetch skipped/failed (new profiles won't get DRM playback until it succeeds; will retry next boot): $out"
+            fi
+        ) &
+        ;;
+esac
+
 # Kill stale processes from previous container runs
 pkill -f 'Xvnc :[0-9]' 2>/dev/null || true
 pkill -f 'cloakbrowser.*chrome' 2>/dev/null || true

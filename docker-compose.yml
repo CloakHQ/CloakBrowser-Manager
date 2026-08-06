@@ -50,6 +50,11 @@ services:
       # `:-` form would inject an empty string when unset rather than leaving
       # the var absent — int("") crashes the app on startup.
       - PROFILE_IDLE_TIMEOUT_SECONDS
+      # Widevine DRM CDM auto-fetch — on by default (entrypoint.sh backgrounds
+      # it, never blocks startup). Bare, same reason as PROFILE_IDLE_TIMEOUT_SECONDS:
+      # entrypoint.sh's own default ("1") must win when this is truly unset, and
+      # `=${...:-}` would inject "" and defeat that default.
+      - CLOAKBROWSER_FETCH_WIDEVINE
       # Extra names/addresses to put in the self-signed cert's SAN list, comma
       # separated (e.g. TLS_SANS=192.168.1.50,manager.lan). localhost and
       # 127.0.0.1 are always included. The container cannot discover the host's
