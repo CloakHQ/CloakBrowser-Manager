@@ -1,0 +1,45 @@
+# Keeps the build context small and stops host-native artifacts from
+# shadowing what a build stage installs for the container's own platform —
+# `frontend/node_modules` in particular: without this, `COPY frontend/ ./`
+# in the frontend-builder stage overwrites the node_modules `npm install`
+# just built for linux/<arch> with whatever host OS/arch last ran npm
+# install locally (esbuild/rollup/vite native binaries included).
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/coverage/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets — never sent to the build context, even though nothing COPYs it in
+.env
+
+# Claude Code / agent scratch
+.claude/
+CLAUDE.md
+AGENTS.md
+.beads
+debug
+tmp/
+trash/
+
+# Misc
+deploy.sh
+publish-docker.sh
+README.md
