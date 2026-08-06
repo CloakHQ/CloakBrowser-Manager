@@ -1,8 +1,12 @@
 # Stage 1: Build React frontend
 FROM node:20-slim AS frontend-builder
 WORKDIR /build
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install
+# package-lock.json is committed — `npm ci` installs exactly what it pins and
+# fails loudly if it's ever missing or out of sync with package.json, instead
+# of `npm install` silently resolving a different dependency graph than what
+# was tested.
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
