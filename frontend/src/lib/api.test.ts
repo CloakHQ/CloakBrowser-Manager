@@ -87,6 +87,8 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   getStatus: [],
   listExtensions: [],
   rescanExtensions: [],
+  uploadExtension: [new File(["dummy"], "test.zip")],
+  installExtensionFromUrl: ["https://chromewebstore.google.com/detail/x/edibdbjcniadpccecjdfdjjppcpchdlm"],
   setClipboard: ["p1", "hello"],
   getClipboard: ["p1"],
   createViewerToken: ["p1"],

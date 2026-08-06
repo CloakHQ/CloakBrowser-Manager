@@ -20,7 +20,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import starlette.requests
@@ -37,10 +46,17 @@ from .browser_manager import (
     RunningProfile,
     _viewer_attached,
 )
-from .extensions import list_available_extensions, rescan_extensions
+from .extensions import (
+    chrome_web_store_crx_url,
+    extract_extension_id,
+    install_extension_from_bytes,
+    list_available_extensions,
+    rescan_extensions,
+)
 from .vnc_manager import viewer_stream_mode_preference
 from .models import (
     ClipboardRequest,
+    ExtensionInstallFromUrlRequest,
     ExtensionResponse,
     LaunchResponse,
     LoginRequest,
@@ -904,6 +920,62 @@ async def rescan_extensions_endpoint():
     extensions.py's rescan_extensions() for why that distinction matters.
     """
     return [ExtensionResponse(**e) for e in rescan_extensions()]
+
+
+@app.post("/api/extensions/upload", response_model=list[ExtensionResponse])
+async def upload_extension(file: UploadFile = File(...)):
+    """Install an uploaded .zip or .crx extension archive and rescan.
+
+    install_extension_from_bytes() is synchronous file/zip I/O — off the
+    event loop the same way ensure_binary() and profile deletion's rmtree
+    already are, so one large upload can't stall every other request.
+    """
+    data = await file.read()
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, install_extension_from_bytes, data, file.filename or "extension",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return [ExtensionResponse(**e) for e in list_available_extensions()]
+
+
+@app.post("/api/extensions/install-from-url", response_model=list[ExtensionResponse])
+async def install_extension_from_url(req: ExtensionInstallFromUrlRequest):
+    """Install an extension straight from a Chrome Web Store URL (or a bare
+    extension id) — no manual crx fetch/unzip needed.
+
+    Never forwards the caller's URL to httpx directly: only a 32-character
+    id is ever extracted from it, and the actual download always targets a
+    URL this function builds itself against Google's own component-update
+    server, the same one Chrome uses. That is what keeps a user-supplied
+    "url" field from being an SSRF vector into the container's network.
+    """
+    extension_id = extract_extension_id(req.url)
+    if not extension_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not find a Chrome extension id in that URL. Paste the "
+                "chromewebstore.google.com/detail/... URL, or the bare id."
+            ),
+        )
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(chrome_web_store_crx_url(extension_id))
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as exc:
+        logger.error("Extension fetch failed for id %s: %s", extension_id, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to download extension: {exc}")
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, install_extension_from_bytes, data, extension_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return [ExtensionResponse(**e) for e in list_available_extensions()]
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────

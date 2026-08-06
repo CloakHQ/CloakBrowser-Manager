@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { ProfileForm } from "./ProfileForm";
 
@@ -125,5 +125,31 @@ describe("ProfileForm extensions rescan control", () => {
 
     render(<ProfileForm profile={makeProfile()} onSave={onSave} onCancel={() => {}} />);
     expect(screen.getByRole("button", { name: /rescan/i })).toBeInTheDocument();
+  });
+});
+
+describe("ProfileForm extension install controls", () => {
+  it("renders an Upload control and a Chrome Web Store URL field", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<ProfileForm profile={makeProfile()} onSave={onSave} onCancel={() => {}} />);
+    expect(screen.getByText("Upload")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/chrome web store/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^install$/i })).toBeInTheDocument();
+  });
+
+  it("disables Install until a URL is entered, then enables it", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<ProfileForm profile={makeProfile()} onSave={onSave} onCancel={() => {}} />);
+    const installButton = screen.getByRole("button", { name: /^install$/i });
+    expect(installButton).toBeDisabled();
+
+    const urlField = screen.getByPlaceholderText(/chrome web store/i);
+    await act(async () => {
+      fireEvent.change(urlField, {
+        target: { value: "https://chromewebstore.google.com/detail/x/edibdbjcniadpccecjdfdjjppcpchdlm" },
+      });
+    });
+
+    expect(installButton).not.toBeDisabled();
   });
 });

@@ -201,3 +201,9 @@ class ClipboardRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     token: str
+
+
+class ExtensionInstallFromUrlRequest(BaseModel):
+    # A chromewebstore.google.com/detail/<name>/<id> URL, or a bare 32-char
+    # extension id — extensions.extract_extension_id() accepts either.
+    url: str = Field(min_length=1, max_length=2048)

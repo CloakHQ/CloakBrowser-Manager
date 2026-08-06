@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+import io
+import json
 import pathlib
 import socket
+import zipfile
 
 from starlette.testclient import TestClient
 
@@ -123,6 +126,126 @@ def test_delete_profile(app_client: TestClient):
 def test_delete_profile_not_found(app_client: TestClient):
     resp = app_client.delete("/api/profiles/nonexistent")
     assert resp.status_code == 404
+
+
+# ── Extensions upload ────────────────────────────────────────────────────────
+
+
+def test_upload_extension_zip(app_client: TestClient, tmp_path, monkeypatch):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"name": "Uploaded Ext", "version": "1.0"}))
+    buf.seek(0)
+    try:
+        resp = app_client.post(
+            "/api/extensions/upload",
+            files={"file": ("my-ext.zip", buf, "application/zip")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert any(e["id"] == "uploaded-ext" and e["name"] == "Uploaded Ext" for e in data)
+    finally:
+        extensions._cache = None
+
+
+def test_upload_extension_rejects_a_bad_archive(app_client: TestClient, tmp_path, monkeypatch):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    try:
+        resp = app_client.post(
+            "/api/extensions/upload",
+            files={"file": ("junk.zip", io.BytesIO(b"not a zip"), "application/zip")},
+        )
+        assert resp.status_code == 400
+    finally:
+        extensions._cache = None
+
+
+def test_install_extension_from_url_downloads_and_installs(
+    app_client: TestClient, tmp_path, monkeypatch,
+):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"name": "Store Ext", "version": "3.0"}))
+    zip_bytes = buf.getvalue()
+
+    mock_resp = MagicMock()
+    mock_resp.content = zip_bytes
+    mock_resp.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+
+    try:
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            resp = app_client.post(
+                "/api/extensions/install-from-url",
+                json={
+                    "url": "https://chromewebstore.google.com/detail/x/"
+                           "edibdbjcniadpccecjdfdjjppcpchdlm",
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert any(e["id"] == "store-ext" for e in data)
+        assert "edibdbjcniadpccecjdfdjjppcpchdlm" in mock_client.get.call_args.args[0]
+    finally:
+        extensions._cache = None
+
+
+def test_install_extension_from_url_rejects_a_url_with_no_extension_id(
+    app_client: TestClient,
+):
+    resp = app_client.post(
+        "/api/extensions/install-from-url", json={"url": "https://example.com/nope"},
+    )
+    assert resp.status_code == 400
+
+
+def test_install_extension_from_url_502s_on_download_failure(app_client: TestClient):
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.post(
+            "/api/extensions/install-from-url",
+            json={"url": "edibdbjcniadpccecjdfdjjppcpchdlm"},
+        )
+    assert resp.status_code == 502
+
+
+def test_install_extension_from_url_never_forwards_the_raw_url_to_httpx(
+    app_client: TestClient,
+):
+    """The whole SSRF guard: only the extracted id may reach the outbound
+    request, never the caller's own URL verbatim."""
+    mock_resp = MagicMock()
+    mock_resp.content = b""
+    mock_resp.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        app_client.post(
+            "/api/extensions/install-from-url",
+            json={"url": "http://169.254.169.254/edibdbjcniadpccecjdfdjjppcpchdlm"},
+        )
+
+    requested_url = mock_client.get.call_args.args[0]
+    assert requested_url.startswith("https://clients2.google.com/")
+    assert "169.254.169.254" not in requested_url
 
 
 # ── Duplicate profile ────────────────────────────────────────────────────────

@@ -101,7 +101,14 @@ Drop unpacked Chrome extensions — one directory per extension, `manifest.json`
 
 **Extensions are scanned once, at container startup, and cached for the container's whole lifetime — not watched for changes.** Adding, removing, or editing an extension under that directory needs `docker compose restart` (or recreate), or a click of the **Rescan** button next to the Extensions section in the profile form (`POST /api/extensions/rescan`), before it shows up in the UI or takes effect on the next launch. This is deliberate: nothing changes automatically or in the background — it keeps a profile's checkboxes from having an extension disappear out from under them mid-session on its own, and avoids re-reading every manifest on every request for something that, by design, never changes unless an operator explicitly asks it to.
 
-To get an extension from the Chrome Web Store as an unpacked directory, fetch its CRX and unzip it (strip the 12+header-length-byte CRX3 header, the rest is a normal zip):
+**Installing one is a form field, not a host-filesystem step**, via two controls next to the Extensions section header:
+
+- **Upload** — pick a `.zip` or a raw `.crx` (CRX2/CRX3 header stripped automatically) from your machine.
+- **Paste a Chrome Web Store URL** (`chromewebstore.google.com/detail/<name>/<id>`, or just the bare 32-character id) — the server fetches the CRX itself from Google's own component-update server (the same one Chrome uses) and installs it. `POST /api/extensions/install-from-url` never forwards the URL you paste to an outbound request verbatim; it extracts just the id and always builds its own request against Google's server, so it can't be used to make the container fetch an arbitrary internal URL.
+
+Either path extracts into its own new directory under `EXTENSIONS_DIR`, deduplicating the name (`my-extension`, `my-extension-2`, …) if it collides, and rescans immediately — no separate click needed.
+
+Prefer doing it by hand on the host instead? Same mechanism, manual steps:
 
 ```bash
 EXT_ID=edibdbjcniadpccecjdfdjjppcpchdlm  # from the store URL
@@ -115,6 +122,8 @@ open('ext.zip','wb').write(data[12+header_len:])
 mkdir -p ~/.cloakbrowser-manager/extensions/my-extension
 unzip ext.zip -d ~/.cloakbrowser-manager/extensions/my-extension
 ```
+
+Then click **Rescan** (or `docker compose restart`) to pick it up.
 
 ### Downloads
 

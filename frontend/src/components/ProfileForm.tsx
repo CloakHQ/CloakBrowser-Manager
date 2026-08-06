@@ -1,4 +1,4 @@
-import { Copy, RefreshCw, Save, Trash2, X } from "lucide-react";
+import { Copy, RefreshCw, Save, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
 
@@ -90,6 +90,9 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
   const [deleting, setDeleting] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
   const [rescanning, setRescanning] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [storeUrl, setStoreUrl] = useState("");
+  const [installingFromUrl, setInstallingFromUrl] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
@@ -158,6 +161,44 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
       console.warn("[extensions] rescan failed:", err);
     } finally {
       setRescanning(false);
+    }
+  };
+
+  // Shared by both install paths: the server always returns the freshly
+  // rescanned full list (see /api/extensions/upload and
+  // /api/extensions/install-from-url), so there is nothing else to refetch.
+  const applyInstalledExtensions = (exts: Extension[]) => {
+    setExtensions(exts);
+    if (!isEdit) {
+      setForm((prev) => ({ ...prev, enabled_extensions: exts.map((e) => e.id) }));
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // otherwise re-picking the same file fires no onChange
+    if (!file) return;
+    setUploading(true);
+    try {
+      applyInstalledExtensions(await api.uploadExtension(file));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to upload extension");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleInstallFromUrl = async () => {
+    const url = storeUrl.trim();
+    if (!url) return;
+    setInstallingFromUrl(true);
+    try {
+      applyInstalledExtensions(await api.installExtensionFromUrl(url));
+      setStoreUrl("");
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to install extension");
+    } finally {
+      setInstallingFromUrl(false);
     }
   };
 
@@ -688,22 +729,56 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
         <section>
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Extensions</h3>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1 cursor-pointer">
+                <Upload className="h-3 w-3" />
+                {uploading ? "Uploading..." : "Upload"}
+                <input
+                  type="file"
+                  accept=".zip,.crx"
+                  className="hidden"
+                  disabled={uploading}
+                  onChange={handleFileUpload}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={handleRescan}
+                disabled={rescanning}
+                className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1"
+                title="Re-scan ~/.cloakbrowser-manager/extensions on the host right now, without a container restart"
+              >
+                <RefreshCw className={`h-3 w-3 ${rescanning ? "animate-spin" : ""}`} />
+                {rescanning ? "Rescanning..." : "Rescan"}
+              </button>
+            </div>
+          </div>
+          <div className="flex gap-2 mb-3">
+            <input
+              className="input flex-1 text-xs"
+              value={storeUrl}
+              onChange={(e) => setStoreUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); handleInstallFromUrl(); }
+              }}
+              placeholder="Paste a Chrome Web Store URL (or extension id) to install it..."
+              disabled={installingFromUrl}
+            />
             <button
               type="button"
-              onClick={handleRescan}
-              disabled={rescanning}
-              className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1"
-              title="Re-scan ~/.cloakbrowser-manager/extensions on the host right now, without a container restart"
+              onClick={handleInstallFromUrl}
+              disabled={installingFromUrl || !storeUrl.trim()}
+              className="btn-secondary text-xs"
             >
-              <RefreshCw className={`h-3 w-3 ${rescanning ? "animate-spin" : ""}`} />
-              {rescanning ? "Rescanning..." : "Rescan"}
+              {installingFromUrl ? "Installing..." : "Install"}
             </button>
           </div>
           {extensions.length === 0 ? (
             <p className="text-xs text-gray-500">
-              None found. Drop an unpacked extension (a directory with manifest.json at its root)
-              into ~/.cloakbrowser-manager/extensions on the host, then click Rescan above (or
-              `docker compose restart`, which always picks up changes too).
+              None found. Upload a .zip/.crx or paste a Chrome Web Store URL above, drop an
+              unpacked extension (a directory with manifest.json at its root) into
+              ~/.cloakbrowser-manager/extensions on the host and click Rescan, or
+              `docker compose restart`, which always picks up changes too.
             </p>
           ) : (
             <div className="space-y-2">

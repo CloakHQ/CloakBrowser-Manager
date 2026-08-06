@@ -281,6 +281,26 @@ export const api = {
   rescanExtensions: () =>
     request<Extension[]>("/api/extensions/rescan", { method: "POST" }),
 
+  uploadExtension: (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    // headers: {} overrides request()'s default JSON content-type — fetch
+    // sets its own multipart boundary from the FormData body, and setting
+    // Content-Type by hand here would omit that boundary and break parsing.
+    return request<Extension[]>(
+      "/api/extensions/upload",
+      { method: "POST", headers: {}, body: formData },
+      MUTATION_TIMEOUT_MS,
+    );
+  },
+
+  installExtensionFromUrl: (url: string) =>
+    request<Extension[]>(
+      "/api/extensions/install-from-url",
+      { method: "POST", body: JSON.stringify({ url }) },
+      MUTATION_TIMEOUT_MS,
+    ),
+
   setClipboard: (id: string, text: string) =>
     request<{ ok: boolean }>(`/api/profiles/${id}/clipboard`, {
       method: "POST",
