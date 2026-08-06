@@ -19,6 +19,45 @@ mkdir -p /data/cloakbrowser
 # startup error.
 mkdir -p /data/extensions
 
+# Authentication is mandatory — there is no "open" mode. If the operator did
+# not set AUTH_TOKEN, generate one and persist it to the /data volume so a
+# restart (or a `docker compose recreate`) does not silently issue a NEW
+# token and invalidate every bookmark, script and Cloudflare edge session.
+# /data/auth_token is also the one thing that lets the tunnel sidecar — a
+# SEPARATE container — learn a token this container generated on its own:
+# compose's ${AUTH_TOKEN:-} substitution only ever sees the HOST's env/.env,
+# never what a sibling container decides at runtime, so the shared volume is
+# the only channel between them (see docker/tunnel-entrypoint.sh).
+AUTH_TOKEN_FILE=/data/auth_token
+auth_token_generated=0
+if [ -z "${AUTH_TOKEN:-}" ]; then
+    if [ -s "$AUTH_TOKEN_FILE" ]; then
+        AUTH_TOKEN="$(cat "$AUTH_TOKEN_FILE")"
+    else
+        AUTH_TOKEN="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)"
+        auth_token_generated=1
+    fi
+fi
+# Written unconditionally, even when AUTH_TOKEN came from the environment:
+# an operator-supplied token must overwrite whatever was here before, and
+# /data/auth_token stays the one canonical file the tunnel sidecar reads.
+printf '%s' "$AUTH_TOKEN" > "$AUTH_TOKEN_FILE"
+chmod 600 "$AUTH_TOKEN_FILE"
+export AUTH_TOKEN
+
+echo ""
+echo "################################################################"
+if [ "$auth_token_generated" = "1" ]; then
+    echo "#  NO AUTH_TOKEN WAS SET. GENERATED ONE AND SAVED IT TO:"
+    echo "#    $AUTH_TOKEN_FILE"
+    echo "#"
+fi
+echo "#  AUTH_TOKEN=$AUTH_TOKEN"
+echo "#"
+echo "#  Set AUTH_TOKEN in .env to pin this value across recreations."
+echo "################################################################"
+echo ""
+
 # Kill stale processes from previous container runs
 pkill -f 'Xvnc :[0-9]' 2>/dev/null || true
 pkill -f 'cloakbrowser.*chrome' 2>/dev/null || true

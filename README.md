@@ -128,10 +128,10 @@ Hitting a stopped profile's CDP endpoint (`/api/profiles/<id>/cdp` or any of its
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AUTH_TOKEN` | *(unset = open)* | Protect the web UI + API with a token |
+| `AUTH_TOKEN` | *(auto-generated if unset)* | Protects the web UI + API. Always required — if unset, entrypoint.sh generates a random 32-character token on first boot, prints it to `docker compose logs manager`, and saves it to `/data/auth_token` so it survives a restart. |
 | `PROFILE_IDLE_TIMEOUT_SECONDS` | `3600` | Stop a profile automatically after this many idle seconds (no VNC viewer, no CDP traffic), releasing its license claim. Per-profile override in the form; `0` disables idle timeout for that profile. |
 | `TLS_SANS` | *(unset)* | Extra names/IPs for the self-signed cert on `:8443`, comma separated. `localhost` and `127.0.0.1` are always included. Read only when the cert is first issued — delete `/data/tls` to re-issue. |
-| `CF_TUNNEL_TOKEN` | *(unset = quick tunnel)* | With `docker-compose.tunnel.yml`: run a **named** Cloudflare tunnel with a stable hostname. Unset gives a free `*.trycloudflare.com` quick tunnel that changes every restart. |
+| `CF_TUNNEL_TOKEN` | *(unset = quick tunnel)* | The `tunnel` sidecar (on by default) runs a **named** Cloudflare tunnel with a stable hostname when set. Unset gives a free `*.trycloudflare.com` quick tunnel that changes every restart. |
 | `CF_TUNNEL_ORIGIN` | `http://manager:8080` | What the tunnel points at inside the compose network. |
 | `TUNNEL_ALLOW_NO_AUTH` | *(unset)* | Allow the tunnel sidecar to start with an empty `AUTH_TOKEN`, i.e. publish an unauthenticated Manager to the internet. |
 | `KASM_QUALITY_PRESET` | `balanced` | Encoding preset: `text`, `balanced`, `low`, `motion` |
@@ -369,15 +369,20 @@ The CDP URL is available in the toolbar (code icon) when a profile is running. T
 
 ## Remote Access
 
-Compose publishes on **all interfaces**: `8080` plain HTTP and `8443` HTTPS with
-a self-signed certificate. Nothing else is exposed — the Xvnc WebSocket and the
-FastAPI control plane stay on loopback inside the container, reached only
-through nginx.
+Compose publishes **no ports on the host by default** — the `tunnel` sidecar
+(on by default, see below) reaches the Manager over the compose network and
+exposes it to the internet itself, with a real certificate and nothing to
+forward or firewall. The Xvnc WebSocket and the FastAPI control plane stay on
+loopback inside the container either way, reached only through nginx.
 
-Set `AUTH_TOKEN` before doing this on an untrusted network: it is the only access
-control, and unset means open (see [Authentication](#authentication)).
+`AUTH_TOKEN` is mandatory regardless of how this is reached (see
+[Authentication](#authentication)) — there is no "open" mode.
 
 ### Use HTTPS for any viewer that is not on localhost
+
+Only relevant if you opted out of the default tunnel and published ports
+directly (see [Keeping it private](#keeping-it-private)) — the tunnel already
+hands out a real `https://` origin with nothing to click through.
 
 This is not a preference. The KasmVNC client will not negotiate **any** video
 codec — NVENC, VAAPI, or even software H.264 — outside a *secure context*,
@@ -411,37 +416,43 @@ one-time "unknown issuer" warning to click through.
 
 ### Cloudflare Tunnel (real certificate, no open ports)
 
-Avoids both the self-signed warning and publishing any port:
+On by default — no ports to forward, no self-signed warning to click through:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d --build
+docker compose up -d --build
 docker compose logs tunnel | grep trycloudflare.com   # the public URL
 ```
 
-With no `CF_TUNNEL_TOKEN` this opens a **free quick tunnel** on a random
-`*.trycloudflare.com` name that is regenerated on every restart — no Cloudflare
-account required. Set `CF_TUNNEL_TOKEN` to run a named tunnel instead, with a
-stable hostname and ingress rules from the Cloudflare dashboard. The overlay
-also drops the manager's published ports, since the tunnel reaches it over the
-compose network. Combine with GPU support by listing both overlays, tunnel last:
+With no `CF_TUNNEL_TOKEN` this is a **free quick tunnel** on a random
+`*.trycloudflare.com` name that is regenerated on every restart — no
+Cloudflare account required. Set `CF_TUNNEL_TOKEN` to run a named tunnel
+instead, with a stable hostname and ingress rules from the Cloudflare
+dashboard (set those up there first — the sidecar just runs `cloudflared
+tunnel run` with the token you give it). It composes normally with the GPU
+overlays, no extra `-f` needed:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
-               -f docker-compose.tunnel.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d --build
 
 # or, on an Intel/AMD integrated GPU
-docker compose -f docker-compose.yml -f docker-compose.igpu.yml \
-               -f docker-compose.tunnel.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.igpu.yml up -d --build
 ```
 
 The sidecar **refuses to start when `AUTH_TOKEN` is empty** — a tunnel publishes
 the Manager to the internet, and this API launches browsers and proxies CDP into
-them. Override with `TUNNEL_ALLOW_NO_AUTH=1` only if you genuinely want an open
-endpoint.
+them. In practice this never fires: `AUTH_TOKEN` is mandatory (see
+[Authentication](#authentication)), so there is always a real token by the time
+the tunnel starts. Override with `TUNNEL_ALLOW_NO_AUTH=1` only if you genuinely
+want an open endpoint.
+
+Don't want the tunnel at all? `docker compose up -d manager` starts only the
+Manager, skipping the sidecar — combine with an override file that re-adds
+`ports:` if you also want direct host access.
 
 ### Keeping it private
 
-Narrow the bindings in `docker-compose.yml` and use a tunnel:
+Not using the tunnel? Bind loopback-only in an override file and reach it
+over SSH instead:
 
 ```yaml
 ports:
@@ -457,20 +468,26 @@ hardware encoding works over an SSH tunnel without TLS.
 
 ## Authentication
 
-By default, there is no authentication (ideal for local use). To protect the web UI and API when hosting on a network, set the `AUTH_TOKEN` environment variable:
+Authentication is **always on** — there is no open mode. Set `AUTH_TOKEN` yourself, or leave it unset and the container generates one on first boot, prints it loudly to `docker compose logs manager`, and saves it to `/data/auth_token` so restarts keep the same value:
+
+```bash
+docker compose up -d
+docker compose logs manager | grep -A2 AUTH_TOKEN=   # if you didn't set one yourself
+```
+
+To pin your own instead:
 
 ```bash
 docker run -p 8080:8080 -v cloakprofiles:/data -e AUTH_TOKEN=your-secret-token cloakhq/cloakbrowser-manager
 ```
 
-Or in `docker-compose.yml`:
+Or in `.env` (read automatically by `docker compose`):
 
-```yaml
-environment:
-  - AUTH_TOKEN=your-secret-token
+```
+AUTH_TOKEN=your-secret-token
 ```
 
-When `AUTH_TOKEN` is set:
+Either way:
 
 - The web UI shows a login page. Enter the token to unlock.
 - API consumers pass the token via `Authorization: Bearer <token>` header.

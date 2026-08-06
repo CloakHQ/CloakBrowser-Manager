@@ -10,21 +10,16 @@ services:
     # mid-cleanup with more than a couple of profiles running, leaving exactly
     # the unclean Chromium shutdown (and restore prompts) that ordering avoids.
     stop_grace_period: 60s
-    # Published on all interfaces so the UI is reachable from other machines
-    # without an SSH tunnel or a reverse proxy in front.
-    #
-    # This is the one setting that decides whether the manager is exposed, and
-    # AUTH_TOKEN is the only thing guarding it: it is OPTIONAL, and when it is
-    # unset the auth middleware short-circuits (backend/main.py) so every API
-    # route — launch, delete, the CDP tunnel — answers unauthenticated. Set
-    # AUTH_TOKEN (the .env below is read automatically) before putting this on
-    # a network you do not control, or narrow the binding back to
-    # "127.0.0.1:8080:8080".
-    ports:
-      - "0.0.0.0:8080:8080"
-      # HTTPS. Use this one from anything that is not localhost — hardware video
-      # encoding needs WebCodecs, and WebCodecs needs a secure context.
-      - "0.0.0.0:8443:8443"
+    # Nothing published on the host by default: the `tunnel` service below
+    # reaches this over the compose network and exposes it to the internet
+    # itself, with a real certificate and no port to forward or firewall.
+    # Need direct host access instead (pure local dev, your own reverse
+    # proxy)? Add back what you need in a small override file, e.g.:
+    #   ports:
+    #     - "127.0.0.1:8080:8080"
+    # AUTH_TOKEN is mandatory either way — see entrypoint.sh. If it is not
+    # set, one is generated on first boot, printed to `docker compose logs
+    # manager`, and saved to /data/auth_token.
     volumes:
       - ~/.cloakbrowser-manager:/data
       # Drop unpacked Chrome extensions (one directory per extension,
@@ -84,3 +79,53 @@ services:
     # `devices:` source path is missing, so mapping /dev/dri here would break
     # every GPU-less host. Enable it with the override file instead:
     #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+
+  # Cloudflare Tunnel sidecar — on by default, since `manager` publishes no
+  # ports of its own (see above). Also the only way hardware video encoding
+  # works from anywhere but localhost: KasmVNC's client gates every codec on
+  # WebCodecs, which browsers withhold outside a secure context, and this
+  # gives the Manager a real https:// origin with no cert to click through.
+  #
+  # Two modes, chosen automatically by docker/tunnel-entrypoint.sh:
+  #   CF_TUNNEL_TOKEN set    → named tunnel; hostname and ingress rules come
+  #                            from the Cloudflare dashboard (already set up
+  #                            elsewhere) — this just runs `cloudflared tunnel
+  #                            run` with that token.
+  #   CF_TUNNEL_TOKEN unset  → FREE quick tunnel on a random
+  #                            *.trycloudflare.com name, printed to this
+  #                            service's own log and regenerated on every
+  #                            restart. No account needed; not for production.
+  # Retrieve the URL with: docker compose logs tunnel | grep trycloudflare.com
+  tunnel:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tunnel
+    image: cloakbrowser-manager-tunnel:latest
+    restart: unless-stopped
+    # Wait for the Manager's healthcheck, not merely its container: a quick
+    # tunnel that connects before nginx is listening publishes a name that
+    # 502s, and the name cannot be reissued without a restart. This ordering
+    # also guarantees /data/auth_token already exists by the time this starts
+    # (see the AUTH_TOKEN fallback below).
+    depends_on:
+      manager:
+        condition: service_healthy
+    volumes:
+      # Read-only: this sidecar only needs to READ the token file `manager`'s
+      # entrypoint generates/persists — see docker/tunnel-entrypoint.sh.
+      - ~/.cloakbrowser-manager:/data:ro
+    environment:
+      # cloudflared reads TUNNEL_TOKEN itself; CF_TUNNEL_TOKEN is the name on
+      # the outside so it reads as this project's setting rather than a global.
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+      # Plain HTTP to the Manager is correct here: TLS is terminated at
+      # Cloudflare's edge, this hop never leaves the compose network, and
+      # cloudflared sets X-Forwarded-Proto: https, which nginx.conf's
+      # $forwarded_proto map already honours so the SPA still advertises wss://.
+      - TUNNEL_ORIGIN=${CF_TUNNEL_ORIGIN:-http://manager:8080}
+      # Passed through so an OPERATOR-SUPPLIED token is used as-is (no need to
+      # read /data/auth_token in that case). Left empty here, tunnel-entrypoint.sh
+      # falls back to the file manager's entrypoint wrote — auth is mandatory
+      # either way, so there is no "both empty" case left to refuse.
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - TUNNEL_ALLOW_NO_AUTH=${TUNNEL_ALLOW_NO_AUTH:-}
