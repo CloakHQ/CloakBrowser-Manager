@@ -398,6 +398,50 @@ async def get_profile(profile_id: str):
     return _profile_response(profile)
 
 
+# Settings only — never cookies, cache, or any other on-disk profile data,
+# and never fingerprint_seed: the whole point of duplicating a profile is
+# usually a second, independently-fingerprinted variant, not an identical
+# twin that would look like the same machine to a detection service.
+_DUPLICATE_FIELDS = (
+    "proxy", "timezone", "locale", "platform", "user_agent",
+    "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
+    "hardware_concurrency", "humanize", "human_preset", "headless",
+    "geoip", "clipboard_sync", "auto_launch", "color_scheme",
+    "license_key", "enabled_extensions", "idle_timeout_seconds",
+    "launch_args", "notes",
+)
+
+
+def _dedupe_profile_name(base_name: str) -> str:
+    """"X" -> "X (copy)" -> "X (copy 2)" -> ... — duplicating a duplicate
+    must not collide with (or overwrite the intent of) the one before it.
+    name has no uniqueness constraint in the schema, so this is purely for
+    a sidebar that would otherwise show several indistinguishable entries.
+    """
+    existing = {p["name"] for p in db.list_profiles()}
+    candidate = f"{base_name} (copy)"
+    if candidate not in existing:
+        return candidate
+    n = 2
+    while f"{base_name} (copy {n})" in existing:
+        n += 1
+    return f"{base_name} (copy {n})"
+
+
+@app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
+async def duplicate_profile(profile_id: str):
+    source = db.get_profile(profile_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    fields = {key: source.get(key) for key in _DUPLICATE_FIELDS}
+    fields["tags"] = [
+        {"tag": t["tag"], "color": t.get("color")} for t in source.get("tags", [])
+    ]
+    new_profile = db.create_profile(name=_dedupe_profile_name(source["name"]), **fields)
+    return _profile_response(new_profile)
+
+
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
 async def update_profile(profile_id: str, req: ProfileUpdate):
     # Only pass fields that were explicitly set

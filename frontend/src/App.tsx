@@ -108,7 +108,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, launch, stop } = useProfiles();
+  const { profiles, loading, error, create, update, duplicate, remove, launch, stop } = useProfiles();
   const binaryDownload = useBinaryDownload();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
@@ -146,6 +146,15 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     if (!selectedId) return;
     await update(selectedId, data);
   }, [selectedId, update]);
+
+  const handleDuplicate = useCallback(async () => {
+    if (!selectedId) return;
+    const copy = await duplicate(selectedId);
+    if (copy) {
+      setSelectedId(copy.id);
+      setView("edit");
+    }
+  }, [selectedId, duplicate]);
 
   const handleDelete = useCallback(async () => {
     if (!selectedId) return;
@@ -282,6 +291,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             <ProfileForm
               profile={selected}
               onSave={handleUpdate}
+              onDuplicate={handleDuplicate}
               onDelete={handleDelete}
               onCancel={() => {
                 setSelectedId(null);

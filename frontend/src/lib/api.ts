@@ -256,6 +256,9 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  duplicateProfile: (id: string) =>
+    request<Profile>(`/api/profiles/${id}/duplicate`, { method: "POST" }),
+
   deleteProfile: (id: string) =>
     request<{ ok: boolean }>(
       `/api/profiles/${id}`, { method: "DELETE" }, MUTATION_TIMEOUT_MS,

@@ -125,6 +125,94 @@ def test_delete_profile_not_found(app_client: TestClient):
     assert resp.status_code == 404
 
 
+# ── Duplicate profile ────────────────────────────────────────────────────────
+
+
+def test_duplicate_profile_not_found(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/duplicate")
+    assert resp.status_code == 404
+
+
+def test_duplicate_profile_copies_settings_with_a_new_id_and_name(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={
+        "name": "Original",
+        "proxy": "http://user:pass@host:8080",
+        "platform": "macos",
+        "screen_width": 2560,
+        "screen_height": 1440,
+        "humanize": True,
+        "human_preset": "careful",
+        "notes": "some notes",
+        "tags": [{"tag": "work", "color": "#ff0000"}],
+    })
+    original = create.json()
+
+    resp = app_client.post(f"/api/profiles/{original['id']}/duplicate")
+    assert resp.status_code == 201
+    dup = resp.json()
+
+    assert dup["id"] != original["id"]
+    assert dup["name"] == "Original (copy)"
+    assert dup["proxy"] == original["proxy"]
+    assert dup["platform"] == "macos"
+    assert dup["screen_width"] == 2560
+    assert dup["humanize"] is True
+    assert dup["human_preset"] == "careful"
+    assert dup["notes"] == "some notes"
+    assert dup["tags"] == [{"tag": "work", "color": "#ff0000"}]
+    assert dup["user_data_dir"] != original["user_data_dir"]
+    assert dup["status"] == "stopped"
+
+
+def test_duplicate_profile_gets_a_fresh_fingerprint_seed(app_client: TestClient):
+    """The point of a duplicate is a second, independently-fingerprinted
+    profile — an identical seed would make it look like the same machine."""
+    create = app_client.post("/api/profiles", json={"name": "Seeded", "fingerprint_seed": 42})
+    original = create.json()
+
+    dup = app_client.post(f"/api/profiles/{original['id']}/duplicate").json()
+
+    assert dup["fingerprint_seed"] != 42
+
+
+def test_duplicate_profile_does_not_copy_enabled_extensions_as_none(app_client: TestClient):
+    """None means "default to every extension" at create time — a duplicate
+    must copy the SOURCE's actual list, not silently re-default."""
+    create = app_client.post("/api/profiles", json={"name": "Ext", "enabled_extensions": []})
+    original = create.json()
+    assert original["enabled_extensions"] == []
+
+    dup = app_client.post(f"/api/profiles/{original['id']}/duplicate").json()
+
+    assert dup["enabled_extensions"] == []
+
+
+def test_duplicate_profile_name_numbers_repeated_duplicates(app_client: TestClient):
+    """Duplicating the same source repeatedly must not collide on name."""
+    create = app_client.post("/api/profiles", json={"name": "Multi"})
+    pid = create.json()["id"]
+
+    first = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+    second = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+    third = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+
+    assert first["name"] == "Multi (copy)"
+    assert second["name"] == "Multi (copy 2)"
+    assert third["name"] == "Multi (copy 3)"
+
+
+def test_duplicate_profile_of_a_duplicate_appends_its_own_suffix(app_client: TestClient):
+    """_dedupe_profile_name works off whatever name it's given — it does not
+    try to detect and strip an existing "(copy)" suffix first."""
+    create = app_client.post("/api/profiles", json={"name": "Multi"})
+    pid = create.json()["id"]
+    first = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+
+    second_gen = app_client.post(f"/api/profiles/{first['id']}/duplicate").json()
+
+    assert second_gen["name"] == "Multi (copy) (copy)"
+
+
 def test_delete_profile_stops_running(
     app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ):

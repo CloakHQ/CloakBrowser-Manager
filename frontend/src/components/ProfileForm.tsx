@@ -1,4 +1,4 @@
-import { Save, Trash2, X } from "lucide-react";
+import { Copy, Save, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
 
@@ -6,8 +6,24 @@ interface ProfileFormProps {
   profile: Profile | null; // null = create mode
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
+  onDuplicate?: () => Promise<void>;
   onCancel: () => void;
 }
+
+// Shown before duplicating, and echoed in the button's tooltip — spelled out
+// because "duplicate" alone leaves the two things people actually ask about
+// (does it copy my login session? does it look like the same machine?)
+// ambiguous, and getting either wrong is either a wasted profile or a burned
+// fingerprint.
+const DUPLICATE_SCOPE_SUMMARY =
+  "Copies all settings — proxy, fingerprint config, timezone/locale, " +
+  "humanize, license key, extensions, idle timeout, launch args, tags, " +
+  "notes — into a new profile.";
+const DUPLICATE_EXCLUSIONS_SUMMARY =
+  "Does NOT copy cookies, browsing history, cache, or any other saved " +
+  "browser data (the duplicate starts with an empty profile directory), " +
+  "and gets its own fresh random fingerprint seed rather than the " +
+  "original's, so it won't look like the same machine.";
 
 const RESOLUTION_PRESETS: Record<string, { width: number; height: number }> = {
   "1920 × 1080 (Full HD)": { width: 1920, height: 1080 },
@@ -52,7 +68,7 @@ const GPU_PRESETS: Record<string, { vendor: string; renderer: string }> = {
   },
 };
 
-export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -72,6 +88,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
 
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
@@ -162,6 +179,19 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     }
   };
 
+  const handleDuplicate = async () => {
+    if (!onDuplicate) return;
+    if (!confirm(
+      `Duplicate this profile?\n\n${DUPLICATE_SCOPE_SUMMARY}\n\n${DUPLICATE_EXCLUSIONS_SUMMARY}`,
+    )) return;
+    setDuplicating(true);
+    try {
+      await onDuplicate();
+    } finally {
+      setDuplicating(false);
+    }
+  };
+
   const applyGpuPreset = (name: string) => {
     const preset = GPU_PRESETS[name];
     if (preset) {
@@ -217,6 +247,18 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           <h2 className="text-lg font-semibold">
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
+          {isEdit && onDuplicate && (
+            <button
+              type="button"
+              onClick={handleDuplicate}
+              disabled={duplicating}
+              className="btn-secondary flex items-center gap-1.5"
+              title={`${DUPLICATE_SCOPE_SUMMARY} ${DUPLICATE_EXCLUSIONS_SUMMARY}`}
+            >
+              <Copy className="h-3.5 w-3.5" />
+              <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
+            </button>
+          )}
           {isEdit && onDelete && (
             <button
               type="button"

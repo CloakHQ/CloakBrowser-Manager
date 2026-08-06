@@ -80,6 +80,7 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   getProfile: ["p1"],
   createProfile: [{ name: "New" }],
   updateProfile: ["p1", { name: "New" }],
+  duplicateProfile: ["p1"],
   deleteProfile: ["p1"],
   launchProfile: ["p1"],
   stopProfile: ["p1"],
