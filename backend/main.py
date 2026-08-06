@@ -20,6 +20,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -68,10 +69,12 @@ from .models import (
     ProfileCreate,
     ProfileResponse,
     ProfileStatusResponse,
+    ProfileTabsResponse,
     ProfileUpdate,
     ResourceUsageResponse,
     StatusResponse,
     SystemCheckResponse,
+    TabInfo,
     TagResponse,
     ViewerTokenResponse,
 )
@@ -772,6 +775,60 @@ async def get_profile_resources(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not running")
     usage = await get_resource_usage(running.proc)
     return ResourceUsageResponse(**usage)
+
+
+# ── Tab manager ──────────────────────────────────────────────────────────────
+# Lets an operator see and close a profile's open tabs without opening its VNC
+# viewer. Each page's title/favicon read is individually bounded so one
+# wedged tab cannot block the whole listing — same pattern as
+# _read_clipboard_from_pages above.
+_TAB_PAGE_TIMEOUT_S = 2.0
+_TAB_MAX_PAGES = 50  # sane upper bound on one listing/close request
+
+_FAVICON_JS = "() => document.querySelector(\"link[rel~='icon']\")?.href || null"
+
+
+async def _tab_info(page: Any, index: int) -> TabInfo:
+    try:
+        title = await asyncio.wait_for(page.title(), timeout=_TAB_PAGE_TIMEOUT_S)
+    except Exception:
+        title = ""
+    url = page.url
+    try:
+        favicon = await asyncio.wait_for(
+            page.evaluate(_FAVICON_JS), timeout=_TAB_PAGE_TIMEOUT_S,
+        )
+    except Exception:
+        favicon = None
+    return TabInfo(index=index, title=title or url, url=url, favicon=favicon)
+
+
+@app.get("/api/profiles/{profile_id}/tabs", response_model=ProfileTabsResponse)
+async def list_profile_tabs(profile_id: str):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    pages = list(running.context.pages)[:_TAB_MAX_PAGES]
+    tabs = await asyncio.gather(*(_tab_info(page, i) for i, page in enumerate(pages)))
+    return ProfileTabsResponse(tabs=list(tabs))
+
+
+@app.delete("/api/profiles/{profile_id}/tabs/{index}")
+async def close_profile_tab(profile_id: str, index: int):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    pages = list(running.context.pages)
+    if index < 0 or index >= len(pages):
+        raise HTTPException(status_code=404, detail="Tab not found")
+    try:
+        await asyncio.wait_for(pages[index].close(), timeout=_TAB_PAGE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timed out closing tab")
+    except Exception as exc:
+        logger.warning("Failed to close tab %d for profile %s: %s", index, profile_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to close tab")
+    return {"ok": True}
 
 
 # ── Cookie Warmup ─────────────────────────────────────────────────────────────

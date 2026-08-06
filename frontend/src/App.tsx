@@ -12,6 +12,7 @@ import { LaunchButton } from "./components/LaunchButton";
 import { RestartButton } from "./components/RestartButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { SystemCheckPanel } from "./components/SystemCheckPanel";
+import { TabManagerPanel } from "./components/TabManagerPanel";
 import { LoginPage } from "./components/LoginPage";
 import { BinaryDownloadBanner } from "./components/BinaryDownloadBanner";
 
@@ -303,6 +304,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             )}
             {/* Container-level, not profile-scoped — always available,
                 unlike everything else in this cluster. */}
+            <TabManagerPanel profiles={profiles} />
             <SystemCheckPanel />
             {authRequired && (
               <button

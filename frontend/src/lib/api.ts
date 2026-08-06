@@ -203,6 +203,16 @@ export interface CookieWarmupStatus {
   error: string | null;
 }
 
+export interface Tab {
+  /** Position in the profile's page list when this response was built — the
+   *  id closeTab() targets. Not a stable identity: a tab opening/closing
+   *  between a list and a close call can shift it. */
+  index: number;
+  title: string;
+  url: string;
+  favicon: string | null;
+}
+
 export interface ViewerAttached {
   /**
    * Whether a viewer WebSocket is attached, or null if the probe could not
@@ -378,6 +388,12 @@ export const api = {
 
   viewerAttached: (id: string) =>
     request<ViewerAttached>(`/api/profiles/${id}/viewer-attached`),
+
+  listTabs: (id: string) =>
+    request<{ tabs: Tab[] }>(`/api/profiles/${id}/tabs`),
+
+  closeTab: (id: string, index: number) =>
+    request<{ ok: boolean }>(`/api/profiles/${id}/tabs/${index}`, { method: "DELETE" }),
 
   startCookieWarmup: (id: string) =>
     request<CookieWarmupStatus>(`/api/profiles/${id}/cookie-warmup/start`, { method: "POST" }),

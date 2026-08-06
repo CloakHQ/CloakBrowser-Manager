@@ -1350,6 +1350,167 @@ def test_get_clipboard_from_page(app_client: TestClient):
     main.browser_mgr.running.pop(pid, None)
 
 
+# ── Tab manager ──────────────────────────────────────────────────────────────
+
+
+def _mock_page(url: str, title: str = "", favicon: str | None = None) -> AsyncMock:
+    page = AsyncMock()
+    page.url = url
+    page.title = AsyncMock(return_value=title)
+    page.evaluate = AsyncMock(return_value=favicon)
+    page.close = AsyncMock()
+    return page
+
+
+def test_list_tabs_not_running(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/tabs")
+    assert resp.status_code == 404
+
+
+def test_list_tabs_returns_title_url_favicon_in_order(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "Tabs"})
+    pid = create.json()["id"]
+
+    page_a = _mock_page("https://a.example/", "Site A", "https://a.example/favicon.ico")
+    page_b = _mock_page("https://b.example/", "Site B", None)
+
+    mock_context = MagicMock()
+    mock_context.pages = [page_a, page_b]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/tabs")
+        assert resp.status_code == 200
+        tabs = resp.json()["tabs"]
+        assert tabs == [
+            {"index": 0, "title": "Site A", "url": "https://a.example/",
+             "favicon": "https://a.example/favicon.ico"},
+            {"index": 1, "title": "Site B", "url": "https://b.example/", "favicon": None},
+        ]
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_list_tabs_falls_back_to_url_when_title_is_empty(app_client: TestClient):
+    # An about:blank tab (or one still loading) reports an empty title — the
+    # panel must show something identifiable rather than a blank row.
+    create = app_client.post("/api/profiles", json={"name": "TabsBlank"})
+    pid = create.json()["id"]
+
+    page = _mock_page("about:blank", title="")
+    mock_context = MagicMock()
+    mock_context.pages = [page]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/tabs")
+        assert resp.json()["tabs"][0]["title"] == "about:blank"
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_list_tabs_survives_a_wedged_page(app_client: TestClient):
+    # One tab whose title()/evaluate() never resolve must not take the whole
+    # listing down with it — same guarantee _read_clipboard_from_pages makes.
+    create = app_client.post("/api/profiles", json={"name": "TabsWedged"})
+    pid = create.json()["id"]
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(10)
+
+    wedged = AsyncMock()
+    wedged.url = "https://stuck.example/"
+    wedged.title = AsyncMock(side_effect=_hang)
+    wedged.evaluate = AsyncMock(side_effect=_hang)
+    good = _mock_page("https://ok.example/", "Fine")
+
+    mock_context = MagicMock()
+    mock_context.pages = [wedged, good]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        with patch("backend.main._TAB_PAGE_TIMEOUT_S", 0.05):
+            resp = app_client.get(f"/api/profiles/{pid}/tabs")
+        assert resp.status_code == 200
+        tabs = resp.json()["tabs"]
+        assert tabs[0] == {
+            "index": 0, "title": "https://stuck.example/",
+            "url": "https://stuck.example/", "favicon": None,
+        }
+        assert tabs[1]["title"] == "Fine"
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_close_tab_not_running(app_client: TestClient):
+    resp = app_client.delete("/api/profiles/nonexistent/tabs/0")
+    assert resp.status_code == 404
+
+
+def test_close_tab_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CloseTab"})
+    pid = create.json()["id"]
+
+    page_a = _mock_page("https://a.example/", "A")
+    page_b = _mock_page("https://b.example/", "B")
+    mock_context = MagicMock()
+    mock_context.pages = [page_a, page_b]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}/tabs/1")
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        page_b.close.assert_awaited_once()
+        page_a.close.assert_not_called()
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_close_tab_invalid_index(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CloseTabBad"})
+    pid = create.json()["id"]
+
+    mock_context = MagicMock()
+    mock_context.pages = [_mock_page("https://a.example/", "A")]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}/tabs/5")
+        assert resp.status_code == 404
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_close_tab_reports_500_when_close_fails(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CloseTabFail"})
+    pid = create.json()["id"]
+
+    page = _mock_page("https://a.example/", "A")
+    page.close = AsyncMock(side_effect=RuntimeError("target closed"))
+    mock_context = MagicMock()
+    mock_context.pages = [page]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}/tabs/0")
+        assert resp.status_code == 500
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
 # ── Response shape ───────────────────────────────────────────────────────────
 
 

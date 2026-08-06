@@ -101,6 +101,8 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   listDownloads: ["p1"],
   deleteDownload: ["p1", "/file.txt"],
   viewerAttached: ["p1"],
+  listTabs: ["p1"],
+  closeTab: ["p1", 0],
   startCookieWarmup: ["p1"],
   cookieWarmupStatus: ["p1"],
   stopCookieWarmup: ["p1"],
@@ -248,6 +250,28 @@ describe("api.getClipboard", () => {
     mockFetch.mockResolvedValueOnce(jsonResponse({ text: "copied" }));
     const result = await api.getClipboard("1");
     expect(result.text).toBe("copied");
+  });
+});
+
+// ── listTabs / closeTab ─────────────────────────────────────────────────────
+
+describe("api.listTabs", () => {
+  it("returns the tab list for a profile", async () => {
+    const tabs = [{ index: 0, title: "Example", url: "https://example.com/", favicon: null }];
+    mockFetch.mockResolvedValueOnce(jsonResponse({ tabs }));
+    const result = await api.listTabs("1");
+    expect(result.tabs).toEqual(tabs);
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/profiles/1/tabs");
+  });
+});
+
+describe("api.closeTab", () => {
+  it("sends DELETE to the indexed tab route", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    await api.closeTab("1", 2);
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/profiles/1/tabs/2");
+    expect(options.method).toBe("DELETE");
   });
 });
 

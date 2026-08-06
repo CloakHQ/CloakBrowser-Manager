@@ -239,6 +239,21 @@ class SystemCheckResponse(BaseModel):
     disk_percent_used: float
 
 
+class TabInfo(BaseModel):
+    # Position in context.pages() at the moment this response was built — the
+    # id used to target the close endpoint. Not a stable identity: a tab
+    # opening/closing between a list and a close call can shift it, same
+    # trade-off downloads-by-filename already makes elsewhere in this API.
+    index: int
+    title: str
+    url: str
+    favicon: str | None = None
+
+
+class ProfileTabsResponse(BaseModel):
+    tabs: list[TabInfo]
+
+
 class CookieWarmupStatusResponse(BaseModel):
     state: Literal["idle", "running", "done", "error", "cancelled"] = "idle"
     sites_total: int = 0
