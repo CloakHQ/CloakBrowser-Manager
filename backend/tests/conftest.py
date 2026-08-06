@@ -12,7 +12,8 @@ import pytest
 # ---------------------------------------------------------------------------
 # Mock cloakbrowser BEFORE any backend module is imported.
 # browser_manager.py does `from cloakbrowser import launch_persistent_context_async`
-# at module level, and main.py imports BrowserManager which triggers it.
+# and `from cloakbrowser.download import ensure_binary` at module level, and
+# main.py imports BrowserManager which triggers both.
 # main.py:381 also does `from cloakbrowser.config import CHROMIUM_VERSION`.
 # ---------------------------------------------------------------------------
 
@@ -22,8 +23,12 @@ _mock_cloakbrowser.launch_persistent_context_async = AsyncMock()  # type: ignore
 _mock_config = types.ModuleType("cloakbrowser.config")
 _mock_config.CHROMIUM_VERSION = "0.0.0-test"  # type: ignore[attr-defined]
 
+_mock_download = types.ModuleType("cloakbrowser.download")
+_mock_download.ensure_binary = MagicMock(return_value="/fake/chrome")  # type: ignore[attr-defined]
+
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
 sys.modules.setdefault("cloakbrowser.config", _mock_config)
+sys.modules.setdefault("cloakbrowser.download", _mock_download)
 
 
 from backend import database as db  # noqa: E402

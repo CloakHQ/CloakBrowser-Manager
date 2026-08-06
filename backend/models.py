@@ -134,6 +134,12 @@ class StatusResponse(BaseModel):
     running_count: int
     binary_version: str
     profiles_total: int
+    # CloakBrowser Chromium downloads on first launch (see binary_status.py);
+    # these let the UI show a progress banner instead of a launch that just
+    # looks hung. binary_download_state is "downloading" | "extracting" | None.
+    binary_downloading: bool = False
+    binary_download_percent: int | None = None
+    binary_download_state: str | None = None
 
 
 class ProfileStatusResponse(BaseModel):

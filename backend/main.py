@@ -26,6 +26,7 @@ import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
+from .binary_status import snapshot as binary_status_snapshot
 from .browser_manager import LAUNCH_TIMEOUT_S, BrowserManager, ProfileAlreadyRunning
 from .vnc_manager import viewer_stream_mode_preference
 from .models import (
@@ -828,10 +829,14 @@ async def get_system_status():
     from cloakbrowser.config import CHROMIUM_VERSION
 
     profiles = db.list_profiles()
+    binary = binary_status_snapshot()
     return StatusResponse(
         running_count=len(browser_mgr.running),
         binary_version=CHROMIUM_VERSION,
         profiles_total=len(profiles),
+        binary_downloading=binary["downloading"],
+        binary_download_percent=binary["percent"],
+        binary_download_state=binary["state"],
     )
 
 

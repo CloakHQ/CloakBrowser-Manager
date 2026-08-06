@@ -102,6 +102,12 @@ export interface SystemStatus {
   running_count: number;
   binary_version: string;
   profiles_total: number;
+  /** CloakBrowser Chromium downloads on first launch — these three describe
+   * that download so the UI can show a progress banner. state is
+   * "downloading" | "extracting" | null (idle/done). */
+  binary_downloading: boolean;
+  binary_download_percent: number | null;
+  binary_download_state: string | null;
 }
 
 export interface ViewerToken {

@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cloakbrowser import launch_persistent_context_async
+from cloakbrowser.download import ensure_binary
+
+from . import binary_status
 
 # _dri_driver reads the driver behind a render node, and the node itself comes
 # from the same KASM_DRINODE that Xvnc's -drinode uses. Imported rather than
@@ -25,6 +28,12 @@ from .vnc_manager import VNCManager, _dri_driver, _dri_render_node
 from .viewer_tokens import viewer_tokens
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
+
+# Parses the "cloakbrowser" logger's download-progress messages into
+# binary_status's in-memory state; see that module for why (no callback hook
+# on ensure_binary()). Installed once at import time — this module is only
+# ever imported once, by main.py at process startup.
+binary_status.install()
 
 
 class ProfileAlreadyRunning(RuntimeError):
@@ -830,6 +839,24 @@ class BrowserManager:
         # server nothing will connect to.
         headless = bool(profile.get("headless", False))
         try:
+            # ensure_binary() is a blocking, synchronous call (network I/O),
+            # and launch_persistent_context_async() below calls it again
+            # internally with no way to make it async. Off the event loop
+            # first: on a warm cache this is a cheap no-op (the second,
+            # internal call just re-hits the same cache), but on a first-ever
+            # launch it keeps every other request — including the frontend's
+            # download-progress poll — served while the ~200-460MB binary
+            # downloads, instead of freezing the whole API for that duration.
+            # binary_status only flips its banner on when a download actually
+            # starts, so a cache hit here never shows one. mark_idle() in the
+            # finally covers the one case the module's own log-parsing can't:
+            # a failed download, which never reaches the "Binary ready" line
+            # that would otherwise clear it, leaving the banner stuck on.
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, ensure_binary)
+            finally:
+                binary_status.mark_idle()
+
             if not headless:
                 display, ws_port = await self.vnc.allocate()
             cdp_port = self._allocate_cdp_port()

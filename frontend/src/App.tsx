@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
+import { useBinaryDownload } from "./hooks/useBinaryDownload";
 import { api, setOnUnauthorized, type ProfileCreateData, type ProfileLifecycle } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
@@ -8,6 +9,7 @@ import { ProfileViewer } from "./components/ProfileViewer";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { LoginPage } from "./components/LoginPage";
+import { BinaryDownloadBanner } from "./components/BinaryDownloadBanner";
 
 type AuthState = "checking" | "required" | "ok" | "error";
 type View = "empty" | "create" | "edit" | "view";
@@ -107,6 +109,7 @@ interface AppContentProps {
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
   const { profiles, loading, error, create, update, remove, launch, stop } = useProfiles();
+  const binaryDownload = useBinaryDownload();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -246,6 +249,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             )}
           </div>
         </div>
+
+        {/* Binary download banner */}
+        <BinaryDownloadBanner status={binaryDownload} />
 
         {/* Error banner */}
         {error && (
