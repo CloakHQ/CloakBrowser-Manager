@@ -1,4 +1,4 @@
-import { Copy, Save, Trash2, X } from "lucide-react";
+import { Copy, RefreshCw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
 
@@ -89,6 +89,7 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
+  const [rescanning, setRescanning] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
@@ -128,11 +129,12 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
   }, [profile?.id]);
 
   // Extensions are scanned once at container startup (see
-  // backend/extensions.py) and don't change without a restart, so a single
-  // fetch on mount — no polling — is correct, not a shortcut. A brand-new
-  // profile (profile === null) starts with every extension enabled; an
-  // existing one keeps whatever the effect above loaded from profile.
-  // enabled_extensions, which this must not stomp on.
+  // backend/extensions.py) and don't change without a restart OR an
+  // explicit Rescan (below), so a single fetch on mount — no polling — is
+  // correct, not a shortcut. A brand-new profile (profile === null) starts
+  // with every extension enabled; an existing one keeps whatever the effect
+  // above loaded from profile.enabled_extensions, which this must not
+  // stomp on.
   useEffect(() => {
     api.listExtensions()
       .then((exts) => {
@@ -143,6 +145,21 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
       })
       .catch((err) => console.warn("[extensions] failed to load:", err));
   }, []);
+
+  const handleRescan = async () => {
+    setRescanning(true);
+    try {
+      const exts = await api.rescanExtensions();
+      setExtensions(exts);
+      if (!isEdit) {
+        setForm((prev) => ({ ...prev, enabled_extensions: exts.map((e) => e.id) }));
+      }
+    } catch (err) {
+      console.warn("[extensions] rescan failed:", err);
+    } finally {
+      setRescanning(false);
+    }
+  };
 
   // Just for the placeholder below — shows what "leave blank" actually
   // resolves to instead of a hardcoded guess that could drift from
@@ -669,12 +686,24 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
 
         {/* Extensions */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Extensions</h3>
+            <button
+              type="button"
+              onClick={handleRescan}
+              disabled={rescanning}
+              className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1"
+              title="Re-scan ~/.cloakbrowser-manager/extensions on the host right now, without a container restart"
+            >
+              <RefreshCw className={`h-3 w-3 ${rescanning ? "animate-spin" : ""}`} />
+              {rescanning ? "Rescanning..." : "Rescan"}
+            </button>
+          </div>
           {extensions.length === 0 ? (
             <p className="text-xs text-gray-500">
               None found. Drop an unpacked extension (a directory with manifest.json at its root)
-              into ~/.cloakbrowser-manager/extensions on the host, then `docker compose restart` —
-              extensions are only scanned once, at startup.
+              into ~/.cloakbrowser-manager/extensions on the host, then click Rescan above (or
+              `docker compose restart`, which always picks up changes too).
             </p>
           ) : (
             <div className="space-y-2">

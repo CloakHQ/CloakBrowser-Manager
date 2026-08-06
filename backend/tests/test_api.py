@@ -128,6 +128,36 @@ def test_delete_profile_not_found(app_client: TestClient):
 # ── Duplicate profile ────────────────────────────────────────────────────────
 
 
+# ── Extensions rescan ────────────────────────────────────────────────────────
+
+
+def test_rescan_extensions_picks_up_a_newly_dropped_extension(
+    app_client: TestClient, tmp_path, monkeypatch,
+):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    (tmp_path / "new-ext").mkdir()
+    (tmp_path / "new-ext" / "manifest.json").write_text(
+        '{"name": "New Ext", "version": "1.0"}',
+    )
+    try:
+        resp = app_client.post("/api/extensions/rescan")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["id"] == "new-ext"
+        assert data[0]["name"] == "New Ext"
+
+        # GET reflects the same cache /rescan just replaced, not a stale copy.
+        assert app_client.get("/api/extensions").json() == data
+    finally:
+        # Force the next real access to re-scan the ACTUAL (monkeypatch-
+        # reverted) EXTENSIONS_DIR instead of leaking this fake result into
+        # every later test in the session.
+        extensions._cache = None
+
+
 def test_duplicate_profile_not_found(app_client: TestClient):
     resp = app_client.post("/api/profiles/nonexistent/duplicate")
     assert resp.status_code == 404

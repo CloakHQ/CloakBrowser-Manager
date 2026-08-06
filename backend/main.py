@@ -37,7 +37,7 @@ from .browser_manager import (
     RunningProfile,
     _viewer_attached,
 )
-from .extensions import list_available_extensions
+from .extensions import list_available_extensions, rescan_extensions
 from .vnc_manager import viewer_stream_mode_preference
 from .models import (
     ClipboardRequest,
@@ -893,6 +893,17 @@ async def get_extensions():
     # list_available_extensions() is cached from the scan lifespan already
     # did at startup — this is a plain in-memory read, not a filesystem scan.
     return [ExtensionResponse(**e) for e in list_available_extensions()]
+
+
+@app.post("/api/extensions/rescan", response_model=list[ExtensionResponse])
+async def rescan_extensions_endpoint():
+    """Re-scan EXTENSIONS_DIR right now, replacing the cached list.
+
+    An explicit operator action (the UI's "Rescan" button, or right after an
+    upload) — not a substitute for the normal once-per-start cache. See
+    extensions.py's rescan_extensions() for why that distinction matters.
+    """
+    return [ExtensionResponse(**e) for e in rescan_extensions()]
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────

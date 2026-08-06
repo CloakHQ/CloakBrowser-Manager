@@ -115,3 +115,15 @@ describe("ProfileForm duplicate control", () => {
     }
   });
 });
+
+describe("ProfileForm extensions rescan control", () => {
+  it("renders a Rescan button in the Extensions section regardless of create/edit mode", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const { unmount } = render(<ProfileForm profile={null} onSave={onSave} onCancel={() => {}} />);
+    expect(screen.getByRole("button", { name: /rescan/i })).toBeInTheDocument();
+    unmount();
+
+    render(<ProfileForm profile={makeProfile()} onSave={onSave} onCancel={() => {}} />);
+    expect(screen.getByRole("button", { name: /rescan/i })).toBeInTheDocument();
+  });
+});

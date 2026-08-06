@@ -278,6 +278,9 @@ export const api = {
 
   listExtensions: () => request<Extension[]>("/api/extensions"),
 
+  rescanExtensions: () =>
+    request<Extension[]>("/api/extensions/rescan", { method: "POST" }),
+
   setClipboard: (id: string, text: string) =>
     request<{ ok: boolean }>(`/api/profiles/${id}/clipboard`, {
       method: "POST",

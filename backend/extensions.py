@@ -16,8 +16,12 @@ every request or watched for changes:
      by design, never changes without a container restart anyway.
 
 Adding, removing, or editing an extension under EXTENSIONS_DIR requires a
-`docker compose restart` (or recreate) to be picked up. See the volumes:
-comment in docker-compose.yml.
+`docker compose restart` (or recreate) to be picked up automatically — OR an
+operator can force it via rescan_extensions() (POST /api/extensions/rescan,
+a "Rescan" button in the UI). That stays consistent with the reasoning
+above: a human explicitly asking for the list to change right now is not
+the same problem as it changing silently out from under them mid-session.
+See the volumes: comment in docker-compose.yml.
 """
 
 from __future__ import annotations
@@ -107,6 +111,20 @@ def list_available_extensions() -> list[dict[str, Any]]:
     global _cache
     if _cache is None:
         _cache = _scan()
+    return _cache
+
+
+def rescan_extensions() -> list[dict[str, Any]]:
+    """Force a fresh scan, replacing the cached list.
+
+    Manual and explicit only — an operator-triggered escape hatch (a UI
+    "Rescan" button, or a fresh upload that needs to show up immediately),
+    not a background watcher. The module docstring's case against
+    auto-refreshing still holds; a human asking for it right now doesn't
+    hit it, since nothing changes without them choosing that exact moment.
+    """
+    global _cache
+    _cache = _scan()
     return _cache
 
 
