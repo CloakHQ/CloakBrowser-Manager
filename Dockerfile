@@ -145,4 +145,16 @@ COPY docker/fetch-widevine.py /fetch-widevine.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Chrome managed policy: BlockThirdPartyCookies=false. Without this a fresh
+# profile inherits upstream Chromium's default cookie-blocking behavior,
+# which silently breaks the "act like an ordinary logged-in browser" premise
+# every other setting here works towards, and is the kind of thing a user
+# could otherwise flip off for themselves in chrome://settings — a managed
+# policy is locked and cannot be changed from inside the browser at all.
+# `/etc/chromium/policies/managed` (not `/etc/opt/chrome/...`) is the path
+# this build's own binary reads — confirmed via `strings` on the fetched
+# chrome binary, not assumed from a generic Google Chrome doc.
+RUN mkdir -p /etc/chromium/policies/managed
+COPY docker/chrome-policies.json /etc/chromium/policies/managed/cloakbrowser.json
+
 ENTRYPOINT ["/entrypoint.sh"]

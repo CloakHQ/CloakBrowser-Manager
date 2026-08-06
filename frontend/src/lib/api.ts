@@ -173,6 +173,16 @@ export interface ResourceUsage {
   process_count: number;
 }
 
+export interface CookieWarmupStatus {
+  state: "idle" | "running" | "done" | "error" | "cancelled";
+  sites_total: number;
+  sites_visited: number;
+  current_site: string | null;
+  elapsed_seconds: number | null;
+  remaining_seconds: number | null;
+  error: string | null;
+}
+
 export interface ViewerAttached {
   /**
    * Whether a viewer WebSocket is attached, or null if the probe could not
@@ -346,6 +356,15 @@ export const api = {
 
   viewerAttached: (id: string) =>
     request<ViewerAttached>(`/api/profiles/${id}/viewer-attached`),
+
+  startCookieWarmup: (id: string) =>
+    request<CookieWarmupStatus>(`/api/profiles/${id}/cookie-warmup/start`, { method: "POST" }),
+
+  cookieWarmupStatus: (id: string) =>
+    request<CookieWarmupStatus>(`/api/profiles/${id}/cookie-warmup/status`),
+
+  stopCookieWarmup: (id: string) =>
+    request<CookieWarmupStatus>(`/api/profiles/${id}/cookie-warmup/stop`, { method: "POST" }),
 };
 
 // Not a JSON fetch — a URL for window.open()/an <a href>, so the browser's

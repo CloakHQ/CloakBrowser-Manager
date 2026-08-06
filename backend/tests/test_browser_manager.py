@@ -521,7 +521,8 @@ def test_init_creates_preferences(tmp_path: Path):
     assert prefs_path.exists()
     data = json.loads(prefs_path.read_text())
     assert "default_search_provider_data" in data
-    assert "DuckDuckGo" in data["default_search_provider_data"]["template_url_data"]["short_name"]
+    assert "Google" in data["default_search_provider_data"]["template_url_data"]["short_name"]
+    assert data["default_search_provider"]["enabled"] is True
 
 
 def test_init_idempotent(tmp_path: Path):

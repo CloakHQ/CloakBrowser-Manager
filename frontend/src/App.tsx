@@ -4,6 +4,7 @@ import { useProfiles } from "./hooks/useProfiles";
 import { useBinaryDownload } from "./hooks/useBinaryDownload";
 import { useResourceUsage } from "./hooks/useResourceUsage";
 import { api, setOnUnauthorized, type ProfileCreateData, type ProfileLifecycle } from "./lib/api";
+import { CookieWarmupPanel } from "./components/CookieWarmupPanel";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -250,6 +251,14 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {/* Cookie warmup only ever needs to appear here: selecting a
+                running profile opens the viewer, never the edit form (see
+                VIEW_ON_SELECT), so a Warm up cookies button living only in
+                ProfileForm would never be reachable while there is anything
+                for it to run against. */}
+            {selected && selected.status === "running" && (
+              <CookieWarmupPanel profileId={selected.id} isRunning compact />
+            )}
             {selected && (
               <LaunchButton
                 status={selected.status}

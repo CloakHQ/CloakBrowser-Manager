@@ -153,3 +153,40 @@ describe("ProfileForm extension install controls", () => {
     expect(installButton).not.toBeDisabled();
   });
 });
+
+describe("ProfileForm cookie warmup section", () => {
+  it("does not render in create mode", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<ProfileForm profile={null} onSave={onSave} onCancel={() => {}} />);
+    expect(screen.queryByText("Cookie Warmup")).not.toBeInTheDocument();
+  });
+
+  it("renders in edit mode and reflects a stopped profile", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    await act(async () => {
+      render(
+        <ProfileForm
+          profile={makeProfile({ status: "stopped" })}
+          onSave={onSave}
+          onCancel={() => {}}
+        />,
+      );
+    });
+    expect(screen.getByText("Cookie Warmup")).toBeInTheDocument();
+    expect(screen.getByText(/launch this profile first/i)).toBeInTheDocument();
+  });
+
+  it("offers to start a warmup for a running profile", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    await act(async () => {
+      render(
+        <ProfileForm
+          profile={makeProfile({ status: "running" })}
+          onSave={onSave}
+          onCancel={() => {}}
+        />,
+      );
+    });
+    expect(screen.getByRole("button", { name: /warm up cookies/i })).toBeInTheDocument();
+  });
+});

@@ -47,6 +47,7 @@ from .browser_manager import (
     RunningProfile,
     _viewer_attached,
 )
+from . import cookie_warmup
 from .extensions import (
     chrome_web_store_crx_url,
     extract_extension_id,
@@ -57,6 +58,7 @@ from .extensions import (
 from .vnc_manager import viewer_stream_mode_preference
 from .models import (
     ClipboardRequest,
+    CookieWarmupStatusResponse,
     ExtensionInstallFromUrlRequest,
     ExtensionResponse,
     LaunchResponse,
@@ -265,6 +267,13 @@ class AuthMiddleware:
 
 # Singleton browser manager
 browser_mgr = BrowserManager()
+
+# Cookie warmup is a fire-and-forget asyncio.Task per profile, tracked
+# separately from RunningProfile since it outlives no single request and
+# should not survive a stop/relaunch of the profile it was running against.
+# See cookie_warmup.py and the /cookie-warmup/* routes below.
+_warmup_status: dict[str, cookie_warmup.WarmupStatus] = {}
+_warmup_tasks: dict[str, asyncio.Task] = {}
 
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
@@ -727,6 +736,80 @@ async def get_profile_resources(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not running")
     usage = await get_resource_usage(running.proc)
     return ResourceUsageResponse(**usage)
+
+
+# ── Cookie Warmup ─────────────────────────────────────────────────────────────
+# A profile stopping mid-warmup is not specially handled here: the running
+# asyncio.Task notices via is_still_running() at the next per-site boundary
+# (at most one dwell interval, ~30s) and ends itself in the "cancelled" state
+# on its own — see cookie_warmup.run()'s docstring.
+
+
+def _cookie_warmup_response(status: cookie_warmup.WarmupStatus) -> CookieWarmupStatusResponse:
+    elapsed = None
+    remaining = None
+    if status.started_at is not None:
+        end = status.finished_at if status.finished_at is not None else time.monotonic()
+        elapsed = end - status.started_at
+        remaining = max(0.0, cookie_warmup.WARMUP_DURATION_SECONDS - elapsed)
+    return CookieWarmupStatusResponse(
+        state=status.state,
+        sites_total=status.sites_total,
+        sites_visited=status.sites_visited,
+        current_site=status.current_site,
+        elapsed_seconds=elapsed,
+        remaining_seconds=remaining,
+        error=status.error,
+    )
+
+
+@app.post(
+    "/api/profiles/{profile_id}/cookie-warmup/start",
+    response_model=CookieWarmupStatusResponse,
+    status_code=202,
+)
+async def start_cookie_warmup(profile_id: str):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    existing_task = _warmup_tasks.get(profile_id)
+    if existing_task is not None and not existing_task.done():
+        raise HTTPException(status_code=409, detail="Cookie warmup already running for this profile")
+
+    context = running.context
+    status = cookie_warmup.new_status()
+    _warmup_status[profile_id] = status
+
+    def is_still_running() -> bool:
+        current = browser_mgr.running.get(profile_id)
+        return current is not None and current.context is context
+
+    _warmup_tasks[profile_id] = asyncio.create_task(cookie_warmup.run(context, status, is_still_running))
+    return _cookie_warmup_response(status)
+
+
+@app.get("/api/profiles/{profile_id}/cookie-warmup/status", response_model=CookieWarmupStatusResponse)
+async def get_cookie_warmup_status(profile_id: str):
+    if not db.get_profile(profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    status = _warmup_status.get(profile_id)
+    if status is None:
+        return CookieWarmupStatusResponse()
+    return _cookie_warmup_response(status)
+
+
+@app.post("/api/profiles/{profile_id}/cookie-warmup/stop", response_model=CookieWarmupStatusResponse)
+async def stop_cookie_warmup(profile_id: str):
+    task = _warmup_tasks.get(profile_id)
+    status = _warmup_status.get(profile_id)
+    if task is None or status is None or task.done():
+        raise HTTPException(status_code=404, detail="No cookie warmup running for this profile")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return _cookie_warmup_response(status)
 
 
 # ── Viewer Sessions (KasmVNC native client) ──────────────────────────────────

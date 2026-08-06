@@ -30,6 +30,15 @@ vi.mock("./lib/api", () => {
         binary_downloading: false, binary_download_percent: null,
         binary_download_state: null, default_idle_timeout_seconds: 3600,
       }),
+      // The top bar's compact CookieWarmupPanel fetches this on mount for
+      // any running profile — see "cookie warmup control in the top bar"
+      // below.
+      cookieWarmupStatus: vi.fn().mockResolvedValue({
+        state: "idle", sites_total: 20, sites_visited: 0, current_site: null,
+        elapsed_seconds: null, remaining_seconds: null, error: null,
+      }),
+      startCookieWarmup: vi.fn(),
+      stopCookieWarmup: vi.fn(),
     },
     setOnUnauthorized: vi.fn(),
     ApiError,
@@ -150,6 +159,35 @@ describe("selecting a profile routes to the pane that can actually work", () => 
     await flush();
     expect(screen.queryByTitle("Browser session")).not.toBeInTheDocument();
     expect(screen.getByText("Save")).toBeInTheDocument();
+  });
+});
+
+describe("cookie warmup control in the top bar", () => {
+  // Selecting a running profile always opens the viewer, never the edit
+  // form (see App.tsx's VIEW_ON_SELECT) — so the actionable "Warm up
+  // cookies" button has to live in the top bar, not inside ProfileForm,
+  // or it would never be reachable for a profile it can actually run
+  // against.
+  it("shows Warm up cookies for a running profile", async () => {
+    mockApi.listProfiles.mockResolvedValue([profile("running")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.getByRole("button", { name: /warm up cookies/i })).toBeInTheDocument();
+  });
+
+  it("does not show it for a stopped profile", async () => {
+    mockApi.listProfiles.mockResolvedValue([profile("stopped")]);
+    render(<App />);
+    await flush();
+    await act(async () => {
+      screen.getByText("Test Profile").click();
+    });
+    await flush();
+    expect(screen.queryByRole("button", { name: /warm up cookies/i })).not.toBeInTheDocument();
   });
 });
 

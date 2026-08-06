@@ -1,6 +1,7 @@
 import { Copy, RefreshCw, Save, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
+import { CookieWarmupPanel } from "./CookieWarmupPanel";
 import { DownloadsBrowser } from "./DownloadsBrowser";
 
 interface ProfileFormProps {
@@ -857,6 +858,14 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
             placeholder="Optional notes about this profile..."
           />
         </section>
+
+        {/* Cookie Warmup — only once a profile exists; needs it running */}
+        {isEdit && profile && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Cookie Warmup</h3>
+            <CookieWarmupPanel profileId={profile.id} isRunning={profile.status === "running"} />
+          </section>
+        )}
 
         {/* Downloads — only once a profile (and its Downloads folder) exists */}
         {isEdit && profile && (

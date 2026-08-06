@@ -6,16 +6,19 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+import asyncio
 import io
 import json
 import os
 import pathlib
 import socket
+import time
 import zipfile
 
 from starlette.testclient import TestClient
 
 from backend import browser_manager as bm
+from backend import cookie_warmup
 from backend import main
 from backend.browser_manager import BrowserManager, RunningProfile
 
@@ -2429,3 +2432,142 @@ def test_spa_falls_through_to_index_for_client_routes(tmp_path: pathlib.Path):
     (dist / "index.html").write_text("<html></html>")
     assert main._resolve_spa_file(dist, "profiles/abc") is None
     assert main._resolve_spa_file(dist, "") is None
+
+
+# ── Cookie warmup ────────────────────────────────────────────────────────────
+# cookie_warmup.run() itself is exercised directly (with a fake context and a
+# monkeypatched-down duration) in test_cookie_warmup.py — these tests only
+# check the HTTP wiring, so `cookie_warmup.run` is patched out here to a
+# controllable stand-in rather than run for real against a mocked context.
+
+
+def _mock_running_profile_with_context() -> MagicMock:
+    mock_context = MagicMock()
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    return mock_running
+
+
+def test_start_cookie_warmup_requires_a_running_profile(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "WarmupNotRunning"})
+    pid = create.json()["id"]
+    resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+    assert resp.status_code == 404
+
+
+def test_start_cookie_warmup_unknown_profile_is_404(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/cookie-warmup/start")
+    assert resp.status_code == 404
+
+
+def test_start_cookie_warmup_returns_idle_state_immediately(app_client: TestClient):
+    """asyncio.create_task schedules the run, it does not execute it inline —
+    the response reflects new_status()'s starting point, not a completed run,
+    regardless of how fast the (here, patched-out) run() itself finishes."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupStart"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+    try:
+        with patch.object(main.cookie_warmup, "run", new=AsyncMock(return_value=None)):
+            resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["state"] == "idle"
+        assert body["sites_visited"] == 0
+        assert body["sites_total"] == len(cookie_warmup.WARMUP_SITES)
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_start_cookie_warmup_conflicts_when_already_running(app_client: TestClient):
+    """A not-yet-done task recorded for this profile is enough to conflict —
+    no need to race a real warmup run to exercise this check."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupConflict"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+    fake_in_flight_task = MagicMock()
+    fake_in_flight_task.done.return_value = False
+    main._warmup_tasks[pid] = fake_in_flight_task
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+        assert resp.status_code == 409
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_cookie_warmup_status_unknown_profile_is_404(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/cookie-warmup/status")
+    assert resp.status_code == 404
+
+
+def test_cookie_warmup_status_defaults_to_idle_before_ever_starting(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "WarmupIdle"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/cookie-warmup/status")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "idle"
+
+
+def test_cookie_warmup_status_reports_a_completed_run(app_client: TestClient):
+    """The task scheduled by /start is fire-and-forget, so this polls briefly
+    for it to actually run rather than assuming it beat the next request —
+    real work here is a MagicMock context and no real awaits, so it settles
+    within one or two event-loop turns in practice."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupDone"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+
+    async def _finish_immediately(context, status, is_still_running):
+        status.state = "running"
+        status.sites_visited = len(cookie_warmup.WARMUP_SITES)
+        status.state = "done"
+
+    try:
+        with patch.object(main.cookie_warmup, "run", new=AsyncMock(side_effect=_finish_immediately)):
+            app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+            body = {}
+            for _ in range(20):
+                body = app_client.get(f"/api/profiles/{pid}/cookie-warmup/status").json()
+                if body["state"] == "done":
+                    break
+                time.sleep(0.01)
+        assert body["state"] == "done"
+        assert body["sites_visited"] == len(cookie_warmup.WARMUP_SITES)
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_stop_cookie_warmup_with_none_running_is_404(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "WarmupStopNone"})
+    pid = create.json()["id"]
+    resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/stop")
+    assert resp.status_code == 404
+
+
+async def _never_finishes(context, status, is_still_running):
+    await asyncio.Event().wait()  # only ends via cancellation
+
+
+def test_stop_cookie_warmup_cancels_the_in_flight_task(app_client: TestClient):
+    """/stop awaits the cancelled task as part of its own request handling,
+    so the task is guaranteed done by the time this response comes back —
+    no polling needed, unlike the "did it finish on its own" test above."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupStop"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+    try:
+        with patch.object(main.cookie_warmup, "run", new=AsyncMock(side_effect=_never_finishes)):
+            app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+            resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/stop")
+        assert resp.status_code == 200
+        assert main._warmup_tasks[pid].done()
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)

@@ -216,3 +216,17 @@ class ResourceUsageResponse(BaseModel):
     cpu_percent: float | None = None
     memory_mb: float | None = None
     process_count: int = 0
+
+
+class CookieWarmupStatusResponse(BaseModel):
+    state: Literal["idle", "running", "done", "error", "cancelled"] = "idle"
+    sites_total: int = 0
+    sites_visited: int = 0
+    current_site: str | None = None
+    # Wall-clock seconds since /start was called and (while running) roughly
+    # how much of the fixed WARMUP_DURATION_SECONDS budget is left — computed
+    # from cookie_warmup.WarmupStatus's monotonic timestamps at response time
+    # rather than stored on it, so the module itself stays clock-free.
+    elapsed_seconds: float | None = None
+    remaining_seconds: float | None = None
+    error: str | None = None

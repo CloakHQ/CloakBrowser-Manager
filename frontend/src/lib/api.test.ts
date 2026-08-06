@@ -97,6 +97,9 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   listDownloads: ["p1"],
   deleteDownload: ["p1", "/file.txt"],
   viewerAttached: ["p1"],
+  startCookieWarmup: ["p1"],
+  cookieWarmupStatus: ["p1"],
+  stopCookieWarmup: ["p1"],
 };
 
 describe("request bounding", () => {
