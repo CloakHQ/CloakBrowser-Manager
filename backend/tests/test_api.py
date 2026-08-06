@@ -262,6 +262,74 @@ def test_resolve_download_path_rejects_empty_string(tmp_path):
     assert main._resolve_download_path(downloads_dir, "") is None
 
 
+# ── Bulk download as zip ─────────────────────────────────────────────────────
+
+
+def test_downloads_zip_404_for_unknown_profile(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/downloads-zip")
+    assert resp.status_code == 404
+
+
+def test_downloads_zip_404_when_nothing_to_zip(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "EmptyZip"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+    assert resp.status_code == 404
+
+
+def test_downloads_zip_contains_every_file_with_real_content(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ZipMe"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "a.txt").write_bytes(b"first file")
+    (downloads_dir / "b.pdf").write_bytes(b"second file, different bytes")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    assert "ZipMe-downloads.zip" in resp.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert sorted(zf.namelist()) == ["a.txt", "b.pdf"]
+        assert zf.read("a.txt") == b"first file"
+        assert zf.read("b.pdf") == b"second file, different bytes"
+
+
+def test_downloads_zip_sanitizes_the_profile_name_for_the_filename_header(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "weird / name? *.txt"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "f.txt").write_bytes(b"x")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+
+    assert resp.status_code == 200
+    disposition = resp.headers["content-disposition"]
+    assert "/" not in disposition.split("filename=")[1]
+    assert "?" not in disposition.split("filename=")[1]
+
+
+def test_downloads_zip_skips_subdirectories(app_client: TestClient):
+    """The Downloads dir is documented as always flat, but a stray subfolder
+    (dropped there some other way) must not crash the zip, just be excluded —
+    zipfile.write() on a directory produces an empty entry, not real content,
+    which isn't what "download all as zip" should silently include."""
+    create = app_client.post("/api/profiles", json={"name": "ZipSkipsDirs"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "real.txt").write_bytes(b"real content")
+    (downloads_dir / "a-subdir").mkdir()
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+
+    assert resp.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert zf.namelist() == ["real.txt"]
+
+
 # ── Per-profile resource usage ───────────────────────────────────────────────
 
 

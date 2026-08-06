@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hmac
+import io
 import json
 import logging
 import os
 import re
 import shutil
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -31,7 +33,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -564,6 +566,38 @@ async def delete_profile_download(profile_id: str, file_path: str):
         raise HTTPException(status_code=404, detail="File not found")
     resolved.unlink()
     return {"ok": True}
+
+
+# Hyphenated, not nested under /downloads/ — {file_path:path} above is a
+# catch-all for that prefix, and a literal "zip" segment would otherwise be
+# indistinguishable from a request for a file actually named "zip".
+@app.get("/api/profiles/{profile_id}/downloads-zip")
+async def download_profile_files_as_zip(profile_id: str):
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    downloads_dir = Path(profile["user_data_dir"]) / "Downloads"
+    files = [p for p in downloads_dir.iterdir() if p.is_file()] if downloads_dir.is_dir() else []
+    if not files:
+        raise HTTPException(status_code=404, detail="No downloads to zip")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in files:
+            try:
+                zf.write(path, arcname=path.name)
+            except OSError as exc:
+                # Same tolerance as the plain listing: a file mid-write or
+                # removed mid-zip should shrink the archive, not fail it.
+                logger.debug("Skipping %s in downloads zip: %s", path, exc)
+    buffer.seek(0)
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", profile["name"]).strip("_") or profile_id
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}-downloads.zip"'},
+    )
 
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)

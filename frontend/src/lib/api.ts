@@ -378,4 +378,10 @@ export function downloadFileUrl(id: string, path: string): string {
   return `/api/profiles/${id}/downloads${path}`;
 }
 
+// Same reasoning as downloadFileUrl above: a URL for window.open(), not a
+// JSON fetch, so it's a standalone function rather than an `api` member.
+export function downloadsZipUrl(id: string): string {
+  return `/api/profiles/${id}/downloads-zip`;
+}
+
 export { ApiError };

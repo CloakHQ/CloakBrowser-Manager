@@ -1,7 +1,8 @@
+import { Archive } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { FileManager, type File as ManagerFile } from "@cubone/react-file-manager";
 import "@cubone/react-file-manager/dist/style.css";
-import { api, downloadFileUrl } from "../lib/api";
+import { api, downloadFileUrl, downloadsZipUrl } from "../lib/api";
 
 interface DownloadsBrowserProps {
   profileId: string;
@@ -61,17 +62,33 @@ export function DownloadsBrowser({ profileId }: DownloadsBrowserProps) {
     }
   };
 
+  const hasFiles = files.some((f) => !f.isDirectory);
+
   return (
-    <FileManager
-      files={files}
-      isLoading={loading}
-      layout="list"
-      height={360}
-      enableFilePreview={false}
-      permissions={PERMISSIONS}
-      onDownload={handleDownload}
-      onDelete={handleDelete}
-      onRefresh={refresh}
-    />
+    <div className="space-y-2">
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={() => window.open(downloadsZipUrl(profileId), "_blank")}
+          disabled={!hasFiles}
+          className="btn-secondary text-xs flex items-center gap-1.5"
+          title="Download every file in this profile's Downloads folder as one .zip"
+        >
+          <Archive className="h-3.5 w-3.5" />
+          Download All as ZIP
+        </button>
+      </div>
+      <FileManager
+        files={files}
+        isLoading={loading}
+        layout="list"
+        height={360}
+        enableFilePreview={false}
+        permissions={PERMISSIONS}
+        onDownload={handleDownload}
+        onDelete={handleDelete}
+        onRefresh={refresh}
+      />
+    </div>
   );
 }
