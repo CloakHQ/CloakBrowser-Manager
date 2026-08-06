@@ -98,6 +98,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
         color_scheme: profile.color_scheme,
+        license_key: profile.license_key,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
@@ -270,6 +271,22 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                   </svg>
                 </button>
               </div>
+            </div>
+            <div className="col-span-2">
+              <label className="label">CloakBrowser License Key</label>
+              <input
+                className="input"
+                type="password"
+                autoComplete="off"
+                value={form.license_key ?? ""}
+                onChange={(e) => set("license_key", e.target.value || null)}
+                placeholder="Leave blank to use the container's default"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Overrides the container's CLOAKBROWSER_LICENSE_KEY for this profile only. Blank
+                inherits the container's default (free tier if it has none either) — it does not
+                force free tier when the container has a key set.
+              </p>
             </div>
           </div>
         </section>

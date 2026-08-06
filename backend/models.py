@@ -39,6 +39,11 @@ class ProfileCreate(BaseModel):
     clipboard_sync: bool = True
     auto_launch: bool = False
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
+    # Per-profile CloakBrowser license key override. Empty/unset defers to
+    # whatever CLOAKBROWSER_LICENSE_KEY the container has (or free tier if
+    # the container has none either) — it does NOT force free tier when a
+    # container-wide key is set. See binary_status.py / browser_manager.py.
+    license_key: str | None = None
     launch_args: list[str] = Field(default_factory=list)
     notes: str | None = None
     tags: list[TagCreate] | None = None
@@ -64,6 +69,7 @@ class ProfileUpdate(BaseModel):
     clipboard_sync: bool | None = None
     auto_launch: bool | None = None
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
+    license_key: str | None = Field(default=None)
     launch_args: list[str] | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
@@ -106,6 +112,7 @@ class ProfileResponse(BaseModel):
         return v if v is not None else True
 
     color_scheme: str | None = None
+    license_key: str | None = None
     launch_args: list[str] = []
     notes: str | None = None
     user_data_dir: str

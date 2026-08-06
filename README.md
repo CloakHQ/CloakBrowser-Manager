@@ -57,7 +57,7 @@ Each CloakBrowser profile generates a completely different device identity. To t
 ## Features
 
 - **Profile management** — create, edit, delete browser profiles with unique fingerprints
-- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform
+- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform, CloakBrowser license key override
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
 - **In-browser viewing** — interact with launched browsers via KasmVNC's native web client, directly in the web GUI (server-authoritative JPEG/WebP by default, opt-in H.264/H.265/AV1 WebCodecs streaming)

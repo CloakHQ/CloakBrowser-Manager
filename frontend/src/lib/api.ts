@@ -53,6 +53,10 @@ export interface Profile {
   clipboard_sync: boolean;
   auto_launch: boolean;
   color_scheme: string | null;
+  /** Per-profile CloakBrowser license key override. Blank inherits whatever
+   *  the container's CLOAKBROWSER_LICENSE_KEY is (or free tier if it has
+   *  none either) — it does not force free tier over a container-wide key. */
+  license_key: string | null;
   launch_args: string[];
   notes: string | null;
   user_data_dir: string;
@@ -84,6 +88,7 @@ export interface ProfileCreateData {
   clipboard_sync?: boolean;
   auto_launch?: boolean;
   color_scheme?: string | null;
+  license_key?: string | null;
   launch_args?: string[];
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];

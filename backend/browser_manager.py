@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -838,6 +839,17 @@ class BrowserManager:
         # root window. Skip the allocation entirely rather than starting a
         # server nothing will connect to.
         headless = bool(profile.get("headless", False))
+        # Per-profile override. cloakbrowser resolves a license key as
+        # explicit param > CLOAKBROWSER_LICENSE_KEY env > cached key file, so
+        # a set override cleanly beats the container-wide env var — but an
+        # UNSET one (None) falls through to that env var same as before, it
+        # does NOT force free tier. Forcing free despite a container-wide key
+        # would mean blanking a process-wide env var for the duration of
+        # ensure_binary()/launch (which can include a first-time download),
+        # serializing every concurrent launch that needs a different key
+        # against it — not a trade worth making for what's otherwise a rare
+        # case. Leave the field blank to inherit the container's default.
+        profile_license_key = profile.get("license_key") or None
         try:
             # ensure_binary() is a blocking, synchronous call (network I/O),
             # and launch_persistent_context_async() below calls it again
@@ -853,7 +865,9 @@ class BrowserManager:
             # a failed download, which never reaches the "Binary ready" line
             # that would otherwise clear it, leaving the banner stuck on.
             try:
-                await asyncio.get_running_loop().run_in_executor(None, ensure_binary)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, functools.partial(ensure_binary, license_key=profile_license_key)
+                )
             finally:
                 binary_status.mark_idle()
 
@@ -918,6 +932,7 @@ class BrowserManager:
                 human_preset=profile.get("human_preset", "default"),
                 geoip=bool(profile.get("geoip", False)),
                 color_scheme=profile.get("color_scheme") or None,
+                license_key=profile_license_key,
                 user_agent=profile.get("user_agent") or None,
                 viewport={
                     "width": profile.get("screen_width", 1920),
