@@ -1,18 +1,24 @@
 name: Test and publish Docker image
 
-# `publish` builds each image "variant" in the matrix below and pushes it to
-# GHCR on every push to every branch (test-only on pull_request), then cuts a
-# GitHub Release pinned to that commit + variant.
+# `publish` builds the CPU/software-render image (./Dockerfile, multi-arch:
+# amd64+arm64 via QEMU — cheap to emulate, so it stays multi-arch) and pushes
+# it to GHCR as ghcr.io/<owner>/cloakbrowser-manager. `publish-gpu` then
+# builds Dockerfile.igpu and Dockerfile.nvidia FROM that just-pushed image
+# (both are `FROM base` — see either Dockerfile's own top comment — so it
+# would be wasteful, not "reusable", to rebuild the CPU image's layers a
+# second and third time just to get a build-context name for them). Neither
+# GPU Dockerfile installs a real GPU driver — the NVIDIA one only installs
+# generic Vulkan/GLVND loaders (the driver itself is injected by the NVIDIA
+# Container Toolkit at `docker run` time) and the iGPU one only installs
+# Mesa/VA-API userspace packages — so building either needs no GPU hardware,
+# only validating acceleration at runtime does. Both build amd64-only: no
+# GPU vendor ships an arm64 desktop iGPU or an arm64 NVIDIA consumer/
+# datacenter card this repo targets, so there's no QEMU cost worth paying
+# there the way there is for the CPU image.
 #
-# Only one variant exists today: `cpu` (the software-rendering base image,
-# ./Dockerfile — no Intel/AMD/NVIDIA GPU). Add docker-compose.igpu.yml's or
-# docker-compose.nvidia.yml's Dockerfile later by adding one entry to the
-# matrix; nothing else needs to change. image_suffix is "" for this one
-# deliberately, so the already-published ghcr.io/.../cloakbrowser-manager
-# image and its :latest/:sha-* tags don't get renamed out from under existing
-# pulls — a later variant sets its own suffix (e.g. "-igpu") instead.
+# Every variant gets its own GitHub Release, tagged sha-<shortsha>-<variant>.
 #
-# `publish` (not `test`) is gated to this fork specifically, so a downstream
+# Both publish jobs are gated to this fork specifically, so a downstream
 # fork's own Actions runs don't push images/releases under an assumption that
 # only applies here.
 
@@ -98,6 +104,81 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Compute short SHA
+        id: shortsha
+        run: echo "sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sha-${{ steps.shortsha.outputs.sha }}-${{ matrix.name }}
+          name: ${{ matrix.name }} @ ${{ steps.shortsha.outputs.sha }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            **Image:** `ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}:sha-${{ github.sha }}`
+            **Branch:** `${{ github.ref_name }}`
+
+            ```
+            docker pull ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}:sha-${{ github.sha }}
+            ```
+
+  # Runs after `publish` (not in parallel with it): both Dockerfiles here are
+  # `FROM base`, and `base` is this job's name for the CPU image `publish`
+  # just pushed — build-contexts below points it at that image by digest-
+  # stable sha tag rather than rebuilding the base layers again per variant.
+  # igpu and nvidia themselves DO build in parallel with each other (two
+  # matrix entries, no ordering between them).
+  publish-gpu:
+    needs: publish
+    if: github.event_name != 'pull_request' && github.repository == 'cjangrist/CloakBrowser-Manager'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: igpu
+            dockerfile: Dockerfile.igpu
+            image_suffix: "-igpu"
+          - name: nvidia
+            dockerfile: Dockerfile.nvidia
+            image_suffix: "-nvidia"
+    concurrency:
+      group: docker-publish-${{ github.ref }}-${{ matrix.name }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-contexts: |
+            base=docker-image://ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager:sha-${{ github.sha }}
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
