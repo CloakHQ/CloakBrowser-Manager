@@ -436,7 +436,7 @@ _DUPLICATE_FIELDS = (
     "proxy", "timezone", "locale", "platform", "user_agent",
     "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
     "hardware_concurrency", "humanize", "human_preset", "headless",
-    "geoip", "clipboard_sync", "auto_launch", "color_scheme",
+    "geoip", "clipboard_sync", "auto_launch", "auto_restart", "color_scheme",
     "license_key", "enabled_extensions", "idle_timeout_seconds",
     "launch_args", "notes",
 )

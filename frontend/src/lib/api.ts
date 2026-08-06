@@ -52,6 +52,11 @@ export interface Profile {
   geoip: boolean;
   clipboard_sync: boolean;
   auto_launch: boolean;
+  /** Relaunch this profile automatically if its Chromium dies unexpectedly
+   *  (crash, OOM kill) — never for a deliberate Stop or an idle-timeout
+   *  auto-stop. Bounded server-side so a profile that crashes on launch
+   *  itself cannot retry forever. */
+  auto_restart: boolean;
   color_scheme: string | null;
   /** Per-profile CloakBrowser license key override. Blank inherits whatever
    *  the container's CLOAKBROWSER_LICENSE_KEY is (or free tier if it has
@@ -94,6 +99,7 @@ export interface ProfileCreateData {
   geoip?: boolean;
   clipboard_sync?: boolean;
   auto_launch?: boolean;
+  auto_restart?: boolean;
   color_scheme?: string | null;
   license_key?: string | null;
   enabled_extensions?: string[] | null;

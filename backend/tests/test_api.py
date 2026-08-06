@@ -91,6 +91,26 @@ def test_create_profile_invalid_platform(app_client: TestClient):
     assert resp.status_code == 422
 
 
+def test_create_profile_defaults_auto_restart_to_false(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={"name": "DefaultAutoRestart"})
+    assert resp.json()["auto_restart"] is False
+
+
+def test_create_profile_with_auto_restart_enabled(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={"name": "WithAutoRestart", "auto_restart": True})
+    assert resp.json()["auto_restart"] is True
+
+
+def test_update_profile_toggles_auto_restart(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ToggleAutoRestart"})
+    pid = create.json()["id"]
+    assert create.json()["auto_restart"] is False
+
+    resp = app_client.put(f"/api/profiles/{pid}", json={"auto_restart": True})
+    assert resp.status_code == 200
+    assert resp.json()["auto_restart"] is True
+
+
 def test_get_profile(app_client: TestClient):
     create = app_client.post("/api/profiles", json={"name": "Get Me"})
     pid = create.json()["id"]
@@ -554,6 +574,16 @@ def test_duplicate_profile_copies_settings_with_a_new_id_and_name(app_client: Te
     assert dup["tags"] == [{"tag": "work", "color": "#ff0000"}]
     assert dup["user_data_dir"] != original["user_data_dir"]
     assert dup["status"] == "stopped"
+
+
+def test_duplicate_profile_copies_auto_restart(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "AutoRestartSrc", "auto_restart": True})
+    original = create.json()
+
+    resp = app_client.post(f"/api/profiles/{original['id']}/duplicate")
+
+    assert resp.status_code == 201
+    assert resp.json()["auto_restart"] is True
 
 
 def test_duplicate_profile_gets_a_fresh_fingerprint_seed(app_client: TestClient):

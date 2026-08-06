@@ -38,6 +38,14 @@ class ProfileCreate(BaseModel):
     geoip: bool = False
     clipboard_sync: bool = True
     auto_launch: bool = False
+    # Relaunch this profile automatically if its Chromium dies unexpectedly
+    # (crash, OOM kill) — never for a launch the user or the idle-timeout
+    # reaper stopped on purpose. See browser_manager.py's _on_browser_closed
+    # for how those two are told apart, and reap_dead_browsers for how a
+    # driver-killed crash with no "close" event is caught at all. Bounded by
+    # AUTO_RESTART_MAX_ATTEMPTS within AUTO_RESTART_WINDOW_S so a profile
+    # that crashes on launch cannot loop forever.
+    auto_restart: bool = False
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
     # Per-profile CloakBrowser license key override. Empty/unset defers to
     # whatever CLOAKBROWSER_LICENSE_KEY the container has (or free tier if
@@ -81,6 +89,7 @@ class ProfileUpdate(BaseModel):
     geoip: bool | None = None
     clipboard_sync: bool | None = None
     auto_launch: bool | None = None
+    auto_restart: bool | None = None
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
     license_key: str | None = Field(default=None)
     enabled_extensions: list[str] | None = None
@@ -120,6 +129,7 @@ class ProfileResponse(BaseModel):
     geoip: bool = False
     clipboard_sync: bool = True
     auto_launch: bool = False
+    auto_restart: bool = False
 
     @field_validator("clipboard_sync", mode="before")
     @classmethod

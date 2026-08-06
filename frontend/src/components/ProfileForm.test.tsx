@@ -26,7 +26,7 @@ describe("ProfileForm headless control", () => {
       locale: null, platform: "windows", user_agent: null, screen_width: 1920,
       screen_height: 1080, gpu_vendor: null, gpu_renderer: null,
       hardware_concurrency: null, humanize: false, human_preset: "default",
-      headless: true, geoip: false, clipboard_sync: true, auto_launch: false,
+      headless: true, geoip: false, clipboard_sync: true, auto_launch: false, auto_restart: false,
       color_scheme: null, launch_args: [], notes: null,
       user_data_dir: "/data/profiles/p1", created_at: "", updated_at: "",
       tags: [], status: "stopped" as const, vnc_ws_port: null, cdp_url: null,
@@ -42,13 +42,39 @@ function makeProfile(overrides: Record<string, unknown> = {}) {
     locale: null, platform: "windows", user_agent: null, screen_width: 1920,
     screen_height: 1080, gpu_vendor: null, gpu_renderer: null,
     hardware_concurrency: null, humanize: false, human_preset: "default",
-    headless: true, geoip: false, clipboard_sync: true, auto_launch: false,
+    headless: true, geoip: false, clipboard_sync: true, auto_launch: false, auto_restart: false,
     color_scheme: null, launch_args: [], notes: null,
     user_data_dir: "/data/profiles/p1", created_at: "", updated_at: "",
     tags: [], status: "stopped" as const, vnc_ws_port: null, cdp_url: null,
     ...overrides,
   };
 }
+
+describe("ProfileForm auto-restart control", () => {
+  it("renders unchecked by default and submits its value", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<ProfileForm profile={null} onSave={onSave} onCancel={() => {}} />);
+
+    const box = screen.getByRole("checkbox", { name: /restart automatically if it crashes/i });
+    expect(box).toBeInTheDocument();
+    expect(box).not.toBeChecked();
+
+    await act(async () => box.click());
+    expect(box).toBeChecked();
+  });
+
+  it("reflects an existing profile's auto_restart value when editing", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ProfileForm
+        profile={makeProfile({ auto_restart: true })}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    );
+    expect(screen.getByRole("checkbox", { name: /restart automatically if it crashes/i })).toBeChecked();
+  });
+});
 
 describe("ProfileForm duplicate control", () => {
   it("does not render Duplicate without an onDuplicate handler", () => {

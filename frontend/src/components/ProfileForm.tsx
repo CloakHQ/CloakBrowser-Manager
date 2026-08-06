@@ -84,6 +84,7 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
     geoip: false,
     clipboard_sync: true,
     auto_launch: false,
+    auto_restart: false,
     launch_args: [],
     tags: [],
   });
@@ -122,6 +123,7 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
         geoip: profile.geoip,
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
+        auto_restart: profile.auto_restart,
         color_scheme: profile.color_scheme,
         license_key: profile.license_key,
         idle_timeout_seconds: profile.idle_timeout_seconds,
@@ -610,6 +612,21 @@ export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }
                 className="rounded border-border bg-surface-2"
               />
               Launch automatically when container starts
+            </label>
+            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.auto_restart ?? false}
+                onChange={(e) => set("auto_restart", e.target.checked)}
+                className="rounded border-border bg-surface-2"
+              />
+              <span>
+                Restart automatically if it crashes
+                <span className="block text-xs text-gray-500">
+                  Only for an unexpected close (a crash or OOM kill) — never for a deliberate
+                  Stop or an idle-timeout auto-stop. Gives up after a few crashes in a row.
+                </span>
+              </span>
             </label>
             <div>
               <label className="label">Idle Timeout (minutes)</label>

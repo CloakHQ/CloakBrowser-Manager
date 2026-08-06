@@ -51,6 +51,7 @@ def init_db():
                 geoip BOOLEAN DEFAULT 0,
                 clipboard_sync BOOLEAN DEFAULT 1,
                 auto_launch BOOLEAN DEFAULT 0,
+                auto_restart BOOLEAN DEFAULT 0,
                 color_scheme TEXT,
                 license_key TEXT,
                 enabled_extensions TEXT DEFAULT '[]',
@@ -90,6 +91,9 @@ def init_db():
         if "idle_timeout_seconds" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN idle_timeout_seconds INTEGER")
             conn.commit()
+        if "auto_restart" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN auto_restart BOOLEAN DEFAULT 0")
+            conn.commit()
 
 
 def _now() -> str:
@@ -113,10 +117,10 @@ def create_profile(
                 id, name, fingerprint_seed, proxy, timezone, locale, platform,
                 user_agent, screen_width, screen_height, gpu_vendor, gpu_renderer,
                 hardware_concurrency, humanize, human_preset, headless, geoip,
-                clipboard_sync, auto_launch, color_scheme, license_key,
+                clipboard_sync, auto_launch, auto_restart, color_scheme, license_key,
                 enabled_extensions, idle_timeout_seconds, launch_args, notes,
                 user_data_dir, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id, name, seed,
                 fields.get("proxy"),
@@ -135,6 +139,7 @@ def create_profile(
                 fields.get("geoip", False),
                 fields.get("clipboard_sync", True),
                 fields.get("auto_launch", False),
+                fields.get("auto_restart", False),
                 fields.get("color_scheme"),
                 fields.get("license_key"),
                 json.dumps(fields.get("enabled_extensions") or []),
@@ -207,7 +212,7 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
         "user_agent", "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "humanize", "human_preset", "headless", "geoip",
-        "clipboard_sync", "auto_launch", "color_scheme", "license_key",
+        "clipboard_sync", "auto_launch", "auto_restart", "color_scheme", "license_key",
         "enabled_extensions", "idle_timeout_seconds", "launch_args", "notes",
     ):
         if col in fields:

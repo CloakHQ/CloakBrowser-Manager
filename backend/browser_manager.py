@@ -510,6 +510,19 @@ DEFAULT_IDLE_TIMEOUT_S = int(os.environ.get("PROFILE_IDLE_TIMEOUT_SECONDS", "360
 # stuck profile stall the whole idle sweep.
 KASM_VIEWER_PROBE_TIMEOUT_S = 2.0
 
+# Crash-loop guard for auto_restart=True profiles: at most this many
+# automatic relaunches within the trailing window, per profile. A profile
+# that crashes on launch itself (bad proxy, missing extension, whatever)
+# would otherwise retry as fast as launch()+crash can cycle, burning CPU and
+# CloakBrowser license claims forever. See _on_browser_closed's genuine-crash
+# branch and _auto_restart_after_crash.
+AUTO_RESTART_MAX_ATTEMPTS = 3
+AUTO_RESTART_WINDOW_S = 300.0
+# Deliberately not instant: gives a transient resource blip (proxy hiccup,
+# a GPU device momentarily busy from the crash itself) a moment to clear
+# before the retry, same spirit as any other backoff.
+AUTO_RESTART_DELAY_S = 3.0
+
 
 def _viewer_attached(bottleneck: Any) -> bool | None:
     """Whether a viewer WebSocket is attached, or None if we cannot tell.
@@ -882,6 +895,10 @@ class BrowserManager:
         # to a display (main.py's xclip relay) must be torn down here, or it
         # outlives its X server and leaks for the container's lifetime.
         self._display_released_hooks: list[Callable[[int], None]] = []
+        # monotonic timestamps of recent auto-restart attempts per profile id,
+        # for AUTO_RESTART_MAX_ATTEMPTS/AUTO_RESTART_WINDOW_S — see
+        # _consume_restart_budget.
+        self._crash_restart_history: dict[str, list[float]] = {}
 
     def add_display_released_hook(self, hook: Callable[[int], None]) -> None:
         self._display_released_hooks.append(hook)
@@ -1277,6 +1294,63 @@ class BrowserManager:
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
             await self._release_display(running.display)
+            # `running` was still in self.running when this close arrived —
+            # nobody called stop() first (that pops it BEFORE closing, see
+            # stop()'s own comment), so this is an unrequested closure: a
+            # crash, an OOM kill, the user closing Chromium some other way.
+            # Fire-and-forget: this handler must not block on a relaunch.
+            asyncio.ensure_future(self._maybe_auto_restart(profile_id))
+
+    def _consume_restart_budget(self, profile_id: str) -> bool:
+        """True and records an attempt if `profile_id` has budget left in the
+        trailing AUTO_RESTART_WINDOW_S; False (no side effect) otherwise."""
+        now = time.monotonic()
+        history = self._crash_restart_history.setdefault(profile_id, [])
+        history[:] = [t for t in history if now - t < AUTO_RESTART_WINDOW_S]
+        if len(history) >= AUTO_RESTART_MAX_ATTEMPTS:
+            return False
+        history.append(now)
+        return True
+
+    async def _maybe_auto_restart(self, profile_id: str) -> None:
+        """Relaunch `profile_id` after an unrequested closure, if it opted in
+        and still has restart budget. Never raises — this runs detached from
+        whatever noticed the crash (_on_browser_closed or reap_dead_browsers,
+        itself called from the maintenance loop), so an uncaught exception
+        here would either vanish into "Task exception was never retrieved" or,
+        in the maintenance loop's case, kill the loop that also runs the
+        teardown-claim sweep and the idle reaper.
+        """
+        from . import database as db
+
+        profile = db.get_profile(profile_id)
+        if profile is None or not profile.get("auto_restart"):
+            return
+        if not self._consume_restart_budget(profile_id):
+            logger.error(
+                "Profile %s crashed again but has used its %d auto-restarts "
+                "in the last %.0fs — giving up until it is launched manually",
+                profile_id, AUTO_RESTART_MAX_ATTEMPTS, AUTO_RESTART_WINDOW_S,
+            )
+            return
+
+        await asyncio.sleep(AUTO_RESTART_DELAY_S)
+        # Re-check after the delay: a manual launch (or another auto-restart
+        # racing this one, though _lock inside launch() itself prevents two
+        # actually starting) may have already made this moot.
+        if profile_id in self.running or profile_id in self._launching:
+            return
+        logger.warning(
+            "Auto-restarting profile %s (%s) after an unrequested close",
+            profile.get("name", "?"), profile_id,
+        )
+        try:
+            await asyncio.wait_for(self.launch(profile), timeout=LAUNCH_TIMEOUT_S)
+            logger.info("Auto-restart succeeded for profile %s", profile_id)
+        except ProfileAlreadyRunning:
+            pass  # relaunched by something else while we were waiting
+        except Exception as exc:
+            logger.error("Auto-restart failed for profile %s: %s", profile_id, exc)
 
     async def stop(self, profile_id: str) -> bool:
         """Stop a running browser instance.

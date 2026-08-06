@@ -70,6 +70,7 @@ function profile(status: ProfileLifecycle) {
     geoip: false,
     clipboard_sync: true,
     auto_launch: false,
+    auto_restart: false,
     color_scheme: null,
     launch_args: [],
     notes: null,
