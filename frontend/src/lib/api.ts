@@ -179,6 +179,20 @@ export interface ResourceUsage {
   process_count: number;
 }
 
+export interface SystemCheck {
+  gpu_mode: "swiftshader" | "nvidia" | "igpu";
+  binary_version: string;
+  /** Whether the CONTAINER has CLOAKBROWSER_LICENSE_KEY set — not whether it
+   *  is valid (only checked for real at launch) and not whether any single
+   *  profile has its own override, which this panel does not see. */
+  license_configured: boolean;
+  kasmvnc_version: string;
+  disk_total_bytes: number;
+  disk_used_bytes: number;
+  disk_free_bytes: number;
+  disk_percent_used: number;
+}
+
 export interface CookieWarmupStatus {
   state: "idle" | "running" | "done" | "error" | "cancelled";
   sites_total: number;
@@ -310,6 +324,8 @@ export const api = {
     ),
 
   getStatus: () => request<SystemStatus>("/api/status"),
+
+  systemCheck: () => request<SystemCheck>("/api/system-check"),
 
   listExtensions: () => request<Extension[]>("/api/extensions"),
 

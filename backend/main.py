@@ -71,10 +71,12 @@ from .models import (
     ProfileUpdate,
     ResourceUsageResponse,
     StatusResponse,
+    SystemCheckResponse,
     TagResponse,
     ViewerTokenResponse,
 )
 from .resources import get_resource_usage
+from .system_check import get_system_check
 from .viewer_tokens import VIEWER_TOKEN_TTL, viewer_tokens
 
 logger = logging.getLogger("cloakbrowser.manager")
@@ -1131,6 +1133,14 @@ async def get_system_status():
         binary_download_state=binary["state"],
         default_idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_S,
     )
+
+
+@app.get("/api/system-check", response_model=SystemCheckResponse)
+async def system_check():
+    """Container-level diagnostics snapshot for the UI's self-check panel —
+    see system_check.py for exactly what each field means and does not mean.
+    """
+    return SystemCheckResponse(**get_system_check(db.DATA_DIR))
 
 
 # ── Extensions ────────────────────────────────────────────────────────────────

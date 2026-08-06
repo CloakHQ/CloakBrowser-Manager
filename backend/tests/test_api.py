@@ -1198,6 +1198,31 @@ def test_system_status(app_client: TestClient):
     assert data["profiles_total"] >= 1
 
 
+def test_system_check(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
+    monkeypatch.delenv("CLOAKBROWSER_LICENSE_KEY", raising=False)
+
+    resp = app_client.get("/api/system-check")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["gpu_mode"] == "swiftshader"
+    assert data["binary_version"] == "0.0.0-test"
+    assert data["license_configured"] is False
+    assert data["kasmvnc_version"] == "1.5.0"
+    assert data["disk_total_bytes"] > 0
+    assert 0.0 <= data["disk_percent_used"] <= 100.0
+
+
+def test_system_check_reflects_a_configured_license(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
+    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", "a-real-key")
+
+    resp = app_client.get("/api/system-check")
+
+    assert resp.json()["license_configured"] is True
+
+
 # ── Launch Args ─────────────────────────────────────────────────────────────
 
 

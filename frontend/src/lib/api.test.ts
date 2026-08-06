@@ -85,6 +85,7 @@ const CALL_ARGS: Record<keyof typeof api, unknown[]> = {
   launchProfile: ["p1"],
   stopProfile: ["p1"],
   getStatus: [],
+  systemCheck: [],
   listExtensions: [],
   rescanExtensions: [],
   uploadExtension: [new File(["dummy"], "test.zip")],

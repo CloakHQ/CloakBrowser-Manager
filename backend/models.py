@@ -228,6 +228,17 @@ class ResourceUsageResponse(BaseModel):
     process_count: int = 0
 
 
+class SystemCheckResponse(BaseModel):
+    gpu_mode: Literal["swiftshader", "nvidia", "igpu"]
+    binary_version: str
+    license_configured: bool
+    kasmvnc_version: str
+    disk_total_bytes: int
+    disk_used_bytes: int
+    disk_free_bytes: int
+    disk_percent_used: float
+
+
 class CookieWarmupStatusResponse(BaseModel):
     state: Literal["idle", "running", "done", "error", "cancelled"] = "idle"
     sites_total: int = 0

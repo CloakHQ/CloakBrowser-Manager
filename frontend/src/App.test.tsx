@@ -31,6 +31,12 @@ vi.mock("./lib/api", () => {
         binary_downloading: false, binary_download_percent: null,
         binary_download_state: null, default_idle_timeout_seconds: 3600,
       }),
+      systemCheck: vi.fn().mockResolvedValue({
+        gpu_mode: "swiftshader", binary_version: "0.0.0-test",
+        license_configured: false, kasmvnc_version: "1.5.0",
+        disk_total_bytes: 1, disk_used_bytes: 0, disk_free_bytes: 1,
+        disk_percent_used: 0,
+      }),
       // The top bar's compact CookieWarmupPanel fetches this on mount for
       // any running profile — see "cookie warmup control in the top bar"
       // below.
@@ -190,6 +196,31 @@ describe("cookie warmup control in the top bar", () => {
     });
     await flush();
     expect(screen.queryByRole("button", { name: /warm up cookies/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("Container self-check panel", () => {
+  it("is available in the top bar with no profile selected", async () => {
+    render(<App />);
+    await flush();
+    expect(screen.getByRole("button", { name: /container self-check/i })).toBeInTheDocument();
+  });
+
+  it("fetches and shows the check when opened", async () => {
+    mockApi.systemCheck.mockResolvedValue({
+      gpu_mode: "igpu", binary_version: "150.0.0", license_configured: true,
+      kasmvnc_version: "1.5.0", disk_total_bytes: 100, disk_used_bytes: 10,
+      disk_free_bytes: 90, disk_percent_used: 10,
+    });
+    render(<App />);
+    await flush();
+
+    await act(async () => {
+      screen.getByRole("button", { name: /container self-check/i }).click();
+    });
+    await flush();
+
+    expect(screen.getByText("150.0.0")).toBeInTheDocument();
   });
 });
 
