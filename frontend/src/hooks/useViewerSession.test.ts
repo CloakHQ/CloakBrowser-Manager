@@ -1723,6 +1723,270 @@ describe("client self-reconnect grace", () => {
   });
 });
 
+// ── suspend & resume detection ──────────────────────────────────────────────
+//
+// PC sleep, a frozen background tab, or a mobile OS suspending the browser
+// process are not guaranteed to fire "offline"/"online" or even
+// visibilitychange on every platform. These simulate a real suspend by
+// jumping the faked wall clock forward with vi.setSystemTime and then
+// letting the suspend detector's own next-scheduled tick fire (a normal
+// vi.advanceTimersByTime for its own 2s period) — the same shape a real
+// resume takes: the timer's OWN schedule is untouched, but Date.now() inside
+// it reveals how much real time actually passed.
+
+describe("suspend & resume detection", () => {
+  function jumpClockAndTick(gapMs: number) {
+    vi.setSystemTime(new Date(Date.now() + gapMs));
+  }
+
+  it("re-verifies immediately when reconnecting through a detected suspend", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    expect(result.current.state).toBe("reconnecting");
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    jumpClockAndTick(20 * 60_000); // 20 minutes "asleep"
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    // The suspend detector re-verifies without waiting for the scheduled
+    // backoff retry, which (post-jump) is already long past due anyway.
+    expect(mockApi.profileStatus.mock.calls.length).toBeGreaterThan(probesBefore);
+  });
+
+  it("re-verifies a connected session through a detected suspend", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    jumpClockAndTick(30 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBeGreaterThan(probesBefore);
+    expect(result.current.state).toBe("connected");
+
+    // and it still notices a session that actually died during the gap
+    mockApi.profileStatus.mockResolvedValue({
+      status: "stopped", xvnc_alive: null, browser_alive: null,
+    });
+    jumpClockAndTick(30 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(result.current.state).toBe("session-ended");
+  });
+
+  it("restarts an old-enough connect through a detected suspend", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    expect(result.current.state).toBe("connecting");
+    const tokensBefore = mockApi.createViewerToken.mock.calls.length;
+
+    // age the connect well past CONNECT_RESTART_MIN_AGE_MS first
+    await advance(5_000);
+    mockApi.createViewerToken.mockResolvedValueOnce(TOK2);
+    jumpClockAndTick(15 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(mockApi.createViewerToken.mock.calls.length).toBeGreaterThan(tokensBefore);
+    expect(result.current.iframeSrc).toContain("tok-2");
+  });
+
+  it("does not restart a just-started connect, but re-arms its watchdog", async () => {
+    // A resume signal that can legitimately fire with zero elapsed time (a
+    // suspend-detected gap cannot: SUSPEND_GAP_THRESHOLD_MS is itself larger
+    // than CONNECT_RESTART_MIN_AGE_MS, so by the time a gap is big enough to
+    // detect, the connect is already old enough to restart outright).
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    expect(result.current.state).toBe("connecting");
+    const tokensBefore = mockApi.createViewerToken.mock.calls.length;
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(mockApi.createViewerToken.mock.calls.length).toBe(tokensBefore);
+    expect(result.current.state).toBe("connecting");
+
+    // but the watchdog was re-armed with a fresh 15s window from here
+    await advance(15_000);
+    expect(result.current.state).toBe("reconnecting");
+  });
+
+  it("an ordinary tick (no real gap) does not trigger a resync", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    await advance(2_000 * 3); // normal, no clock jump
+    expect(mockApi.profileStatus.mock.calls.length).toBe(probesBefore);
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("a halted session is not resurrected by a detected suspend", async () => {
+    mockApi.createViewerToken.mockRejectedValue(new ApiError(401, "Unauthorized"));
+    const { result } = setup();
+    await flush();
+    expect(result.current.state).toBe("fatal");
+    const tokensBefore = mockApi.createViewerToken.mock.calls.length;
+
+    jumpClockAndTick(20 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(mockApi.createViewerToken.mock.calls.length).toBe(tokensBefore);
+    expect(result.current.state).toBe("fatal");
+  });
+
+  it("a terminal session-ended state is not resurrected by a detected suspend", async () => {
+    mockApi.profileStatus.mockResolvedValue(STOPPED);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    await advance(250);
+    expect(result.current.state).toBe("session-ended");
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+
+    jumpClockAndTick(20 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBe(probesBefore);
+    expect(result.current.state).toBe("session-ended");
+  });
+
+  it("stops ticking once destroyed", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { unmount } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    unmount();
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    jumpClockAndTick(20 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000 * 2);
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBe(probesBefore);
+  });
+
+  it("a bfcache restore (pageshow persisted) re-verifies a connected session", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    const event = new Event("pageshow") as unknown as PageTransitionEvent;
+    Object.defineProperty(event, "persisted", { value: true, configurable: true });
+    await act(async () => {
+      window.dispatchEvent(event);
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBeGreaterThan(probesBefore);
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("an ordinary pageshow (not persisted) does nothing", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    const event = new Event("pageshow") as unknown as PageTransitionEvent;
+    Object.defineProperty(event, "persisted", { value: false, configurable: true });
+    await act(async () => {
+      window.dispatchEvent(event);
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBe(probesBefore);
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("the Page Lifecycle resume event re-verifies a connected session", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    document.dispatchEvent(new Event("freeze"));
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    await act(async () => {
+      document.dispatchEvent(new Event("resume"));
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBeGreaterThan(probesBefore);
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("window focus re-verifies a connected session", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+
+    const probesBefore = mockApi.profileStatus.mock.calls.length;
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(mockApi.profileStatus.mock.calls.length).toBeGreaterThan(probesBefore);
+    expect(result.current.state).toBe("connected");
+  });
+
+  it("a burst of focus events while reconnecting does not bypass backoff or burn the alive-reconnect budget", async () => {
+    // Without a rate limit here, "focus" (which fires on every alt-tab) ran a
+    // full probe-then-reconnect cycle on EVERY event, bypassing the backoff
+    // schedule entirely and minting a fresh token each time — an impatient
+    // user alt-tabbing a handful of times against an otherwise-healthy
+    // backend could burn through the whole MAX_ALIVE_RECONNECTS budget in
+    // seconds and see "Can't reach this browser session" for a session that
+    // would have recovered on its own.
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    expect(result.current.state).toBe("reconnecting");
+
+    const tokensBefore = mockApi.createViewerToken.mock.calls.length;
+    for (let i = 0; i < 20; i++) {
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+      });
+    }
+    // At most one focus-triggered reconnect cycle got through the rate gate.
+    expect(mockApi.createViewerToken.mock.calls.length).toBeLessThanOrEqual(tokensBefore + 1);
+    expect(result.current.state).not.toBe("session-ended");
+  });
+
+  it("window focus attempts an immediate reconnect while reconnecting", async () => {
+    mockApi.profileStatus.mockResolvedValue(ALIVE);
+    const { result } = setup();
+    await flush();
+    act(() => sendConnectionState("connected"));
+    act(() => sendConnectionState("disconnected"));
+    expect(result.current.state).toBe("reconnecting");
+    expect(mockApi.profileStatus).not.toHaveBeenCalled();
+
+    mockApi.createViewerToken.mockResolvedValueOnce(TOK2);
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(mockApi.profileStatus).toHaveBeenCalledTimes(1);
+    expect(result.current.state).toBe("connecting");
+  });
+});
+
 // ── state-machine invariant ─────────────────────────────────────────────────
 
 describe("liveness invariant", () => {

@@ -180,6 +180,27 @@ const MAX_DETACHED_PROBES = 2;
 /** 4xx codes that mean "later", not "never". */
 const RETRYABLE_4XX = new Set([408, 429]);
 const DEBUG_LOG_LIMIT = 20;
+/**
+ * How often the suspend detector ticks. Under NORMAL operation (including
+ * ordinary background-tab timer throttling) each tick observes a gap close
+ * to this value — fake-timer tests confirm consecutive interval fires always
+ * see exactly this period, since a discrete timer engine cannot skip queued
+ * callbacks. A gap far larger than this is therefore not throttling; it is
+ * evidence the JS engine itself stopped running (system sleep, a frozen
+ * background tab, a mobile OS suspending the browser process) for that long.
+ */
+const SUSPEND_DETECTOR_INTERVAL_MS = 2_000;
+/**
+ * Gap size that counts as "we just resumed from a suspend". Ordinary Chrome
+ * background-tab throttling can stretch a 2s interval to roughly a minute
+ * once a tab has been hidden for several minutes — treating THAT as a resume
+ * signal too is not a bug, it is exactly the reinforcement this detector
+ * exists to add: a stale connection sitting in a throttled background tab
+ * gets re-verified the moment its own timer finally gets to run, instead of
+ * waiting on visibilitychange/online, neither of which is guaranteed to fire
+ * around a real suspend on every platform.
+ */
+const SUSPEND_GAP_THRESHOLD_MS = 10_000;
 
 /**
  * Iframe URL for the native client. `path` overrides the default root-absolute
@@ -305,6 +326,18 @@ interface Controller {
   destroy: () => void;
 }
 
+/**
+ * The Page Lifecycle API's "freeze"/"resume" document events. Not in every
+ * TS DOM lib version (support is Chromium-led), so `document` is narrowed to
+ * this shape locally rather than widening the global lib target for two
+ * listeners. addEventListener with an unrecognised type is a silent no-op in
+ * browsers that lack the API, so registering it unconditionally is safe.
+ */
+type PageLifecycleEventTarget = EventTarget & {
+  addEventListener(type: "freeze" | "resume", listener: () => void): void;
+  removeEventListener(type: "freeze" | "resume", listener: () => void): void;
+};
+
 function createViewerController(deps: ControllerDeps): Controller {
   const { profileId, getClipboardSync, getIframe, random, onChange } = deps;
 
@@ -347,6 +380,16 @@ function createViewerController(deps: ControllerDeps): Controller {
   let resumeSeq = 0;
   /** Date.now() when the last resume probe STARTED; null = none yet. */
   let lastResumeProbeAt: number | null = null;
+  /**
+   * Date.now() of the last time resyncAfterResume actually acted on the
+   * "reconnecting"/"connecting" branches (see RESUME_PROBE_MIN_INTERVAL_MS
+   * gate below). "connected" already rate-limits itself inside
+   * probeAfterResume and is deliberately left out of this one — duplicating
+   * a second gate there would mean reimplementing (and risking disagreeing
+   * with) the droppedWhileConnected exemption that function already gets
+   * right.
+   */
+  let lastResyncActionAt: number | null = null;
   /** consecutive definitive "no viewer attached" readings. */
   let detachedStreak = 0;
   /**
@@ -394,6 +437,9 @@ function createViewerController(deps: ControllerDeps): Controller {
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let degradedTimer: ReturnType<typeof setTimeout> | null = null;
   let clientGraceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Runs for the controller's whole lifetime — see armSuspendDetector. */
+  let suspendDetectorTimer: ReturnType<typeof setInterval> | null = null;
+  let lastSuspendTickAt = Date.now();
 
   function clearTimer(id: ReturnType<typeof setTimeout> | null): null {
     if (id !== null) clearTimeout(id);
@@ -410,6 +456,40 @@ function createViewerController(deps: ControllerDeps): Controller {
     stableTimer = clearTimer(stableTimer);
     degradedTimer = clearTimer(degradedTimer);
     clientGraceTimer = clearTimer(clientGraceTimer);
+    // suspendDetectorTimer is deliberately NOT cleared here: it runs for the
+    // whole controller lifetime (armed once in start(), disarmed only in
+    // destroy()), independent of which per-cycle timers a state transition
+    // clears — a suspend can happen from any state, including ones with no
+    // other timer of their own.
+  }
+
+  /**
+   * Detects "the JS engine itself was not running for a while" — a laptop
+   * lid closing, a fully backgrounded/frozen tab, a mobile OS suspending the
+   * browser process — none of which are guaranteed to fire "offline" or
+   * visibilitychange on every platform. A setInterval's own queued callbacks
+   * cannot be skipped by a live engine, so an observed gap far larger than
+   * the interval itself is direct evidence time passed that this machine
+   * could not react to. See resyncAfterResume for what happens next.
+   */
+  function armSuspendDetector() {
+    if (suspendDetectorTimer !== null) return;
+    lastSuspendTickAt = Date.now();
+    suspendDetectorTimer = setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastSuspendTickAt;
+      lastSuspendTickAt = now;
+      if (gap > SUSPEND_GAP_THRESHOLD_MS) {
+        resyncAfterResume(`resumed after an apparent suspend (${Math.round(gap / 1000)}s gap)`);
+      }
+    }, SUSPEND_DETECTOR_INTERVAL_MS);
+  }
+
+  function disarmSuspendDetector() {
+    if (suspendDetectorTimer !== null) {
+      clearInterval(suspendDetectorTimer);
+      suspendDetectorTimer = null;
+    }
   }
 
   function emit() {
@@ -850,41 +930,113 @@ function createViewerController(deps: ControllerDeps): Controller {
     emit();
   }
 
-  function handleOnline() {
-    offline = false;
+  /**
+   * The single dispatcher for "something suggests we might have just come
+   * back from a gap the machine could not observe" — an "online" event, the
+   * suspend detector's drift check, a bfcache restore (pageshow persisted),
+   * a Page Lifecycle "resume", window focus, or the tab becoming visible.
+   * All of these are evidence of the SAME underlying thing (time passed
+   * un-monitored), so one dispatcher decides what to do in each state rather
+   * than every signal source reinventing that mapping — and rather than
+   * having each source individually decide, and disagree over time, which
+   * states are worth re-verifying.
+   */
+  function resyncAfterResume(reason: string) {
+    offline = typeof navigator !== "undefined" ? !navigator.onLine : offline;
     emit();
-    // A halted machine is halted on purpose: every endpoint it would touch can
-    // only answer 401 again, and connect() used to clear the halt outright.
+    // A halted machine is halted on purpose: every endpoint it would touch
+    // can only answer 401 again, and only explicit user action (reconnectNow)
+    // clears the flag.
     if (halted) return;
-    if (state === "reconnecting") void attemptReconnect();
-    else if (state === "connecting") {
-      // Debounced: a burst of "online" would otherwise restart the connect once
-      // per event, so it could never finish. See CONNECT_RESTART_MIN_AGE_MS.
-      if (Date.now() - connectStartedAt >= CONNECT_RESTART_MIN_AGE_MS) {
-        void connect("network back online");
+    if (state === "reconnecting" || state === "connecting") {
+      // Rate-limited the same way probeAfterResume's own resume probe
+      // already is (same constant, same reasoning): "focus" in particular
+      // fires on every alt-tab, and attemptReconnect() here runs a full
+      // probe-then-reconnect cycle IMMEDIATELY, bypassing the backoff
+      // schedule entirely — unlike the retryTimer's own scheduled calls to
+      // attemptReconnect(), which this gate does not touch at all (it only
+      // guards resync-TRIGGERED entries into these branches). Without this,
+      // a burst of focus events while reconnecting could burn through the
+      // whole MAX_ALIVE_RECONNECTS budget in seconds and end a session that
+      // the normal backoff-paced retries would have recovered.
+      if (
+        lastResyncActionAt !== null &&
+        Date.now() - lastResyncActionAt < RESUME_PROBE_MIN_INTERVAL_MS
+      ) {
+        return;
       }
+      lastResyncActionAt = Date.now();
     }
-    // Still "connected" is the dangerous case, not the safe one: the profile
-    // may have died while we were offline, and a black-holed TCP connection
-    // can leave the client silent for minutes (OS retransmit timeout) while
-    // the toolbar shows a green dot over a frozen frame. Re-verify.
-    else if (state === "connected") void probeAfterResume();
+    if (state === "reconnecting") {
+      void attemptReconnect();
+    } else if (state === "connecting") {
+      // Debounced: a burst of resume signals would otherwise restart the
+      // connect once per event, so it could never finish. See
+      // CONNECT_RESTART_MIN_AGE_MS.
+      if (Date.now() - connectStartedAt >= CONNECT_RESTART_MIN_AGE_MS) {
+        void connect(reason);
+      } else {
+        // Too young to restart outright, but the watchdog itself may be
+        // stale — background-tab throttling (or the very suspend this
+        // function exists to detect) can delay a real setTimeout by minutes.
+        // Re-arm it so a connect that silently died during the gap is not
+        // left waiting on a callback that already should have fired.
+        armConnectWatchdog();
+      }
+    } else if (state === "connected") {
+      // The dangerous case, not the safe one: the profile may have died
+      // during the gap, and a black-holed TCP connection can leave the
+      // client silent for minutes (OS retransmit timeout) while the toolbar
+      // shows a green dot over a frozen frame. Re-verify.
+      void probeAfterResume();
+    }
+    // idle: connect() has not even started yet, nothing to resync.
+    // session-ended/fatal: terminal on purpose — only reconnectNow() (an
+    // explicit user click) reopens them, per its own comment on why.
+  }
+
+  function handleOnline() {
+    resyncAfterResume("network back online");
   }
 
   function handleVisibility() {
     if (document.visibilityState !== "visible") return;
-    if (halted) return;
-    if (state === "reconnecting") {
-      void attemptReconnect();
-    } else if (state === "connected") {
-      void probeAfterResume();
-    } else if (state === "connecting") {
-      // "connecting" renders no overlay, so there is no "Try again" here — a
-      // stalled connect must not be able to sit indefinitely. Background tabs
-      // throttle timers aggressively, so the 15s watchdog may not have run
-      // while hidden; give it a fresh window now that the user is looking.
-      armConnectWatchdog();
-    }
+    resyncAfterResume("tab became visible");
+  }
+
+  function handleFocus() {
+    resyncAfterResume("window focused");
+  }
+
+  /**
+   * `pageshow` with `persisted: true` fires when the page is restored from
+   * the browser's back/forward cache — every timer in this controller was
+   * frozen along with the rest of the page for that whole window, which
+   * ordinary "offline"/"online" and even visibilitychange are not guaranteed
+   * to bracket on every browser (notably iOS Safari's aggressive tab
+   * suspension). An ordinary load has `persisted: false` and needs no
+   * special handling — connect() from start() already covers it.
+   */
+  function handlePageShow(event: PageTransitionEvent) {
+    if (!event.persisted) return;
+    resyncAfterResume("restored from back/forward cache");
+  }
+
+  /**
+   * Page Lifecycle API: fires just before the page stops running JS
+   * entirely (a backgrounded tab nearing discard, some mobile suspend
+   * paths). Nothing productive runs until "resume" or a fresh load, so there
+   * is nothing to pause here — only reset the drift baseline, so the FIRST
+   * suspend-detector tick after resume does not measure a gap that started
+   * before the freeze was even observed. Not load-bearing: a stale baseline
+   * would only ever OVER-report the gap, never under-report it.
+   */
+  function handleFreeze() {
+    lastSuspendTickAt = Date.now();
+  }
+
+  function handlePageLifecycleResume() {
+    resyncAfterResume("Page Lifecycle API resume event");
   }
 
   /** Lightweight authoritative probe when the tab becomes visible again. */
@@ -1030,6 +1182,11 @@ function createViewerController(deps: ControllerDeps): Controller {
       window.addEventListener("online", handleOnline);
       window.addEventListener("offline", handleOffline);
       document.addEventListener("visibilitychange", handleVisibility);
+      window.addEventListener("focus", handleFocus);
+      window.addEventListener("pageshow", handlePageShow);
+      (document as PageLifecycleEventTarget).addEventListener("freeze", handleFreeze);
+      (document as PageLifecycleEventTarget).addEventListener("resume", handlePageLifecycleResume);
+      armSuspendDetector();
       void connect("initial connect");
     },
     handleMessage,
@@ -1073,10 +1230,15 @@ function createViewerController(deps: ControllerDeps): Controller {
       destroyed = true;
       generation += 1;
       clearAllTimers();
+      disarmSuspendDetector();
       window.removeEventListener("message", handleMessage);
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("pageshow", handlePageShow);
+      (document as PageLifecycleEventTarget).removeEventListener("freeze", handleFreeze);
+      (document as PageLifecycleEventTarget).removeEventListener("resume", handlePageLifecycleResume);
     },
   };
 }

@@ -111,6 +111,49 @@ def test_update_profile_toggles_auto_restart(app_client: TestClient):
     assert resp.json()["auto_restart"] is True
 
 
+def test_profile_response_auto_restart_exhausted_defaults_false(app_client: TestClient):
+    resp = app_client.post(
+        "/api/profiles", json={"name": "NotExhausted", "auto_restart": True},
+    )
+    assert resp.json()["auto_restart_exhausted"] is False
+
+
+def test_profile_response_auto_restart_exhausted_is_always_false_when_disabled(
+    app_client: TestClient,
+):
+    from backend import browser_manager as bm
+    from backend import main
+
+    create = app_client.post("/api/profiles", json={"name": "DisabledNeverExhausted"})
+    pid = create.json()["id"]
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        main.browser_mgr._consume_restart_budget(pid)
+
+    resp = app_client.get(f"/api/profiles/{pid}")
+    assert resp.json()["auto_restart"] is False
+    assert resp.json()["auto_restart_exhausted"] is False
+
+    main.browser_mgr._crash_restart_history.pop(pid, None)
+
+
+def test_profile_response_reports_auto_restart_exhausted(app_client: TestClient):
+    from backend import browser_manager as bm
+    from backend import main
+
+    create = app_client.post(
+        "/api/profiles", json={"name": "Exhausted", "auto_restart": True},
+    )
+    pid = create.json()["id"]
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        main.browser_mgr._consume_restart_budget(pid)
+
+    resp = app_client.get(f"/api/profiles/{pid}")
+    assert resp.json()["auto_restart_exhausted"] is True
+
+    # cleanup: this module-level singleton persists across tests in this file
+    main.browser_mgr._crash_restart_history.pop(pid, None)
+
+
 def test_get_profile(app_client: TestClient):
     create = app_client.post("/api/profiles", json={"name": "Get Me"})
     pid = create.json()["id"]

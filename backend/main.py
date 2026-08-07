@@ -395,12 +395,21 @@ def _profile_response(profile: dict) -> ProfileResponse:
     3s poll.
     """
     status = browser_mgr.get_status(profile["id"])
+    # Only meaningful when auto_restart is on — no budget to exhaust
+    # otherwise, and auto_restart_budget_state's own history is per-profile-id
+    # regardless, so skipping the (still pure, no-I/O) call when it cannot
+    # answer True just avoids the wasted list comprehension on every poll.
+    exhausted = (
+        browser_mgr.auto_restart_budget_state(profile["id"])["exhausted"]
+        if profile.get("auto_restart") else False
+    )
     return ProfileResponse(**{
         **profile,
         "status": status["status"],
         "vnc_ws_port": status["vnc_ws_port"],
         "cdp_url": status["cdp_url"],
         "tags": [TagResponse(**t) for t in profile.get("tags", [])],
+        "auto_restart_exhausted": exhausted,
     })
 
 

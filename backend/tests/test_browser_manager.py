@@ -820,9 +820,9 @@ def test_consume_restart_budget_allows_up_to_the_max(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
 
-    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
-        assert mgr._consume_restart_budget("p1") is True
-    assert mgr._consume_restart_budget("p1") is False
+    for expected in range(1, bm.AUTO_RESTART_MAX_ATTEMPTS + 1):
+        assert mgr._consume_restart_budget("p1") == expected
+    assert mgr._consume_restart_budget("p1") is None
 
 
 def test_consume_restart_budget_is_per_profile(monkeypatch):
@@ -832,8 +832,8 @@ def test_consume_restart_budget_is_per_profile(monkeypatch):
 
     for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
         mgr._consume_restart_budget("p1")
-    assert mgr._consume_restart_budget("p1") is False
-    assert mgr._consume_restart_budget("p2") is True  # untouched budget
+    assert mgr._consume_restart_budget("p1") is None
+    assert mgr._consume_restart_budget("p2") == 1  # untouched budget
 
 
 def test_consume_restart_budget_recovers_after_the_window(monkeypatch):
@@ -843,10 +843,102 @@ def test_consume_restart_budget_recovers_after_the_window(monkeypatch):
 
     for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
         mgr._consume_restart_budget("p1")
-    assert mgr._consume_restart_budget("p1") is False
+    assert mgr._consume_restart_budget("p1") is None
 
     clock[0] += bm.AUTO_RESTART_WINDOW_S + 1
-    assert mgr._consume_restart_budget("p1") is True
+    assert mgr._consume_restart_budget("p1") == 1  # fresh window, back to attempt 1
+
+
+def test_consume_global_restart_budget_allows_up_to_the_max(monkeypatch):
+    mgr = BrowserManager()
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+
+    for _ in range(bm.GLOBAL_AUTO_RESTART_MAX_ATTEMPTS):
+        assert mgr._consume_global_restart_budget() is True
+    assert mgr._consume_global_restart_budget() is False
+
+
+def test_consume_global_restart_budget_is_shared_across_profiles(monkeypatch):
+    # Unlike the per-profile budget: one profile's crashes can exhaust the
+    # container-wide breaker on their own, which is the point — a single
+    # profile crash-looping fast enough to hit this is itself worth pausing.
+    mgr = BrowserManager()
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+
+    for _ in range(bm.GLOBAL_AUTO_RESTART_MAX_ATTEMPTS):
+        assert mgr._consume_global_restart_budget() is True
+    assert mgr._consume_global_restart_budget() is False
+
+
+def test_consume_global_restart_budget_recovers_after_the_window(monkeypatch):
+    mgr = BrowserManager()
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+
+    for _ in range(bm.GLOBAL_AUTO_RESTART_MAX_ATTEMPTS):
+        mgr._consume_global_restart_budget()
+    assert mgr._consume_global_restart_budget() is False
+
+    clock[0] += bm.GLOBAL_AUTO_RESTART_WINDOW_S + 1
+    assert mgr._consume_global_restart_budget() is True
+
+
+def test_restart_delay_grows_with_attempt_number_and_is_capped(monkeypatch):
+    mgr = BrowserManager()
+    monkeypatch.setattr(bm.random, "uniform", lambda a, b: 0.0)  # strip jitter
+
+    assert mgr._restart_delay_s(1) == bm.AUTO_RESTART_BACKOFF_BASE_S
+    assert mgr._restart_delay_s(2) == bm.AUTO_RESTART_BACKOFF_BASE_S * 2
+    assert mgr._restart_delay_s(3) == bm.AUTO_RESTART_BACKOFF_BASE_S * 4
+    # A high enough attempt number must not exceed the cap
+    assert mgr._restart_delay_s(20) == bm.AUTO_RESTART_BACKOFF_MAX_S
+
+
+def test_restart_delay_applies_positive_jitter_on_top_of_the_base(monkeypatch):
+    mgr = BrowserManager()
+    monkeypatch.setattr(bm.random, "uniform", lambda a, b: b)  # max jitter
+
+    delay = mgr._restart_delay_s(1)
+    assert delay == pytest.approx(
+        bm.AUTO_RESTART_BACKOFF_BASE_S * (1 + bm.AUTO_RESTART_BACKOFF_JITTER_FRACTION),
+    )
+
+
+def test_auto_restart_budget_state_reports_not_exhausted_when_untouched():
+    mgr = BrowserManager()
+    state = mgr.auto_restart_budget_state("p1")
+    assert state == {"exhausted": False, "attempts_used": 0, "retry_after_s": None}
+
+
+def test_auto_restart_budget_state_reports_exhausted_with_a_retry_deadline(monkeypatch):
+    mgr = BrowserManager()
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        mgr._consume_restart_budget("p1")
+    clock[0] += 20.0  # some time passes after the last attempt
+
+    state = mgr.auto_restart_budget_state("p1")
+    assert state["exhausted"] is True
+    assert state["attempts_used"] == bm.AUTO_RESTART_MAX_ATTEMPTS
+    assert state["retry_after_s"] == pytest.approx(bm.AUTO_RESTART_WINDOW_S - 20.0)
+
+
+def test_auto_restart_budget_state_is_read_only(monkeypatch):
+    """Checking exhaustion must never itself consume budget."""
+    mgr = BrowserManager()
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+
+    mgr.auto_restart_budget_state("p1")
+    mgr.auto_restart_budget_state("p1")
+    mgr.auto_restart_budget_state("p1")
+
+    for expected in range(1, bm.AUTO_RESTART_MAX_ATTEMPTS + 1):
+        assert mgr._consume_restart_budget("p1") == expected  # full budget intact
 
 
 @pytest.mark.asyncio
@@ -854,7 +946,7 @@ async def test_maybe_auto_restart_does_nothing_for_a_deleted_profile(monkeypatch
     mgr = BrowserManager()
     launch = AsyncMock()
     monkeypatch.setattr(mgr, "launch", launch)
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
 
     await mgr._maybe_auto_restart("nonexistent-profile-id")
 
@@ -869,7 +961,7 @@ async def test_maybe_auto_restart_does_nothing_when_auto_restart_disabled(monkey
     mgr = BrowserManager()
     launch = AsyncMock()
     monkeypatch.setattr(mgr, "launch", launch)
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
 
     await mgr._maybe_auto_restart(pid)
 
@@ -884,13 +976,14 @@ async def test_maybe_auto_restart_launches_when_enabled(monkeypatch, tmp_db):
     mgr = BrowserManager()
     launch = AsyncMock()
     monkeypatch.setattr(mgr, "launch", launch)
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
 
     await mgr._maybe_auto_restart(pid)
 
     launch.assert_awaited_once()
     launched_profile = launch.await_args.args[0]
     assert launched_profile["id"] == pid
+    assert launch.await_args.kwargs == {"_is_auto_restart": True}
 
 
 @pytest.mark.asyncio
@@ -903,12 +996,109 @@ async def test_maybe_auto_restart_skips_launch_if_already_running_after_the_dela
     mgr = BrowserManager()
     launch = AsyncMock()
     monkeypatch.setattr(mgr, "launch", launch)
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
     mgr.running[pid] = MagicMock()  # already back up by the time the delay elapses
 
     await mgr._maybe_auto_restart(pid)
 
     launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_skips_launch_if_deleted_during_the_delay(monkeypatch, tmp_db):
+    """The profile must be RE-fetched after the delay, not reused from before
+    it — a delete mid-sleep must not launch a browser onto a directory a
+    concurrent DELETE is (or already has finished) rmtree-ing.
+
+    _restart_delay_s() itself stays synchronous in production (it is called,
+    then its plain float result is handed to asyncio.sleep), so the side
+    effect has to happen INSIDE that sleep — patching asyncio.sleep itself is
+    what actually lands it in the delay window asyncio.sleep(_restart_delay_s
+    (...)) creates, rather than before or after it.
+    """
+    from backend import database as db
+
+    pid = db.create_profile(name="DeletedDuringDelay", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+
+    async def sleep_and_delete(delay):
+        db.delete_profile(pid)
+
+    monkeypatch.setattr(bm.asyncio, "sleep", sleep_and_delete)
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_skips_launch_if_claimed_for_delete_during_the_delay(
+    monkeypatch, tmp_db,
+):
+    """claim_for_delete() is taken before the DB row is gone — a restart
+    landing in that window must still back off, not race the rmtree."""
+    from backend import database as db
+
+    pid = db.create_profile(name="DeleteClaimedDuringDelay", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+
+    async def sleep_and_claim(delay):
+        mgr.claim_for_delete(pid)
+
+    monkeypatch.setattr(bm.asyncio, "sleep", sleep_and_claim)
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_skips_launch_if_turned_off_during_the_delay(monkeypatch, tmp_db):
+    from backend import database as db
+
+    pid = db.create_profile(name="TurnedOffDuringDelay", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+
+    async def sleep_and_disable(delay):
+        db.update_profile(pid, auto_restart=False)
+
+    monkeypatch.setattr(bm.asyncio, "sleep", sleep_and_disable)
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_uses_the_freshest_profile_settings_after_the_delay(
+    monkeypatch, tmp_db,
+):
+    """An edit (e.g. fixing the proxy that caused the crash) made during the
+    delay must be what actually launches, not a stale pre-delay snapshot."""
+    from backend import database as db
+
+    pid = db.create_profile(
+        name="EditedDuringDelay", auto_restart=True, proxy="http://bad:1@h:1",
+    )["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+
+    async def sleep_and_fix_proxy(delay):
+        db.update_profile(pid, proxy=None)
+
+    monkeypatch.setattr(bm.asyncio, "sleep", sleep_and_fix_proxy)
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_awaited_once()
+    assert launch.await_args.args[0]["proxy"] is None
 
 
 @pytest.mark.asyncio
@@ -922,7 +1112,7 @@ async def test_maybe_auto_restart_absorbs_profile_already_running(monkeypatch, t
     monkeypatch.setattr(
         mgr, "launch", AsyncMock(side_effect=bm.ProfileAlreadyRunning("already running")),
     )
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
 
     await mgr._maybe_auto_restart(pid)  # must not raise
 
@@ -936,7 +1126,7 @@ async def test_maybe_auto_restart_absorbs_a_launch_failure(monkeypatch, tmp_db):
     pid = db.create_profile(name="BrokenProxy", auto_restart=True)["id"]
     mgr = BrowserManager()
     monkeypatch.setattr(mgr, "launch", AsyncMock(side_effect=RuntimeError("boom")))
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
 
     await mgr._maybe_auto_restart(pid)  # must not raise
 
@@ -949,7 +1139,7 @@ async def test_maybe_auto_restart_respects_the_crash_loop_budget(monkeypatch, tm
     mgr = BrowserManager()
     launch = AsyncMock()
     monkeypatch.setattr(mgr, "launch", launch)
-    monkeypatch.setattr(bm, "AUTO_RESTART_DELAY_S", 0)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
     clock = [0.0]
     monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
 
@@ -959,6 +1149,346 @@ async def test_maybe_auto_restart_respects_the_crash_loop_budget(monkeypatch, tm
 
     await mgr._maybe_auto_restart(pid)  # one crash too many
     assert launch.await_count == bm.AUTO_RESTART_MAX_ATTEMPTS  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_respects_the_global_crash_loop_budget(monkeypatch, tmp_db):
+    """A single profile crashing fast enough can exhaust the container-wide
+    breaker on its own — that IS the point, not a bug: this many restarts
+    this fast, from anywhere, is itself the signal something systemic is
+    wrong, so it must stop regardless of whose per-profile budget it is."""
+    from backend import database as db
+
+    pid = db.create_profile(name="SystemicCrash", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+    # Exhaust the global budget from OTHER profiles first, well within each
+    # of their own per-profile budgets.
+    for _ in range(bm.GLOBAL_AUTO_RESTART_MAX_ATTEMPTS):
+        mgr._consume_global_restart_budget()
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_global_budget_does_not_block_an_isolated_crash(
+    monkeypatch, tmp_db,
+):
+    from backend import database as db
+
+    pid = db.create_profile(name="IsolatedCrash", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_logs_a_fast_crash_distinctly(monkeypatch, tmp_db, caplog):
+    from backend import database as db
+
+    pid = db.create_profile(name="FastCrash", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr, "launch", AsyncMock())
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
+
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.browser"):
+        await mgr._maybe_auto_restart(pid, ran_for_s=1.5)
+
+    assert any("persistent configuration problem" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_restart_does_not_log_fast_crash_for_a_long_lived_instance(
+    monkeypatch, tmp_db, caplog,
+):
+    from backend import database as db
+
+    pid = db.create_profile(name="SlowCrash", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr, "launch", AsyncMock())
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
+
+    with caplog.at_level("WARNING", logger="cloakbrowser.manager.browser"):
+        await mgr._maybe_auto_restart(pid, ran_for_s=3600.0)
+
+    assert not any("persistent configuration problem" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_successful_manual_launch_resets_the_crash_budget(monkeypatch, tmp_db):
+    """The whole point of the reset: a profile that burned its budget crash-
+    looping earlier must get a full budget again once it has PROVEN it can
+    come up cleanly — not stay silently unprotected until the window rolls
+    off or the container restarts. headless=True sidesteps the Xvnc
+    allocate/start_vnc path entirely, which is not what this test is about."""
+    from backend import database as db
+
+    pid = db.create_profile(name="Recovered", auto_restart=True, headless=True)["id"]
+    mgr = BrowserManager()
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        mgr._consume_restart_budget(pid)
+    assert mgr.auto_restart_budget_state(pid)["exhausted"] is True
+
+    profile = db.get_profile(pid)
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async", AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    # A failed manual launch must NOT reset the budget (it is not proof of
+    # anything) — only a launch that actually comes up does.
+    with pytest.raises(Exception):
+        await mgr.launch(profile)
+    assert mgr.auto_restart_budget_state(pid)["exhausted"] is True
+
+
+def _mock_successful_context() -> MagicMock:
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.pages = []
+    context.on = MagicMock()
+    context.add_init_script = AsyncMock()
+    return context
+
+
+@pytest.mark.asyncio
+async def test_a_successful_manual_launch_actually_resets_the_budget(monkeypatch, tmp_db):
+    """The other half of the pair above: a launch that DOES come up clears
+    the history rather than merely not incrementing it."""
+    from backend import database as db
+
+    pid = db.create_profile(name="ActuallyRecovered", auto_restart=True, headless=True)["id"]
+    mgr = BrowserManager()
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        mgr._consume_restart_budget(pid)
+    assert mgr.auto_restart_budget_state(pid)["exhausted"] is True
+    profile = db.get_profile(pid)
+
+    async def fake_discover(*args, **kwargs):
+        return bm.BrowserProcess(pid=os.getpid(), starttime=0, user_data_dir="/tmp", cdp_port=5100)
+
+    monkeypatch.setattr(bm, "discover_browser_process_async", fake_discover)
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async",
+        AsyncMock(return_value=_mock_successful_context()),
+    )
+
+    await mgr.launch(profile)  # a manual launch — NOT _is_auto_restart
+
+    state = mgr.auto_restart_budget_state(pid)
+    assert state["exhausted"] is False
+    assert state["attempts_used"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_auto_restart_success_does_not_reset_its_own_budget(monkeypatch, tmp_db):
+    """_is_auto_restart=True launches must not erase the very history that
+    limits them — otherwise a profile that crashes, is auto-restarted, and
+    crashes again immediately would never actually exhaust the budget."""
+    from backend import database as db
+
+    pid = db.create_profile(name="AutoRestartLoop", auto_restart=True, headless=True)["id"]
+    mgr = BrowserManager()
+    mgr._consume_restart_budget(pid)
+    mgr._consume_restart_budget(pid)
+    profile = db.get_profile(pid)
+
+    async def fake_discover(*args, **kwargs):
+        return bm.BrowserProcess(pid=os.getpid(), starttime=0, user_data_dir="/tmp", cdp_port=5100)
+
+    monkeypatch.setattr(bm, "discover_browser_process_async", fake_discover)
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async",
+        AsyncMock(return_value=_mock_successful_context()),
+    )
+
+    await mgr.launch(profile, _is_auto_restart=True)
+
+    assert mgr.auto_restart_budget_state(pid)["attempts_used"] == 2  # untouched
+
+
+@pytest.mark.asyncio
+async def test_is_starting_is_true_for_the_whole_auto_restart_backoff_window(monkeypatch, tmp_db):
+    """The exact fix for the frontend viewer treating every auto-restarted
+    crash as terminal: without this, get_status() falls through to "stopped"
+    during the backoff sleep, and the viewer's reconnect machine ends the
+    session outright on a control-plane-terminal "stopped" verdict on the
+    FIRST probe — showing "Browser session ended" within ~250ms of a crash
+    auto-restart exists to make invisible."""
+    from backend import database as db
+
+    pid = db.create_profile(name="StatusDuringBackoff", auto_restart=True, headless=True)["id"]
+    mgr = BrowserManager()
+
+    async def fake_discover(*args, **kwargs):
+        return bm.BrowserProcess(pid=os.getpid(), starttime=0, user_data_dir="/tmp", cdp_port=5100)
+
+    monkeypatch.setattr(bm, "discover_browser_process_async", fake_discover)
+    monkeypatch.setattr(
+        bm, "launch_persistent_context_async",
+        AsyncMock(return_value=_mock_successful_context()),
+    )
+
+    delay_started = asyncio.Event()
+    release_delay = asyncio.Event()
+
+    async def held_sleep(delay):
+        delay_started.set()
+        await release_delay.wait()
+
+    monkeypatch.setattr(bm.asyncio, "sleep", held_sleep)
+
+    assert mgr.is_starting(pid) is False
+    task = asyncio.ensure_future(mgr._maybe_auto_restart(pid))
+    await delay_started.wait()
+
+    # Mid-backoff: this is exactly the window that used to report "stopped".
+    assert mgr.is_starting(pid) is True
+    assert mgr.get_status(pid)["status"] == "starting"
+
+    release_delay.set()
+    await task
+
+    # Restart completed (launched) — no longer pending.
+    assert mgr.is_starting(pid) is False
+
+
+@pytest.mark.asyncio
+async def test_is_starting_clears_even_if_the_restart_is_refused(monkeypatch, tmp_db):
+    from backend import database as db
+
+    pid = db.create_profile(name="RefusedRestart", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
+    mgr.running[pid] = MagicMock()  # already back up by the time the delay elapses
+
+    await mgr._maybe_auto_restart(pid)
+
+    assert mgr.is_starting(pid) is False
+
+
+@pytest.mark.asyncio
+async def test_a_restart_aborted_after_the_delay_does_not_consume_either_budget(
+    monkeypatch, tmp_db,
+):
+    """Budgets must only be spent on restarts that actually reach launch() —
+    not on ones aborted by a post-sleep check (already running, deleted,
+    turned off). Consuming up front charged both budgets for restarts that
+    never happened at all."""
+    from backend import database as db
+
+    pid = db.create_profile(name="AbortedAfterDelay", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+
+    async def sleep_and_win_the_race(delay):
+        mgr.running[pid] = MagicMock()  # a manual launch wins during the delay
+
+    monkeypatch.setattr(bm.asyncio, "sleep", sleep_and_win_the_race)
+
+    await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+    state = mgr.auto_restart_budget_state(pid)
+    assert state["attempts_used"] == 0
+    assert len(mgr._global_restart_history) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_globally_refused_restart_does_not_consume_the_per_profile_budget(
+    monkeypatch, tmp_db,
+):
+    """The per-profile budget must not be charged for a restart the global
+    breaker refuses — otherwise a profile that was never actually
+    auto-restarted once ends up individually locked out too, for the rest of
+    AUTO_RESTART_WINDOW_S, after an unrelated systemic storm clears."""
+    from backend import database as db
+
+    pid = db.create_profile(name="GloballyRefused", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr, "_restart_delay_s", lambda n: 0)
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+    clock = [0.0]
+    monkeypatch.setattr(bm.time, "monotonic", lambda: clock[0])
+    for _ in range(bm.GLOBAL_AUTO_RESTART_MAX_ATTEMPTS):
+        mgr._consume_global_restart_budget()
+
+    for _ in range(3):
+        await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+    assert mgr.auto_restart_budget_state(pid)["attempts_used"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ten_crashes_deleted_during_delay_do_not_trip_the_global_breaker(
+    monkeypatch, tmp_db,
+):
+    """Ten restart ATTEMPTS that never actually happen (each profile deleted
+    mid-backoff) must not exhaust the container-wide breaker — it counts
+    restarts that fire, not crashes considered."""
+    from backend import database as db
+
+    pids = [
+        db.create_profile(name=f"Deleted{i}", auto_restart=True)["id"] for i in range(10)
+    ]
+    mgr = BrowserManager()
+    launch = AsyncMock()
+    monkeypatch.setattr(mgr, "launch", launch)
+
+    for pid in pids:
+        async def sleep_and_delete(delay, pid=pid):
+            db.delete_profile(pid)
+
+        monkeypatch.setattr(bm.asyncio, "sleep", sleep_and_delete)
+        await mgr._maybe_auto_restart(pid)
+
+    launch.assert_not_awaited()
+    assert len(mgr._global_restart_history) == 0
+
+    # The breaker must still have full budget for a real crash afterward.
+    new_pid = db.create_profile(name="RealCrash", auto_restart=True)["id"]
+
+    async def noop_sleep(delay):
+        pass
+
+    monkeypatch.setattr(bm.asyncio, "sleep", noop_sleep)
+    await mgr._maybe_auto_restart(new_pid)
+    launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_new_restart_is_scheduled_once_shutdown_has_started(monkeypatch, tmp_db):
+    from backend import database as db
+
+    pid = db.create_profile(name="DuringShutdown", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+    restart = AsyncMock()
+    monkeypatch.setattr(mgr, "_maybe_auto_restart", restart)
+    mgr._shutting_down = True
+
+    context = MagicMock()
+    mgr.running[pid] = bm.RunningProfile(
+        profile_id=pid, context=context, display=100, ws_port=6100, cdp_port=5100,
+    )
+
+    await mgr._on_browser_closed(pid, context)
+    await asyncio.sleep(0)
+
+    restart.assert_not_awaited()
+    assert mgr._restart_tasks == set()
 
 
 @pytest.mark.asyncio
@@ -981,7 +1511,34 @@ async def test_on_browser_closed_schedules_a_restart_for_a_genuine_crash(monkeyp
     await mgr._on_browser_closed(pid, context)
     await asyncio.sleep(0)  # let the fire-and-forget task actually start
 
-    restart.assert_awaited_once_with(pid)
+    restart.assert_awaited_once()
+    call_args = restart.await_args.args
+    assert call_args[0] == pid
+    assert isinstance(call_args[1], float)  # ran_for_s, non-negative elapsed time
+    assert call_args[1] >= 0
+
+
+@pytest.mark.asyncio
+async def test_on_browser_closed_tracks_the_restart_task_and_forgets_it_when_done(
+    monkeypatch, tmp_db,
+):
+    from backend import database as db
+
+    pid = db.create_profile(name="Tracked", auto_restart=True)["id"]
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+    monkeypatch.setattr(mgr, "_maybe_auto_restart", AsyncMock())
+
+    context = MagicMock()
+    mgr.running[pid] = bm.RunningProfile(
+        profile_id=pid, context=context, display=100, ws_port=6100, cdp_port=5100,
+    )
+
+    await mgr._on_browser_closed(pid, context)
+    assert len(mgr._restart_tasks) == 1
+    await asyncio.sleep(0)  # let the task run to completion...
+    await asyncio.sleep(0)  # ...and its done-callback (call_soon) actually fire
+    assert len(mgr._restart_tasks) == 0
 
 
 @pytest.mark.asyncio
@@ -1076,6 +1633,66 @@ async def test_cleanup_all_stops_every_profile_concurrently(monkeypatch):
     vnc_cleanup.assert_awaited_once()
     assert elapsed < 0.15                       # not 4 x 0.05 in series
     assert [w[0] for w in windows[:4]] == [f"start-{i}" for i in range(4)]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_cancels_a_pending_auto_restart(monkeypatch):
+    """Untracked, a fire-and-forget auto-restart sleeping through shutdown
+    used to wake up AFTER cleanup_all() returned and launch a brand new,
+    totally unsupervised Chromium while nginx and the event loop were
+    themselves being torn down. cleanup_all() must cancel it instead."""
+    mgr = BrowserManager()
+    launched = False
+
+    async def slow_restart():
+        nonlocal launched
+        await asyncio.sleep(60)  # would only return after a real shutdown
+        launched = True  # never reached if cancelled, as it must be
+
+    task = asyncio.ensure_future(slow_restart())
+    mgr._restart_tasks.add(task)
+    monkeypatch.setattr(mgr.vnc, "cleanup_all", AsyncMock())
+
+    await mgr.cleanup_all()
+
+    assert task.cancelled()
+    assert launched is False
+    assert mgr._restart_tasks == set()
+    assert mgr._shutting_down is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_sweeps_teardown_claims_after_cancelling_restart_tasks(monkeypatch):
+    """A restart task cancelled WHILE INSIDE launch_persistent_context_async
+    (before a context exists) leaves its _closing claim in place with no
+    identified process — normally resolved by the maintenance loop's own
+    sweep, but main.py's lifespan cancels that loop's task BEFORE calling
+    cleanup_all(). One explicit sweep pass here catches the fast, common case
+    (the browser already provably gone) instead of leaving the claim dangling
+    for the rest of this short-lived process."""
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr.vnc, "cleanup_all", AsyncMock())
+    sweep = AsyncMock()
+    monkeypatch.setattr(mgr, "sweep_teardown_claims", sweep)
+
+    task = asyncio.ensure_future(asyncio.sleep(60))
+    mgr._restart_tasks.add(task)
+
+    await mgr.cleanup_all()
+
+    sweep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_skips_the_sweep_when_nothing_was_pending(monkeypatch):
+    mgr = BrowserManager()
+    monkeypatch.setattr(mgr.vnc, "cleanup_all", AsyncMock())
+    sweep = AsyncMock()
+    monkeypatch.setattr(mgr, "sweep_teardown_claims", sweep)
+
+    await mgr.cleanup_all()
+
+    sweep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -130,6 +130,14 @@ class ProfileResponse(BaseModel):
     clipboard_sync: bool = True
     auto_launch: bool = False
     auto_restart: bool = False
+    # True when this profile's crash-restart budget is currently exhausted
+    # (AUTO_RESTART_MAX_ATTEMPTS auto-restarts already used within
+    # AUTO_RESTART_WINDOW_S) — see BrowserManager.auto_restart_budget_state.
+    # Always False when auto_restart itself is off; there is no budget to
+    # exhaust. A manual launch that comes up cleanly resets it immediately,
+    # so this is never a permanent state short of the profile continuing to
+    # crash on every attempt.
+    auto_restart_exhausted: bool = False
 
     @field_validator("clipboard_sync", mode="before")
     @classmethod

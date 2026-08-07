@@ -57,6 +57,12 @@ export interface Profile {
    *  auto-stop. Bounded server-side so a profile that crashes on launch
    *  itself cannot retry forever. */
   auto_restart: boolean;
+  /** True when this profile's crash-restart budget is currently exhausted
+   *  (it crashed AUTO_RESTART_MAX_ATTEMPTS times within the trailing
+   *  window) — auto_restart is on, but the NEXT crash will not be
+   *  auto-restarted until the window rolls off or a launch that comes up
+   *  cleanly resets it. Always false when auto_restart itself is off. */
+  auto_restart_exhausted: boolean;
   color_scheme: string | null;
   /** Per-profile CloakBrowser license key override. Blank inherits whatever
    *  the container's CLOAKBROWSER_LICENSE_KEY is (or free tier if it has

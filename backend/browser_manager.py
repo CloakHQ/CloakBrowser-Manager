@@ -7,6 +7,7 @@ import functools
 import json
 import logging
 import os
+import random
 import secrets
 import signal
 import socket
@@ -515,13 +516,41 @@ KASM_VIEWER_PROBE_TIMEOUT_S = 2.0
 # that crashes on launch itself (bad proxy, missing extension, whatever)
 # would otherwise retry as fast as launch()+crash can cycle, burning CPU and
 # CloakBrowser license claims forever. See _on_browser_closed's genuine-crash
-# branch and _auto_restart_after_crash.
+# branch and _maybe_auto_restart.
 AUTO_RESTART_MAX_ATTEMPTS = 3
 AUTO_RESTART_WINDOW_S = 300.0
-# Deliberately not instant: gives a transient resource blip (proxy hiccup,
-# a GPU device momentarily busy from the crash itself) a moment to clear
-# before the retry, same spirit as any other backoff.
-AUTO_RESTART_DELAY_S = 3.0
+# Exponential backoff between an auto-restart's attempts, not a fixed delay:
+# a profile with a persistent problem (bad proxy, a launch arg the binary
+# rejects) used to retry every 3s for all 3 attempts and then go silent for
+# the rest of AUTO_RESTART_WINDOW_S, wasting its whole budget in under 10s
+# and giving a transient blip (a GPU device momentarily busy from the crash
+# itself, a proxy hiccup) no more room to clear than a real, permanent fault.
+# doubles per attempt (3s, 6s, 12s, ...) up to the cap.
+AUTO_RESTART_BACKOFF_BASE_S = 3.0
+AUTO_RESTART_BACKOFF_MAX_S = 30.0
+# Full jitter on top of the capped backoff (0-50% extra), so a container-wide
+# event that crashes several profiles in the same instant does not restart
+# them all in lockstep on the next attempt too — see also
+# GLOBAL_AUTO_RESTART_MAX_ATTEMPTS below, the container-wide circuit breaker
+# this jitter alone cannot substitute for.
+AUTO_RESTART_BACKOFF_JITTER_FRACTION = 0.5
+# A browser that dies this soon after its own launch almost certainly has a
+# persistent configuration problem (bad proxy, an extension or launch arg the
+# binary rejects) rather than a transient fault — auto-restarting it is still
+# the right call (the budget above already bounds how many times), but it is
+# worth telling the operator plainly rather than logging it exactly like an
+# OOM kill after six hours of healthy use.
+AUTO_RESTART_FAST_CRASH_THRESHOLD_S = 10.0
+# Container-wide circuit breaker, independent of any single profile's budget.
+# A systemic fault — a bad binary, a full disk, the GPU driver crashing —
+# crashes every auto_restart profile at once, and per-profile budgets alone
+# would still auto-restart all of them, piling more load onto a container
+# that is already failing. Once this many restarts have fired across ALL
+# profiles combined within the window, every further auto-restart is skipped
+# (loudly) until the window rolls off, however much per-profile budget any
+# individual profile still has left.
+GLOBAL_AUTO_RESTART_MAX_ATTEMPTS = 10
+GLOBAL_AUTO_RESTART_WINDOW_S = 300.0
 
 
 def _viewer_attached(bottleneck: Any) -> bool | None:
@@ -839,6 +868,11 @@ class RunningProfile:
     # against idle_timeout_seconds by reap_idle_profiles(). monotonic, not
     # wall-clock, so it cannot be upset by a clock step.
     last_active: float = field(default_factory=time.monotonic)
+    # When THIS instance came up. Used only for auto-restart diagnostics — see
+    # _on_browser_closed's ran_for_s — to tell a fast, likely-persistent crash
+    # (bad proxy, a rejected launch arg) apart from one after hours of healthy
+    # use. Not idle_timeout related; last_active already covers that.
+    launched_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -899,6 +933,40 @@ class BrowserManager:
         # for AUTO_RESTART_MAX_ATTEMPTS/AUTO_RESTART_WINDOW_S — see
         # _consume_restart_budget.
         self._crash_restart_history: dict[str, list[float]] = {}
+        # monotonic timestamps of recent auto-restart attempts across EVERY
+        # profile, for GLOBAL_AUTO_RESTART_MAX_ATTEMPTS/_WINDOW_S — see
+        # _consume_global_restart_budget.
+        self._global_restart_history: list[float] = []
+        # Pending auto-restart tasks (the AUTO_RESTART_BACKOFF_*S sleep, then
+        # the relaunch itself), so shutdown can cancel them — see
+        # cleanup_all(). A set, not a dict keyed by profile id: two restart
+        # tasks can be alive for the same profile at once (one sleeping its
+        # backoff, superseded by a manual launch that itself later crashes
+        # and starts a second one), and a dict would silently drop the
+        # reference to the first when the second is created. Untracked
+        # entirely, these used to survive past cleanup_all(): a fire-and-forget
+        # task sleeping through a container shutdown would wake up afterward
+        # and launch a brand new, fully unsupervised Chromium while nginx and
+        # the event loop were already being torn down.
+        self._restart_tasks: set[asyncio.Task] = set()
+        # Profile ids with an auto-restart currently pending (sleeping out its
+        # backoff, or mid-launch) — consulted by is_starting() so the profile
+        # reports "starting" instead of "stopped" for that whole window. Not
+        # merely cosmetic: the frontend viewer's reconnect state machine ends
+        # the session outright on a control-plane-terminal "stopped" verdict,
+        # on the FIRST probe (by design — see useViewerSession.ts's classify());
+        # without this, EVERY auto-restart showed "Browser session ended"
+        # within one reconnect-probe interval of the crash it was recovering
+        # from, the opposite of what auto-restart exists to do.
+        self._restarting: set[str] = set()
+        # Set once, at the very start of cleanup_all(), and never cleared —
+        # checked synchronously in _on_browser_closed with no await in
+        # between, so there is no interleaving under asyncio's cooperative
+        # scheduling where a new restart task could be created after this is
+        # true. See _on_browser_closed and cleanup_all() for the two-part fix
+        # this is one half of (the other: cleanup_all() cancels whatever was
+        # ALREADY in _restart_tasks before shutdown began).
+        self._shutting_down = False
 
     def add_display_released_hook(self, hook: Callable[[int], None]) -> None:
         self._display_released_hooks.append(hook)
@@ -918,8 +986,19 @@ class BrowserManager:
             except Exception as exc:
                 logger.warning("Display-released hook failed for :%d: %s", display, exc)
 
-    async def launch(self, profile: dict[str, Any]) -> RunningProfile:
-        """Launch a browser instance for the given profile."""
+    async def launch(
+        self, profile: dict[str, Any], *, _is_auto_restart: bool = False,
+    ) -> RunningProfile:
+        """Launch a browser instance for the given profile.
+
+        `_is_auto_restart` is set ONLY by _maybe_auto_restart's own call to
+        this method. Every other caller (the API, auto_launch_all at
+        container startup) is by definition a fresh, deliberate start — proof
+        the profile can come up cleanly right now — which clears its crash
+        history on success (see the end of the try block below) so a profile
+        that burned its auto-restart budget hours ago is not still treated as
+        crash-looping the next time it dies.
+        """
         profile_id = profile["id"]
 
         # Resolve any teardown claim BEFORE taking the lock. The check probes
@@ -1210,6 +1289,14 @@ class BrowserManager:
                 else "headless, no display", cdp_port,
             )
 
+            if not _is_auto_restart:
+                # A deliberate launch that actually came up is proof the
+                # profile CAN run right now — clear whatever crash history it
+                # accumulated so a later crash gets the full budget again,
+                # rather than inheriting a count from an incident hours ago
+                # that the user has since fixed (or that resolved itself).
+                self._crash_restart_history.pop(profile_id, None)
+
             return running
 
         except BaseException:
@@ -1298,21 +1385,122 @@ class BrowserManager:
             # nobody called stop() first (that pops it BEFORE closing, see
             # stop()'s own comment), so this is an unrequested closure: a
             # crash, an OOM kill, the user closing Chromium some other way.
-            # Fire-and-forget: this handler must not block on a relaunch.
-            asyncio.ensure_future(self._maybe_auto_restart(profile_id))
+            ran_for_s = time.monotonic() - running.launched_at
+            # Never schedule a NEW restart once shutdown has started. Without
+            # this check, cleanup_all()'s own cancel-everything-in
+            # `_restart_tasks` pass can run and finish BEFORE this task is
+            # even created (this coroutine can still be suspended in the
+            # `_release_display` await above while cleanup_all() completes
+            # its whole cancel/gather/clear sequence, since it has nothing to
+            # cancel yet) — the task would then be created into a dict
+            # nobody will ever look at again, sleep through its backoff, and
+            # launch a brand new, fully unsupervised Chromium after the
+            # container has finished tearing down nginx and the event loop.
+            # A flag checked here, synchronously, with no await between the
+            # check and cleanup_all()'s own flag-set, closes that window
+            # completely — see cleanup_all() for the other half.
+            if self._shutting_down:
+                logger.info(
+                    "Not scheduling an auto-restart for profile %s: shutting down",
+                    profile_id,
+                )
+                return
+            # Fire-and-forget: this handler must not block on a relaunch. But
+            # tracked, not abandoned — see cleanup_all(), which cancels these
+            # on shutdown. A set, not a dict keyed by profile_id: two restart
+            # tasks CAN be alive for the same profile at once (this one sleeps
+            # its backoff -> a manual launch wins the race -> that instance
+            # crashes too -> a second task is created) and a dict keyed by
+            # profile_id would silently drop the reference to the first one,
+            # making it invisible to cleanup_all() — exactly the leak the
+            # tracking exists to prevent.
+            task = asyncio.ensure_future(self._maybe_auto_restart(profile_id, ran_for_s))
+            self._restart_tasks.add(task)
+            task.add_done_callback(self._restart_tasks.discard)
 
-    def _consume_restart_budget(self, profile_id: str) -> bool:
-        """True and records an attempt if `profile_id` has budget left in the
-        trailing AUTO_RESTART_WINDOW_S; False (no side effect) otherwise."""
+    def _consume_restart_budget(self, profile_id: str) -> int | None:
+        """Records an attempt and returns its 1-based count within the
+        trailing AUTO_RESTART_WINDOW_S if `profile_id` has budget left;
+        None (no side effect) if exhausted."""
         now = time.monotonic()
         history = self._crash_restart_history.setdefault(profile_id, [])
         history[:] = [t for t in history if now - t < AUTO_RESTART_WINDOW_S]
         if len(history) >= AUTO_RESTART_MAX_ATTEMPTS:
+            return None
+        history.append(now)
+        return len(history)
+
+    def _restart_budget_peek(self, profile_id: str) -> int | None:
+        """Non-consuming _consume_restart_budget: the 1-based attempt count
+        THIS profile would get if consumed right now, or None if exhausted.
+        Used before the backoff sleep, to size the delay and fail fast
+        without waiting through a sleep the budget already rules out — actual
+        consumption happens only once the restart is truly about to launch,
+        in _maybe_auto_restart, so an attempt aborted by a post-sleep check
+        (already running, deleted, auto_restart turned off) never counts
+        against the budget it would otherwise have spent."""
+        now = time.monotonic()
+        history = [t for t in self._crash_restart_history.get(profile_id, []) if now - t < AUTO_RESTART_WINDOW_S]
+        if len(history) >= AUTO_RESTART_MAX_ATTEMPTS:
+            return None
+        return len(history) + 1
+
+    def _consume_global_restart_budget(self) -> bool:
+        """True and records an attempt if the CONTAINER (every profile
+        combined) has budget left in the trailing GLOBAL_AUTO_RESTART_WINDOW_S;
+        False (no side effect) otherwise. See GLOBAL_AUTO_RESTART_MAX_ATTEMPTS."""
+        now = time.monotonic()
+        history = self._global_restart_history
+        history[:] = [t for t in history if now - t < GLOBAL_AUTO_RESTART_WINDOW_S]
+        if len(history) >= GLOBAL_AUTO_RESTART_MAX_ATTEMPTS:
             return False
         history.append(now)
         return True
 
-    async def _maybe_auto_restart(self, profile_id: str) -> None:
+    def _global_restart_budget_peek(self) -> bool:
+        """Non-consuming _consume_global_restart_budget, for the same
+        fail-fast-before-sleeping reason as _restart_budget_peek."""
+        now = time.monotonic()
+        history = [t for t in self._global_restart_history if now - t < GLOBAL_AUTO_RESTART_WINDOW_S]
+        return len(history) < GLOBAL_AUTO_RESTART_MAX_ATTEMPTS
+
+    def auto_restart_budget_state(self, profile_id: str) -> dict[str, Any]:
+        """Read-only snapshot of a profile's crash-restart budget, for the UI.
+
+        Pure: does not consume anything, safe to call on every status poll.
+        `exhausted` is true exactly when the NEXT crash would be refused by
+        _consume_restart_budget — the same window/count math, just without
+        the side effect.
+        """
+        now = time.monotonic()
+        history = [
+            t for t in self._crash_restart_history.get(profile_id, [])
+            if now - t < AUTO_RESTART_WINDOW_S
+        ]
+        exhausted = len(history) >= AUTO_RESTART_MAX_ATTEMPTS
+        retry_after_s = (AUTO_RESTART_WINDOW_S - (now - min(history))) if exhausted else None
+        return {
+            "exhausted": exhausted,
+            "attempts_used": len(history),
+            "retry_after_s": max(0.0, retry_after_s) if retry_after_s is not None else None,
+        }
+
+    def _restart_delay_s(self, attempt_number: int) -> float:
+        """Backoff for auto-restart attempt N (1-based): doubles per attempt
+        up to a cap, plus 0-50% extra on top of that (NOT textbook "full
+        jitter", which would let the delay approach zero — this keeps a
+        guaranteed floor so a transient blip still gets at least
+        AUTO_RESTART_BACKOFF_BASE_S to clear, and leaves decorrelating a
+        genuine container-wide crash storm to GLOBAL_AUTO_RESTART_MAX_ATTEMPTS
+        instead, which this alone cannot do: ten profiles crashing in the
+        same instant all still wait AT LEAST the same base delay)."""
+        base = min(
+            AUTO_RESTART_BACKOFF_BASE_S * (2 ** (attempt_number - 1)),
+            AUTO_RESTART_BACKOFF_MAX_S,
+        )
+        return base + random.uniform(0, base * AUTO_RESTART_BACKOFF_JITTER_FRACTION)
+
+    async def _maybe_auto_restart(self, profile_id: str, ran_for_s: float | None = None) -> None:
         """Relaunch `profile_id` after an unrequested closure, if it opted in
         and still has restart budget. Never raises — this runs detached from
         whatever noticed the crash (_on_browser_closed or reap_dead_browsers,
@@ -1320,37 +1508,131 @@ class BrowserManager:
         here would either vanish into "Task exception was never retrieved" or,
         in the maintenance loop's case, kill the loop that also runs the
         teardown-claim sweep and the idle reaper.
+
+        `ran_for_s` is diagnostic only (see AUTO_RESTART_FAST_CRASH_THRESHOLD_S)
+        and never changes whether a restart happens.
+
+        Both restart budgets are PEEKED (not consumed) before the sleep —
+        just to fail fast and to size the backoff — and only actually
+        CONSUMED once every post-sleep precondition has passed, immediately
+        before the launch() call itself. Consuming up front used to charge a
+        profile's (and the container's) budget for restarts that never
+        happened at all: refused by the other budget, or aborted because the
+        profile had already come back, been deleted, or had auto_restart
+        turned off during the wait.
         """
         from . import database as db
 
         profile = db.get_profile(profile_id)
         if profile is None or not profile.get("auto_restart"):
             return
-        if not self._consume_restart_budget(profile_id):
+
+        attempt_number = self._restart_budget_peek(profile_id)
+        if attempt_number is None:
             logger.error(
                 "Profile %s crashed again but has used its %d auto-restarts "
                 "in the last %.0fs — giving up until it is launched manually",
                 profile_id, AUTO_RESTART_MAX_ATTEMPTS, AUTO_RESTART_WINDOW_S,
             )
             return
-
-        await asyncio.sleep(AUTO_RESTART_DELAY_S)
-        # Re-check after the delay: a manual launch (or another auto-restart
-        # racing this one, though _lock inside launch() itself prevents two
-        # actually starting) may have already made this moot.
-        if profile_id in self.running or profile_id in self._launching:
+        if not self._global_restart_budget_peek():
+            logger.error(
+                "Skipping auto-restart for profile %s: %d or more profiles have "
+                "crashed container-wide in the last %.0fs. That looks systemic "
+                "(a bad binary, a full disk, a crashing GPU driver) rather than "
+                "this profile's problem alone, so every automatic restart is "
+                "paused until the storm subsides — restarting profiles into a "
+                "container that is already failing would only add load",
+                profile_id, GLOBAL_AUTO_RESTART_MAX_ATTEMPTS, GLOBAL_AUTO_RESTART_WINDOW_S,
+            )
             return
-        logger.warning(
-            "Auto-restarting profile %s (%s) after an unrequested close",
-            profile.get("name", "?"), profile_id,
-        )
+        if ran_for_s is not None and ran_for_s < AUTO_RESTART_FAST_CRASH_THRESHOLD_S:
+            logger.warning(
+                "Profile %s crashed only %.1fs after launch — this looks like a "
+                "persistent configuration problem (bad proxy, extension, or "
+                "launch arg) rather than a transient fault; auto-restarting "
+                "anyway, but it will keep happening until the underlying cause "
+                "is fixed",
+                profile_id, ran_for_s,
+            )
+
+        # From here until the finally, an auto-restart is genuinely pending
+        # for this profile — reflected in is_starting()/get_status() as
+        # "starting" rather than "stopped", so the frontend viewer's reconnect
+        # machine (which ends the session outright on a control-plane-terminal
+        # "stopped" verdict, on the FIRST probe, by design) waits it out
+        # instead of showing "Browser session ended" for a crash this exists
+        # to make invisible.
+        self._restarting.add(profile_id)
         try:
-            await asyncio.wait_for(self.launch(profile), timeout=LAUNCH_TIMEOUT_S)
-            logger.info("Auto-restart succeeded for profile %s", profile_id)
-        except ProfileAlreadyRunning:
-            pass  # relaunched by something else while we were waiting
-        except Exception as exc:
-            logger.error("Auto-restart failed for profile %s: %s", profile_id, exc)
+            await asyncio.sleep(self._restart_delay_s(attempt_number))
+            # Re-check after the delay: a manual launch (or another auto-restart
+            # racing this one, though _lock inside launch() itself prevents two
+            # actually starting) may have already made this moot.
+            if profile_id in self.running or profile_id in self._launching:
+                return
+            # Re-fetch rather than reuse the profile captured before the sleep:
+            # it may have been edited (a fixed proxy, auto_restart turned off) or
+            # deleted entirely while this task was waiting, and launching on a
+            # stale dict would use settings the user just changed or, worse, spin
+            # up a browser for a profile whose directory a concurrent DELETE is
+            # mid-rmtree on.
+            profile = db.get_profile(profile_id)
+            if profile is None:
+                logger.info(
+                    "Profile %s was deleted during its auto-restart delay; not "
+                    "relaunching", profile_id,
+                )
+                return
+            if profile_id in self._deleting:
+                logger.info(
+                    "Profile %s is being deleted; not relaunching", profile_id,
+                )
+                return
+            if not profile.get("auto_restart"):
+                logger.info(
+                    "Auto-restart was turned off for profile %s during its delay; "
+                    "not relaunching", profile_id,
+                )
+                return
+
+            # Authoritative consumption — see the docstring for why this is
+            # deferred to here rather than done before the sleep.
+            if not self._consume_global_restart_budget():
+                logger.error(
+                    "Skipping auto-restart for profile %s: the container-wide "
+                    "crash-storm breaker tripped while this attempt was waiting "
+                    "out its backoff", profile_id,
+                )
+                return
+            real_attempt_number = self._consume_restart_budget(profile_id)
+            if real_attempt_number is None:
+                logger.error(
+                    "Profile %s used its last auto-restart while this attempt "
+                    "was waiting out its backoff — giving up until it is "
+                    "launched manually", profile_id,
+                )
+                return
+
+            logger.warning(
+                "Auto-restarting profile %s (%s) after an unrequested close "
+                "(attempt %d/%d in this window)",
+                profile.get("name", "?"), profile_id,
+                real_attempt_number, AUTO_RESTART_MAX_ATTEMPTS,
+            )
+            try:
+                await asyncio.wait_for(
+                    self.launch(profile, _is_auto_restart=True), timeout=LAUNCH_TIMEOUT_S,
+                )
+                logger.info("Auto-restart succeeded for profile %s", profile_id)
+            except ProfileAlreadyRunning:
+                pass  # relaunched by something else while we were waiting
+            except asyncio.CancelledError:
+                raise  # shutdown: do not log this as a launch failure
+            except Exception as exc:
+                logger.error("Auto-restart failed for profile %s: %s", profile_id, exc)
+        finally:
+            self._restarting.discard(profile_id)
 
     async def stop(self, profile_id: str) -> bool:
         """Stop a running browser instance.
@@ -1717,8 +1999,13 @@ class BrowserManager:
                 logger.warning("Maintenance pass failed: %s", exc)
 
     def is_starting(self, profile_id: str) -> bool:
-        """True while a launch is in flight or queued behind auto-launch."""
-        return profile_id in self._launching or profile_id in self._pending_auto_launch
+        """True while a launch is in flight, queued behind auto-launch, or an
+        auto-restart is pending (sleeping out its backoff, or mid-launch)."""
+        return (
+            profile_id in self._launching
+            or profile_id in self._pending_auto_launch
+            or profile_id in self._restarting
+        )
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Cheap lifecycle status: running | starting | stopping | stopped.
@@ -1851,6 +2138,43 @@ class BrowserManager:
         SIGKILLed mid-cleanup — killing uncleanly the very browsers the ordered
         shutdown exists to protect.
         """
+        # Set FIRST, synchronously, before anything else — see
+        # _on_browser_closed and the field's own comment. This is the half
+        # that stops NEW restart tasks from being created once shutdown has
+        # started; the cancel pass just below is the half that stops ones
+        # already pending before it started.
+        self._shutting_down = True
+
+        # Cancel pending auto-restarts, before touching `running` at all.
+        # Each is either sleeping through its backoff or mid-launch; left
+        # alone, a sleeping one wakes up after everything below has already
+        # torn down and starts a brand new, totally unsupervised Chromium
+        # while nginx and the event loop are themselves shutting down.
+        restart_tasks = list(self._restart_tasks)
+        for task in restart_tasks:
+            task.cancel()
+        if restart_tasks:
+            await asyncio.gather(*restart_tasks, return_exceptions=True)
+        self._restart_tasks.clear()
+        # A restart task cancelled WHILE INSIDE launch_persistent_context_async
+        # (before a context exists) is not cleaned up the same way a later
+        # cancellation is: launch()'s own abort path deliberately leaves its
+        # _closing claim in place with no identified process, deferring to
+        # the maintenance loop's sweep to adopt and eventually SIGTERM/SIGKILL
+        # it once a driver finishes starting the now-orphaned Chromium. But
+        # main.py's lifespan cancels `_sweep_task` BEFORE calling this method,
+        # so nothing will ever run that sweep again. One explicit pass here
+        # cannot fully replace 20-35s of escalation (CLOSING_SIGTERM_AFTER_S/
+        # CLOSING_SIGKILL_AFTER_S) that a cancelled shutdown has no time left
+        # for anyway, but it does catch the common, fast case — the browser
+        # already provably gone — and releases that claim instead of leaving
+        # it dangling for the rest of this (short-lived) process. Whatever
+        # this one pass cannot resolve is left to Docker's own SIGKILL at the
+        # end of stop_grace_period, the same fallback CLOSING_SIGKILL_AFTER_S's
+        # own comment already accepts for a survived SIGTERM.
+        if restart_tasks:
+            await self.sweep_teardown_claims()
+
         async with self._lock:
             profile_ids = list(self.running.keys())
 
