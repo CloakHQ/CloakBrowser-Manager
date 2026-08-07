@@ -1,9 +1,136 @@
 services:
   manager:
-    build: .
-    ports:
-      - "127.0.0.1:8080:8080"
+    build:
+      context: .
+    # The entrypoint exits if nginx or uvicorn dies; this is what turns that
+    # into recovery instead of a permanently broken container.
+    restart: unless-stopped
+    # The entrypoint waits for uvicorn's lifespan to close every browser and
+    # Xvnc before stopping nginx. Docker's 10s default would SIGKILL PID 1
+    # mid-cleanup with more than a couple of profiles running, leaving exactly
+    # the unclean Chromium shutdown (and restore prompts) that ordering avoids.
+    stop_grace_period: 60s
+    # Nothing published on the host by default: the `tunnel` service below
+    # reaches this over the compose network and exposes it to the internet
+    # itself, with a real certificate and no port to forward or firewall.
+    # Need direct host access instead (pure local dev, your own reverse
+    # proxy)? Add back what you need in a small override file, e.g.:
+    #   ports:
+    #     - "127.0.0.1:8080:8080"
+    # AUTH_TOKEN is mandatory either way — see entrypoint.sh. If it is not
+    # set, one is generated on first boot, printed to `docker compose logs
+    # manager`, and saved to /data/auth_token.
     volumes:
       - ~/.cloakbrowser-manager:/data
+      # Drop unpacked Chrome extensions (one directory per extension,
+      # manifest.json at its root) into ~/.cloakbrowser-manager/extensions on
+      # the host and they show up as per-profile checkboxes in the UI — see
+      # backend/extensions.py. Not a separate bind mount: it's a subdirectory
+      # of the /data mount above, covered by every Dockerfile/overlay in this
+      # repo automatically since none of them override `volumes:`.
+      #
+      # Scanned ONCE per container start, not watched: adding, removing, or
+      # editing an extension needs `docker compose restart` (or recreate) to
+      # show up in the UI. Deliberate, not a limitation — see extensions.py's
+      # own comment for why.
     environment:
+      # Bare names pass the host value through when set and are ignored when
+      # not. Without these the tuning knobs the README documents have no effect
+      # under Compose — they only reached the container via `docker run -e`.
       - AUTH_TOKEN=${AUTH_TOKEN:-}
+      # Not a build arg: the binary is downloaded at container launch (see
+      # Dockerfile), so this is the only place the key is ever needed. It
+      # decides which binary ensure_binary() fetches on first launch, and the
+      # Pro binary re-validates it on every later launch too — exit 77 on a
+      # missing key, exit 76 once the plan's concurrent-session limit is
+      # taken. Swapping the license needs no rebuild, just a restart.
+      - CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY:-}
+      # Bare, NOT `=${...:-}`: browser_manager.py does
+      # int(os.environ.get("PROFILE_IDLE_TIMEOUT_SECONDS", "3600")), and the
+      # `:-` form would inject an empty string when unset rather than leaving
+      # the var absent — int("") crashes the app on startup.
+      - PROFILE_IDLE_TIMEOUT_SECONDS
+      # Widevine DRM CDM auto-fetch — on by default (entrypoint.sh backgrounds
+      # it, never blocks startup). Bare, same reason as PROFILE_IDLE_TIMEOUT_SECONDS:
+      # entrypoint.sh's own default ("1") must win when this is truly unset, and
+      # `=${...:-}` would inject "" and defeat that default.
+      - CLOAKBROWSER_FETCH_WIDEVINE
+      # Extra names/addresses to put in the self-signed cert's SAN list, comma
+      # separated (e.g. TLS_SANS=192.168.1.50,manager.lan). localhost and
+      # 127.0.0.1 are always included. The container cannot discover the host's
+      # LAN address by itself, so without this the browser adds a name-mismatch
+      # complaint on top of the unknown-issuer one. Only read when the cert is
+      # first generated — delete /data/tls to re-issue.
+      - TLS_SANS
+      - KASM_QUALITY_PRESET
+      - KASM_ENCODING_POLICY
+      - KASM_VIDEO_CODEC
+      - KASM_XVNC_LOG_LEVEL
+      # Inert on KasmVNC 1.5.0 (-RectThreads is accepted but never read); kept
+      # only so an existing deployment that sets it does not break.
+      - KASM_RECT_THREADS
+      - KASM_HW3D
+      - KASM_DRINODE
+      # Chromium GL backend. Defaults to 'auto', which engages a GPU path only
+      # when a device is actually present in the container — /dev/nvidiactl for
+      # the NVIDIA one, a non-nvidia /dev/dri render node for the Mesa one — so
+      # it is inert here and load-bearing under docker-compose.nvidia.yml and
+      # docker-compose.igpu.yml.
+      - CHROME_GPU_ACCEL
+      # ANGLE backend for the Mesa (Intel/AMD) path only: gl-egl, vulkan or gl.
+      # Ignored in every other mode.
+      - CHROME_ANGLE_BACKEND
+    # GPU passthrough is opt-in — Docker hard-fails container creation when a
+    # `devices:` source path is missing, so mapping /dev/dri here would break
+    # every GPU-less host. Enable it with the override file instead:
+    #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+
+  # Cloudflare Tunnel sidecar — on by default, since `manager` publishes no
+  # ports of its own (see above). Also the only way hardware video encoding
+  # works from anywhere but localhost: KasmVNC's client gates every codec on
+  # WebCodecs, which browsers withhold outside a secure context, and this
+  # gives the Manager a real https:// origin with no cert to click through.
+  #
+  # Two modes, chosen automatically by docker/tunnel-entrypoint.sh:
+  #   CF_TUNNEL_TOKEN set    → named tunnel; hostname and ingress rules come
+  #                            from the Cloudflare dashboard (already set up
+  #                            elsewhere) — this just runs `cloudflared tunnel
+  #                            run` with that token.
+  #   CF_TUNNEL_TOKEN unset  → FREE quick tunnel on a random
+  #                            *.trycloudflare.com name, printed to this
+  #                            service's own log and regenerated on every
+  #                            restart. No account needed; not for production.
+  # Retrieve the URL with: docker compose logs tunnel | grep trycloudflare.com
+  tunnel:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tunnel
+    image: cloakbrowser-manager-tunnel:latest
+    restart: unless-stopped
+    # Wait for the Manager's healthcheck, not merely its container: a quick
+    # tunnel that connects before nginx is listening publishes a name that
+    # 502s, and the name cannot be reissued without a restart. This ordering
+    # also guarantees /data/auth_token already exists by the time this starts
+    # (see the AUTH_TOKEN fallback below).
+    depends_on:
+      manager:
+        condition: service_healthy
+    volumes:
+      # Read-only: this sidecar only needs to READ the token file `manager`'s
+      # entrypoint generates/persists — see docker/tunnel-entrypoint.sh.
+      - ~/.cloakbrowser-manager:/data:ro
+    environment:
+      # cloudflared reads TUNNEL_TOKEN itself; CF_TUNNEL_TOKEN is the name on
+      # the outside so it reads as this project's setting rather than a global.
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+      # Plain HTTP to the Manager is correct here: TLS is terminated at
+      # Cloudflare's edge, this hop never leaves the compose network, and
+      # cloudflared sets X-Forwarded-Proto: https, which nginx.conf's
+      # $forwarded_proto map already honours so the SPA still advertises wss://.
+      - TUNNEL_ORIGIN=${CF_TUNNEL_ORIGIN:-http://manager:8080}
+      # Passed through so an OPERATOR-SUPPLIED token is used as-is (no need to
+      # read /data/auth_token in that case). Left empty here, tunnel-entrypoint.sh
+      # falls back to the file manager's entrypoint wrote — auth is mandatory
+      # either way, so there is no "both empty" case left to refuse.
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - TUNNEL_ALLOW_NO_AUTH=${TUNNEL_ALLOW_NO_AUTH:-}

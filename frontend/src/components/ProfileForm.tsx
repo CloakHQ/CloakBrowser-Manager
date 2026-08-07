@@ -1,13 +1,31 @@
-import { Save, Trash2, X } from "lucide-react";
+import { Copy, RefreshCw, Save, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { Profile, ProfileCreateData } from "../lib/api";
+import { api, type Extension, type Profile, type ProfileCreateData } from "../lib/api";
+import { CookieWarmupPanel } from "./CookieWarmupPanel";
+import { DownloadsBrowser } from "./DownloadsBrowser";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
+  onDuplicate?: () => Promise<void>;
   onCancel: () => void;
 }
+
+// Shown before duplicating, and echoed in the button's tooltip — spelled out
+// because "duplicate" alone leaves the two things people actually ask about
+// (does it copy my login session? does it look like the same machine?)
+// ambiguous, and getting either wrong is either a wasted profile or a burned
+// fingerprint.
+const DUPLICATE_SCOPE_SUMMARY =
+  "Copies all settings — proxy, fingerprint config, timezone/locale, " +
+  "humanize, license key, extensions, idle timeout, launch args, tags, " +
+  "notes — into a new profile.";
+const DUPLICATE_EXCLUSIONS_SUMMARY =
+  "Does NOT copy cookies, browsing history, cache, or any other saved " +
+  "browser data (the duplicate starts with an empty profile directory), " +
+  "and gets its own fresh random fingerprint seed rather than the " +
+  "original's, so it won't look like the same machine.";
 
 const RESOLUTION_PRESETS: Record<string, { width: number; height: number }> = {
   "1920 × 1080 (Full HD)": { width: 1920, height: 1080 },
@@ -52,7 +70,7 @@ const GPU_PRESETS: Record<string, { vendor: string; renderer: string }> = {
   },
 };
 
-export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, onSave, onDelete, onDuplicate, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -66,15 +84,23 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     geoip: false,
     clipboard_sync: true,
     auto_launch: false,
+    auto_restart: false,
     launch_args: [],
     tags: [],
   });
 
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
+  const [rescanning, setRescanning] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [storeUrl, setStoreUrl] = useState("");
+  const [installingFromUrl, setInstallingFromUrl] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [launchArgInput, setLaunchArgInput] = useState("");
+  const [extensions, setExtensions] = useState<Extension[]>([]);
+  const [defaultIdleTimeoutSeconds, setDefaultIdleTimeoutSeconds] = useState(3600);
 
   useEffect(() => {
     if (profile) {
@@ -97,13 +123,97 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         geoip: profile.geoip,
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
+        auto_restart: profile.auto_restart,
         color_scheme: profile.color_scheme,
+        license_key: profile.license_key,
+        idle_timeout_seconds: profile.idle_timeout_seconds,
+        enabled_extensions: profile.enabled_extensions ?? [],
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
       });
     }
   }, [profile?.id]);
+
+  // Extensions are scanned once at container startup (see
+  // backend/extensions.py) and don't change without a restart OR an
+  // explicit Rescan (below), so a single fetch on mount — no polling — is
+  // correct, not a shortcut. A brand-new profile (profile === null) starts
+  // with every extension enabled; an existing one keeps whatever the effect
+  // above loaded from profile.enabled_extensions, which this must not
+  // stomp on.
+  useEffect(() => {
+    api.listExtensions()
+      .then((exts) => {
+        setExtensions(exts);
+        if (!isEdit) {
+          setForm((prev) => ({ ...prev, enabled_extensions: exts.map((e) => e.id) }));
+        }
+      })
+      .catch((err) => console.warn("[extensions] failed to load:", err));
+  }, []);
+
+  const handleRescan = async () => {
+    setRescanning(true);
+    try {
+      const exts = await api.rescanExtensions();
+      setExtensions(exts);
+      if (!isEdit) {
+        setForm((prev) => ({ ...prev, enabled_extensions: exts.map((e) => e.id) }));
+      }
+    } catch (err) {
+      console.warn("[extensions] rescan failed:", err);
+    } finally {
+      setRescanning(false);
+    }
+  };
+
+  // Shared by both install paths: the server always returns the freshly
+  // rescanned full list (see /api/extensions/upload and
+  // /api/extensions/install-from-url), so there is nothing else to refetch.
+  const applyInstalledExtensions = (exts: Extension[]) => {
+    setExtensions(exts);
+    if (!isEdit) {
+      setForm((prev) => ({ ...prev, enabled_extensions: exts.map((e) => e.id) }));
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // otherwise re-picking the same file fires no onChange
+    if (!file) return;
+    setUploading(true);
+    try {
+      applyInstalledExtensions(await api.uploadExtension(file));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to upload extension");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleInstallFromUrl = async () => {
+    const url = storeUrl.trim();
+    if (!url) return;
+    setInstallingFromUrl(true);
+    try {
+      applyInstalledExtensions(await api.installExtensionFromUrl(url));
+      setStoreUrl("");
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to install extension");
+    } finally {
+      setInstallingFromUrl(false);
+    }
+  };
+
+  // Just for the placeholder below — shows what "leave blank" actually
+  // resolves to instead of a hardcoded guess that could drift from
+  // PROFILE_IDLE_TIMEOUT_SECONDS.
+  useEffect(() => {
+    api.getStatus()
+      .then((s) => setDefaultIdleTimeoutSeconds(s.default_idle_timeout_seconds))
+      .catch((err) => console.warn("[status] failed to load:", err));
+  }, []);
 
   const set = <K extends keyof ProfileCreateData>(key: K, value: ProfileCreateData[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -128,6 +238,19 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
       await onDelete();
     } finally {
       setDeleting(false);
+    }
+  };
+
+  const handleDuplicate = async () => {
+    if (!onDuplicate) return;
+    if (!confirm(
+      `Duplicate this profile?\n\n${DUPLICATE_SCOPE_SUMMARY}\n\n${DUPLICATE_EXCLUSIONS_SUMMARY}`,
+    )) return;
+    setDuplicating(true);
+    try {
+      await onDuplicate();
+    } finally {
+      setDuplicating(false);
     }
   };
 
@@ -171,6 +294,14 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     set("launch_args", (form.launch_args ?? []).filter((_, i) => i !== idx));
   };
 
+  const toggleExtension = (id: string, enabled: boolean) => {
+    const current = form.enabled_extensions ?? [];
+    set(
+      "enabled_extensions",
+      enabled ? [...current, id] : current.filter((x) => x !== id),
+    );
+  };
+
   return (
     <form onSubmit={handleSubmit} className="p-6 max-w-2xl mx-auto">
       <div className="flex items-center justify-between mb-6">
@@ -178,6 +309,18 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           <h2 className="text-lg font-semibold">
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
+          {isEdit && onDuplicate && (
+            <button
+              type="button"
+              onClick={handleDuplicate}
+              disabled={duplicating}
+              className="btn-secondary flex items-center gap-1.5"
+              title={`${DUPLICATE_SCOPE_SUMMARY} ${DUPLICATE_EXCLUSIONS_SUMMARY}`}
+            >
+              <Copy className="h-3.5 w-3.5" />
+              <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
+            </button>
+          )}
           {isEdit && onDelete && (
             <button
               type="button"
@@ -270,6 +413,22 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                   </svg>
                 </button>
               </div>
+            </div>
+            <div className="col-span-2">
+              <label className="label">CloakBrowser License Key</label>
+              <input
+                className="input"
+                type="password"
+                autoComplete="off"
+                value={form.license_key ?? ""}
+                onChange={(e) => set("license_key", e.target.value || null)}
+                placeholder="Leave blank to use the container's default"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Overrides the container's CLOAKBROWSER_LICENSE_KEY for this profile only. Blank
+                inherits the container's default (free tier if it has none either) — it does not
+                force free tier when the container has a key set.
+              </p>
             </div>
           </div>
         </section>
@@ -454,6 +613,60 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               />
               Launch automatically when container starts
             </label>
+            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.auto_restart ?? false}
+                onChange={(e) => set("auto_restart", e.target.checked)}
+                className="rounded border-border bg-surface-2"
+              />
+              <span>
+                Restart automatically if it crashes
+                <span className="block text-xs text-gray-500">
+                  Only for an unexpected close (a crash or OOM kill) — never for a deliberate
+                  Stop or an idle-timeout auto-stop. Gives up after a few crashes in a row.
+                </span>
+              </span>
+            </label>
+            <div>
+              <label className="label">Idle Timeout (minutes)</label>
+              <input
+                className="input no-spin"
+                type="number"
+                min={0}
+                value={form.idle_timeout_seconds != null ? form.idle_timeout_seconds / 60 : ""}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  set(
+                    "idle_timeout_seconds",
+                    raw === "" ? null : Math.max(0, Math.round(Number(raw) * 60)),
+                  );
+                }}
+                placeholder={`Container default (${Math.round(defaultIdleTimeoutSeconds / 60)} min)`}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Stops this profile automatically after this many minutes with no attached
+                VNC viewer and no CDP traffic, releasing its CloakBrowser license claim.
+                Leave blank to use the container's default; enter 0 to disable idle
+                timeout for this profile.
+              </p>
+            </div>
+            {/* The form has always SUBMITTED headless; it just never rendered a
+                control for it, so the option was unreachable from the UI. */}
+            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.headless ?? false}
+                onChange={(e) => set("headless", e.target.checked)}
+                className="rounded border-border bg-surface-2"
+              />
+              <span>
+                Headless
+                <span className="block text-xs text-gray-500">
+                  No display and no viewer — drive it over CDP. Uses no Xvnc.
+                </span>
+              </span>
+            </label>
             <div>
               <label className="label">Color Scheme</label>
               <select
@@ -531,10 +744,94 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           </div>
         </section>
 
+        {/* Extensions */}
+        <section>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Extensions</h3>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1 cursor-pointer">
+                <Upload className="h-3 w-3" />
+                {uploading ? "Uploading..." : "Upload"}
+                <input
+                  type="file"
+                  accept=".zip,.crx"
+                  className="hidden"
+                  disabled={uploading}
+                  onChange={handleFileUpload}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={handleRescan}
+                disabled={rescanning}
+                className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1"
+                title="Re-scan ~/.cloakbrowser-manager/extensions on the host right now, without a container restart"
+              >
+                <RefreshCw className={`h-3 w-3 ${rescanning ? "animate-spin" : ""}`} />
+                {rescanning ? "Rescanning..." : "Rescan"}
+              </button>
+            </div>
+          </div>
+          <div className="flex gap-2 mb-3">
+            <input
+              className="input flex-1 text-xs"
+              value={storeUrl}
+              onChange={(e) => setStoreUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); handleInstallFromUrl(); }
+              }}
+              placeholder="Paste a Chrome Web Store URL (or extension id) to install it..."
+              disabled={installingFromUrl}
+            />
+            <button
+              type="button"
+              onClick={handleInstallFromUrl}
+              disabled={installingFromUrl || !storeUrl.trim()}
+              className="btn-secondary text-xs"
+            >
+              {installingFromUrl ? "Installing..." : "Install"}
+            </button>
+          </div>
+          {extensions.length === 0 ? (
+            <p className="text-xs text-gray-500">
+              None found. Upload a .zip/.crx or paste a Chrome Web Store URL above, drop an
+              unpacked extension (a directory with manifest.json at its root) into
+              ~/.cloakbrowser-manager/extensions on the host and click Rescan, or
+              `docker compose restart`, which always picks up changes too.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {extensions.map((ext) => (
+                <label
+                  key={ext.id}
+                  className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={(form.enabled_extensions ?? []).includes(ext.id)}
+                    onChange={(e) => toggleExtension(ext.id, e.target.checked)}
+                    className="rounded border-border bg-surface-2 mt-0.5"
+                  />
+                  <span>
+                    {ext.name}
+                    {ext.version && <span className="text-gray-500"> v{ext.version}</span>}
+                    {ext.description && (
+                      <span className="block text-xs text-gray-500">{ext.description}</span>
+                    )}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+        </section>
+
         {/* Launch Args */}
         <section>
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Launch Args</h3>
-          <p className="text-xs text-gray-500 mb-2">Custom Chromium flags passed at launch (e.g. --load-extension, --disable-features)</p>
+          <p className="text-xs text-gray-500 mb-2">
+            Custom Chromium flags passed at launch (e.g. --disable-features). For extensions, use
+            the Extensions section above — a manual --load-extension here is overridden by it.
+          </p>
           {(form.launch_args ?? []).length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-3">
               {(form.launch_args ?? []).map((arg, idx) => (
@@ -560,7 +857,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               value={launchArgInput}
               onChange={(e) => setLaunchArgInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addLaunchArg(); } }}
-              placeholder="--load-extension=/data/extensions/ublock"
+              placeholder="--disable-features=Translate"
             />
             <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">
               Add
@@ -578,6 +875,22 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
             placeholder="Optional notes about this profile..."
           />
         </section>
+
+        {/* Cookie Warmup — only once a profile exists; needs it running */}
+        {isEdit && profile && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Cookie Warmup</h3>
+            <CookieWarmupPanel profileId={profile.id} isRunning={profile.status === "running"} />
+          </section>
+        )}
+
+        {/* Downloads — only once a profile (and its Downloads folder) exists */}
+        {isEdit && profile && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Downloads</h3>
+            <DownloadsBrowser profileId={profile.id} />
+          </section>
+        )}
       </div>
 
     </form>

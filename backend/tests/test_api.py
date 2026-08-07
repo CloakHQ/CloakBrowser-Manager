@@ -3,13 +3,49 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+import asyncio
+import io
+import json
+import os
+import pathlib
+import socket
+import time
+import zipfile
+
 from starlette.testclient import TestClient
 
+from backend import browser_manager as bm
+from backend import cookie_warmup
 from backend import main
-from backend.browser_manager import RunningProfile
+from backend.browser_manager import BrowserManager, RunningProfile
+
+
+def _wedge(pid: str) -> bm.ClosingClaim:
+    """Record a teardown claim whose browser is provably still alive.
+
+    A real live pid, not a sentinel: the claim resolves by asking /proc
+    whether THAT process is still running, so a fabricated identity would be
+    released by the first check and the test would silently exercise nothing.
+    """
+    import os as _os
+
+    _state, _ppid, starttime = bm._proc_stat(_os.getpid())
+    claim = bm.ClosingClaim(
+        context=MagicMock(),
+        proc=bm.BrowserProcess(
+            pid=_os.getpid(), starttime=starttime,
+            user_data_dir="/tmp/udd", cdp_port=5100,
+        ),
+        user_data_dir="/tmp/udd", cdp_port=5100,
+        # Fresh, so the sweeper's escalation clock cannot fire and SIGTERM the
+        # test runner.
+        claimed_at=__import__("time").monotonic(),
+    )
+    main.browser_mgr._closing[pid] = claim
+    return claim
 
 
 # ── Profile CRUD ─────────────────────────────────────────────────────────────
@@ -55,6 +91,69 @@ def test_create_profile_invalid_platform(app_client: TestClient):
     assert resp.status_code == 422
 
 
+def test_create_profile_defaults_auto_restart_to_false(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={"name": "DefaultAutoRestart"})
+    assert resp.json()["auto_restart"] is False
+
+
+def test_create_profile_with_auto_restart_enabled(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={"name": "WithAutoRestart", "auto_restart": True})
+    assert resp.json()["auto_restart"] is True
+
+
+def test_update_profile_toggles_auto_restart(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ToggleAutoRestart"})
+    pid = create.json()["id"]
+    assert create.json()["auto_restart"] is False
+
+    resp = app_client.put(f"/api/profiles/{pid}", json={"auto_restart": True})
+    assert resp.status_code == 200
+    assert resp.json()["auto_restart"] is True
+
+
+def test_profile_response_auto_restart_exhausted_defaults_false(app_client: TestClient):
+    resp = app_client.post(
+        "/api/profiles", json={"name": "NotExhausted", "auto_restart": True},
+    )
+    assert resp.json()["auto_restart_exhausted"] is False
+
+
+def test_profile_response_auto_restart_exhausted_is_always_false_when_disabled(
+    app_client: TestClient,
+):
+    from backend import browser_manager as bm
+    from backend import main
+
+    create = app_client.post("/api/profiles", json={"name": "DisabledNeverExhausted"})
+    pid = create.json()["id"]
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        main.browser_mgr._consume_restart_budget(pid)
+
+    resp = app_client.get(f"/api/profiles/{pid}")
+    assert resp.json()["auto_restart"] is False
+    assert resp.json()["auto_restart_exhausted"] is False
+
+    main.browser_mgr._crash_restart_history.pop(pid, None)
+
+
+def test_profile_response_reports_auto_restart_exhausted(app_client: TestClient):
+    from backend import browser_manager as bm
+    from backend import main
+
+    create = app_client.post(
+        "/api/profiles", json={"name": "Exhausted", "auto_restart": True},
+    )
+    pid = create.json()["id"]
+    for _ in range(bm.AUTO_RESTART_MAX_ATTEMPTS):
+        main.browser_mgr._consume_restart_budget(pid)
+
+    resp = app_client.get(f"/api/profiles/{pid}")
+    assert resp.json()["auto_restart_exhausted"] is True
+
+    # cleanup: this module-level singleton persists across tests in this file
+    main.browser_mgr._crash_restart_history.pop(pid, None)
+
+
 def test_get_profile(app_client: TestClient):
     create = app_client.post("/api/profiles", json={"name": "Get Me"})
     pid = create.json()["id"]
@@ -96,7 +195,553 @@ def test_delete_profile_not_found(app_client: TestClient):
     assert resp.status_code == 404
 
 
-def test_delete_profile_stops_running(app_client: TestClient):
+# ── Profile downloads ─────────────────────────────────────────────────────────
+
+
+def test_list_downloads_empty_when_directory_absent(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NoDownloadsYet"})
+    pid = create.json()["id"]
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_downloads_404_for_unknown_profile(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/downloads")
+    assert resp.status_code == 404
+
+
+def test_list_downloads_reports_real_files(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "HasDownloads"})
+    pid = create.json()["id"]
+    user_data_dir = pathlib.Path(create.json()["user_data_dir"])
+    downloads_dir = user_data_dir / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "invoice.pdf").write_bytes(b"pdf-bytes-here")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["name"] == "invoice.pdf"
+    assert data[0]["path"] == "/invoice.pdf"
+    assert data[0]["isDirectory"] is False
+    assert data[0]["size"] == len(b"pdf-bytes-here")
+    assert data[0]["updatedAt"]
+
+
+def test_download_profile_file_returns_the_real_content(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "DownloadMe"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "report.txt").write_bytes(b"the actual file content")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads/report.txt")
+
+    assert resp.status_code == 200
+    assert resp.content == b"the actual file content"
+
+
+def test_download_profile_file_404_when_missing(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NoSuchFile"})
+    pid = create.json()["id"]
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads/ghost.txt")
+
+    assert resp.status_code == 404
+
+
+def test_delete_profile_download_removes_the_file(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "DeleteMe"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    target = downloads_dir / "old.zip"
+    target.write_bytes(b"stale archive")
+
+    resp = app_client.delete(f"/api/profiles/{pid}/downloads/old.zip")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert not target.exists()
+
+
+def test_delete_profile_download_404_when_missing(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "DeleteGhost"})
+    pid = create.json()["id"]
+
+    resp = app_client.delete(f"/api/profiles/{pid}/downloads/ghost.txt")
+
+    assert resp.status_code == 404
+
+
+# _resolve_download_path unit tests, not HTTP-level: an HTTP client (httpx,
+# a browser, TestClient) normalizes ".." out of a URL path client-side before
+# the request is even sent, so "GET .../downloads/../Preferences" never
+# reaches this function with a literal ".." in it over that path — a raw
+# request bypassing that normalization (a hand-crafted %2e%2e, a non-
+# normalizing HTTP client) does, and this is what actually stops it.
+def test_resolve_download_path_rejects_parent_traversal(tmp_path):
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+
+    assert main._resolve_download_path(downloads_dir, "../Preferences") is None
+
+
+def test_resolve_download_path_treats_a_leading_slash_as_the_virtual_root(tmp_path):
+    """The listing endpoint hands out "path": "/<filename>" (cubone's own
+    convention — see list_profile_downloads), so a leading "/" here means
+    "relative to downloads_dir", not "OS-absolute" — stripped, not rejected.
+    It is still fully contained: this can only ever land back inside
+    downloads_dir, never escape it, which is what actually matters.
+    """
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "file.txt").write_text("x")
+
+    resolved = main._resolve_download_path(downloads_dir, "/file.txt")
+
+    assert resolved == (downloads_dir / "file.txt").resolve()
+
+
+def test_resolve_download_path_accepts_a_plain_filename(tmp_path):
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "file.txt").write_text("x")
+
+    resolved = main._resolve_download_path(downloads_dir, "file.txt")
+
+    assert resolved == (downloads_dir / "file.txt").resolve()
+
+
+def test_resolve_download_path_rejects_empty_string(tmp_path):
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+
+    assert main._resolve_download_path(downloads_dir, "") is None
+
+
+# ── Bulk download as zip ─────────────────────────────────────────────────────
+
+
+def test_downloads_zip_404_for_unknown_profile(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/downloads-zip")
+    assert resp.status_code == 404
+
+
+def test_downloads_zip_404_when_nothing_to_zip(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "EmptyZip"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+    assert resp.status_code == 404
+
+
+def test_downloads_zip_contains_every_file_with_real_content(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ZipMe"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "a.txt").write_bytes(b"first file")
+    (downloads_dir / "b.pdf").write_bytes(b"second file, different bytes")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    assert "ZipMe-downloads.zip" in resp.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert sorted(zf.namelist()) == ["a.txt", "b.pdf"]
+        assert zf.read("a.txt") == b"first file"
+        assert zf.read("b.pdf") == b"second file, different bytes"
+
+
+def test_downloads_zip_sanitizes_the_profile_name_for_the_filename_header(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "weird / name? *.txt"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "f.txt").write_bytes(b"x")
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+
+    assert resp.status_code == 200
+    disposition = resp.headers["content-disposition"]
+    assert "/" not in disposition.split("filename=")[1]
+    assert "?" not in disposition.split("filename=")[1]
+
+
+def test_downloads_zip_skips_subdirectories(app_client: TestClient):
+    """The Downloads dir is documented as always flat, but a stray subfolder
+    (dropped there some other way) must not crash the zip, just be excluded —
+    zipfile.write() on a directory produces an empty entry, not real content,
+    which isn't what "download all as zip" should silently include."""
+    create = app_client.post("/api/profiles", json={"name": "ZipSkipsDirs"})
+    pid = create.json()["id"]
+    downloads_dir = pathlib.Path(create.json()["user_data_dir"]) / "Downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "real.txt").write_bytes(b"real content")
+    (downloads_dir / "a-subdir").mkdir()
+
+    resp = app_client.get(f"/api/profiles/{pid}/downloads-zip")
+
+    assert resp.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert zf.namelist() == ["real.txt"]
+
+
+# ── Per-profile resource usage ───────────────────────────────────────────────
+
+
+def test_get_profile_resources_for_a_running_profile(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResourceTest"})
+    pid = create.json()["id"]
+
+    stat = bm._proc_stat(os.getpid())
+    proc = bm.BrowserProcess(
+        pid=os.getpid(), starttime=stat[2], user_data_dir="/tmp", cdp_port=5100,
+    )
+    running = MagicMock(spec=RunningProfile)
+    running.proc = proc
+    running.idle_timeout_seconds = 3600
+    running.last_active = time.monotonic()
+    main.browser_mgr.running[pid] = running
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["process_count"] >= 1
+        assert data["memory_mb"] > 0
+        assert data["cpu_percent"] >= 0.0
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_profile_resources_404_when_not_running(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NotRunning"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/resources")
+    assert resp.status_code == 404
+
+
+def test_get_profile_resources_404_for_unknown_profile(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/resources")
+    assert resp.status_code == 404
+
+
+def _mock_running_for_resources(pid: str, idle_timeout_seconds: int, last_active: float):
+    stat = bm._proc_stat(os.getpid())
+    proc = bm.BrowserProcess(
+        pid=os.getpid(), starttime=stat[2], user_data_dir="/tmp", cdp_port=5100,
+    )
+    running = MagicMock(spec=RunningProfile)
+    running.proc = proc
+    running.idle_timeout_seconds = idle_timeout_seconds
+    running.last_active = last_active
+    main.browser_mgr.running[pid] = running
+    return running
+
+
+def test_get_profile_resources_reports_idle_remaining_seconds(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "IdleRemaining"})
+    pid = create.json()["id"]
+    now = time.monotonic()
+    _mock_running_for_resources(pid, idle_timeout_seconds=600, last_active=now - 100)
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        remaining = resp.json()["idle_remaining_seconds"]
+        # Not exact: real wall-clock elapses between last_active and the
+        # request. Bounded rather than pinned to 500 so this isn't flaky.
+        assert 490 <= remaining <= 500
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_profile_resources_idle_remaining_seconds_is_null_when_disabled(
+    app_client: TestClient,
+):
+    create = app_client.post("/api/profiles", json={"name": "IdleDisabled"})
+    pid = create.json()["id"]
+    _mock_running_for_resources(pid, idle_timeout_seconds=0, last_active=time.monotonic())
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        assert resp.json()["idle_remaining_seconds"] is None
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_profile_resources_idle_remaining_seconds_clamps_at_zero(app_client: TestClient):
+    # The reaper's own sweep runs every 5s, so a request in that window can
+    # land after the deadline has technically passed; a negative number here
+    # would read as "N seconds ago" in the UI instead of "any moment now".
+    create = app_client.post("/api/profiles", json={"name": "IdleOverdue"})
+    pid = create.json()["id"]
+    now = time.monotonic()
+    _mock_running_for_resources(pid, idle_timeout_seconds=60, last_active=now - 9999)
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/resources")
+        assert resp.status_code == 200
+        assert resp.json()["idle_remaining_seconds"] == 0
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── Extensions upload ────────────────────────────────────────────────────────
+
+
+def test_upload_extension_zip(app_client: TestClient, tmp_path, monkeypatch):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"name": "Uploaded Ext", "version": "1.0"}))
+    buf.seek(0)
+    try:
+        resp = app_client.post(
+            "/api/extensions/upload",
+            files={"file": ("my-ext.zip", buf, "application/zip")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert any(e["id"] == "uploaded-ext" and e["name"] == "Uploaded Ext" for e in data)
+    finally:
+        extensions._cache = None
+
+
+def test_upload_extension_rejects_a_bad_archive(app_client: TestClient, tmp_path, monkeypatch):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    try:
+        resp = app_client.post(
+            "/api/extensions/upload",
+            files={"file": ("junk.zip", io.BytesIO(b"not a zip"), "application/zip")},
+        )
+        assert resp.status_code == 400
+    finally:
+        extensions._cache = None
+
+
+def test_install_extension_from_url_downloads_and_installs(
+    app_client: TestClient, tmp_path, monkeypatch,
+):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"name": "Store Ext", "version": "3.0"}))
+    zip_bytes = buf.getvalue()
+
+    mock_resp = MagicMock()
+    mock_resp.content = zip_bytes
+    mock_resp.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+
+    try:
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            resp = app_client.post(
+                "/api/extensions/install-from-url",
+                json={
+                    "url": "https://chromewebstore.google.com/detail/x/"
+                           "edibdbjcniadpccecjdfdjjppcpchdlm",
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert any(e["id"] == "store-ext" for e in data)
+        assert "edibdbjcniadpccecjdfdjjppcpchdlm" in mock_client.get.call_args.args[0]
+    finally:
+        extensions._cache = None
+
+
+def test_install_extension_from_url_rejects_a_url_with_no_extension_id(
+    app_client: TestClient,
+):
+    resp = app_client.post(
+        "/api/extensions/install-from-url", json={"url": "https://example.com/nope"},
+    )
+    assert resp.status_code == 400
+
+
+def test_install_extension_from_url_502s_on_download_failure(app_client: TestClient):
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.post(
+            "/api/extensions/install-from-url",
+            json={"url": "edibdbjcniadpccecjdfdjjppcpchdlm"},
+        )
+    assert resp.status_code == 502
+
+
+def test_install_extension_from_url_never_forwards_the_raw_url_to_httpx(
+    app_client: TestClient,
+):
+    """The whole SSRF guard: only the extracted id may reach the outbound
+    request, never the caller's own URL verbatim."""
+    mock_resp = MagicMock()
+    mock_resp.content = b""
+    mock_resp.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        app_client.post(
+            "/api/extensions/install-from-url",
+            json={"url": "http://169.254.169.254/edibdbjcniadpccecjdfdjjppcpchdlm"},
+        )
+
+    requested_url = mock_client.get.call_args.args[0]
+    assert requested_url.startswith("https://clients2.google.com/")
+    assert "169.254.169.254" not in requested_url
+
+
+# ── Duplicate profile ────────────────────────────────────────────────────────
+
+
+# ── Extensions rescan ────────────────────────────────────────────────────────
+
+
+def test_rescan_extensions_picks_up_a_newly_dropped_extension(
+    app_client: TestClient, tmp_path, monkeypatch,
+):
+    from backend import extensions
+
+    monkeypatch.setattr(extensions, "EXTENSIONS_DIR", tmp_path)
+    (tmp_path / "new-ext").mkdir()
+    (tmp_path / "new-ext" / "manifest.json").write_text(
+        '{"name": "New Ext", "version": "1.0"}',
+    )
+    try:
+        resp = app_client.post("/api/extensions/rescan")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["id"] == "new-ext"
+        assert data[0]["name"] == "New Ext"
+
+        # GET reflects the same cache /rescan just replaced, not a stale copy.
+        assert app_client.get("/api/extensions").json() == data
+    finally:
+        # Force the next real access to re-scan the ACTUAL (monkeypatch-
+        # reverted) EXTENSIONS_DIR instead of leaking this fake result into
+        # every later test in the session.
+        extensions._cache = None
+
+
+def test_duplicate_profile_not_found(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/duplicate")
+    assert resp.status_code == 404
+
+
+def test_duplicate_profile_copies_settings_with_a_new_id_and_name(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={
+        "name": "Original",
+        "proxy": "http://user:pass@host:8080",
+        "platform": "macos",
+        "screen_width": 2560,
+        "screen_height": 1440,
+        "humanize": True,
+        "human_preset": "careful",
+        "notes": "some notes",
+        "tags": [{"tag": "work", "color": "#ff0000"}],
+    })
+    original = create.json()
+
+    resp = app_client.post(f"/api/profiles/{original['id']}/duplicate")
+    assert resp.status_code == 201
+    dup = resp.json()
+
+    assert dup["id"] != original["id"]
+    assert dup["name"] == "Original (copy)"
+    assert dup["proxy"] == original["proxy"]
+    assert dup["platform"] == "macos"
+    assert dup["screen_width"] == 2560
+    assert dup["humanize"] is True
+    assert dup["human_preset"] == "careful"
+    assert dup["notes"] == "some notes"
+    assert dup["tags"] == [{"tag": "work", "color": "#ff0000"}]
+    assert dup["user_data_dir"] != original["user_data_dir"]
+    assert dup["status"] == "stopped"
+
+
+def test_duplicate_profile_copies_auto_restart(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "AutoRestartSrc", "auto_restart": True})
+    original = create.json()
+
+    resp = app_client.post(f"/api/profiles/{original['id']}/duplicate")
+
+    assert resp.status_code == 201
+    assert resp.json()["auto_restart"] is True
+
+
+def test_duplicate_profile_gets_a_fresh_fingerprint_seed(app_client: TestClient):
+    """The point of a duplicate is a second, independently-fingerprinted
+    profile — an identical seed would make it look like the same machine."""
+    create = app_client.post("/api/profiles", json={"name": "Seeded", "fingerprint_seed": 42})
+    original = create.json()
+
+    dup = app_client.post(f"/api/profiles/{original['id']}/duplicate").json()
+
+    assert dup["fingerprint_seed"] != 42
+
+
+def test_duplicate_profile_does_not_copy_enabled_extensions_as_none(app_client: TestClient):
+    """None means "default to every extension" at create time — a duplicate
+    must copy the SOURCE's actual list, not silently re-default."""
+    create = app_client.post("/api/profiles", json={"name": "Ext", "enabled_extensions": []})
+    original = create.json()
+    assert original["enabled_extensions"] == []
+
+    dup = app_client.post(f"/api/profiles/{original['id']}/duplicate").json()
+
+    assert dup["enabled_extensions"] == []
+
+
+def test_duplicate_profile_name_numbers_repeated_duplicates(app_client: TestClient):
+    """Duplicating the same source repeatedly must not collide on name."""
+    create = app_client.post("/api/profiles", json={"name": "Multi"})
+    pid = create.json()["id"]
+
+    first = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+    second = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+    third = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+
+    assert first["name"] == "Multi (copy)"
+    assert second["name"] == "Multi (copy 2)"
+    assert third["name"] == "Multi (copy 3)"
+
+
+def test_duplicate_profile_of_a_duplicate_appends_its_own_suffix(app_client: TestClient):
+    """_dedupe_profile_name works off whatever name it's given — it does not
+    try to detect and strip an existing "(copy)" suffix first."""
+    create = app_client.post("/api/profiles", json={"name": "Multi"})
+    pid = create.json()["id"]
+    first = app_client.post(f"/api/profiles/{pid}/duplicate").json()
+
+    second_gen = app_client.post(f"/api/profiles/{first['id']}/duplicate").json()
+
+    assert second_gen["name"] == "Multi (copy) (copy)"
+
+
+def test_delete_profile_stops_running(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
     """Deleting a running profile should stop it first."""
     create = app_client.post("/api/profiles", json={"name": "Running"})
     pid = create.json()["id"]
@@ -107,11 +752,23 @@ def test_delete_profile_stops_running(app_client: TestClient):
     mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
-    main.browser_mgr.stop = AsyncMock()
+    # monkeypatch, not assignment: browser_mgr is a module singleton shared by
+    # the whole session, so a plain assignment would leave every later test
+    # calling this mock instead of the real method.
+    # emulate the real stop(): it removes the profile from `running`, which
+    # delete then re-checks before touching the filesystem
+    calls: list[str] = []
+
+    async def stop(target: str) -> bool:
+        calls.append(target)
+        main.browser_mgr.running.pop(target, None)
+        return True  # browser really closed
+
+    monkeypatch.setattr(main.browser_mgr, "stop", stop)
 
     resp = app_client.delete(f"/api/profiles/{pid}")
     assert resp.status_code == 200
-    main.browser_mgr.stop.assert_called_once_with(pid)
+    assert calls == [pid]
 
 
 # ── Profile Status ───────────────────────────────────────────────────────────
@@ -128,6 +785,135 @@ def test_get_profile_status_stopped(app_client: TestClient):
 def test_get_profile_status_not_found(app_client: TestClient):
     resp = app_client.get("/api/profiles/nonexistent/status")
     assert resp.status_code == 404
+
+
+def test_status_stopped_alive_fields_null(app_client: TestClient):
+    """Stopped profiles should report xvnc_alive/browser_alive as null."""
+    create = app_client.post("/api/profiles", json={"name": "AliveStopped"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["xvnc_alive"] is None
+    assert data["browser_alive"] is None
+
+
+def test_status_starting_while_launch_in_flight(app_client: TestClient):
+    """A profile mid-launch reports "starting", never "stopped"."""
+    create = app_client.post("/api/profiles", json={"name": "Booting"})
+    pid = create.json()["id"]
+
+    main.browser_mgr._launching.add(pid)
+    try:
+        data = app_client.get(f"/api/profiles/{pid}/status").json()
+        assert data["status"] == "starting"
+        # list/detail views agree with the status endpoint
+        assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "starting"
+    finally:
+        main.browser_mgr._launching.discard(pid)
+
+    assert app_client.get(f"/api/profiles/{pid}/status").json()["status"] == "stopped"
+
+
+def test_status_starting_while_queued_for_auto_launch(app_client: TestClient):
+    """Auto-launch is sequential; queued profiles must not read as stopped."""
+    create = app_client.post("/api/profiles", json={"name": "Queued"})
+    pid = create.json()["id"]
+
+    main.browser_mgr._pending_auto_launch.add(pid)
+    try:
+        assert app_client.get(f"/api/profiles/{pid}/status").json()["status"] == "starting"
+    finally:
+        main.browser_mgr._pending_auto_launch.discard(pid)
+
+
+def test_viewer_token_starting_is_retryable_503(app_client: TestClient):
+    """503 (retry) not 404 (terminal) while the profile is coming up."""
+    create = app_client.post("/api/profiles", json={"name": "BootingToken"})
+    pid = create.json()["id"]
+
+    main.browser_mgr._pending_auto_launch.add(pid)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/viewer-token")
+        assert resp.status_code == 503
+    finally:
+        main.browser_mgr._pending_auto_launch.discard(pid)
+
+    assert app_client.post(f"/api/profiles/{pid}/viewer-token").status_code == 404
+
+
+def test_launch_while_starting_conflicts(app_client: TestClient):
+    """Launching a profile that is already coming up is a 409, not a 500."""
+    create = app_client.post("/api/profiles", json={"name": "DoubleLaunch"})
+    pid = create.json()["id"]
+
+    main.browser_mgr._launching.add(pid)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/launch")
+        assert resp.status_code == 409
+    finally:
+        main.browser_mgr._launching.discard(pid)
+
+
+def test_status_running_alive_fields(app_client: TestClient):
+    """Running profiles report real liveness for Xvnc and the browser.
+
+    browser_alive comes from a real connect to the CDP port — a listening
+    socket stands in for Chromium's DevTools endpoint.
+    """
+    create = app_client.post("/api/profiles", json={"name": "AliveRunning"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    mock.cdp_port = listener.getsockname()[1]
+
+    # Fake a live Xvnc process for the profile's display
+    fake_vnc = MagicMock()
+    fake_vnc.process.poll.return_value = None
+    main.browser_mgr.vnc._allocated[100] = fake_vnc
+
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["xvnc_alive"] is True
+        assert data["browser_alive"] is True
+    finally:
+        listener.close()
+        main.browser_mgr.vnc._allocated.pop(100, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_status_running_dead_processes(app_client: TestClient):
+    """Exited Xvnc / a CDP port nobody is listening on report False."""
+    create = app_client.post("/api/profiles", json={"name": "AliveDead"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    mock.cdp_port = _closed_port()  # Chromium is gone
+
+    fake_vnc = MagicMock()
+    fake_vnc.process.poll.return_value = 1  # exited
+    main.browser_mgr.vnc._allocated[100] = fake_vnc
+
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["xvnc_alive"] is False
+        assert data["browser_alive"] is False
+    finally:
+        main.browser_mgr.vnc._allocated.pop(100, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def _closed_port() -> int:
+    """A port that was bound and released — nothing is listening on it."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 # ── Launch / Stop ────────────────────────────────────────────────────────────
@@ -149,21 +935,26 @@ def test_launch_already_running(app_client: TestClient):
     main.browser_mgr.running.pop(pid, None)
 
 
-def test_launch_invalid_proxy_400(app_client: TestClient):
+def test_launch_invalid_proxy_400(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """ValueError from browser_mgr.launch should map to 400."""
     create = app_client.post("/api/profiles", json={"name": "BadProxy"})
     pid = create.json()["id"]
-    main.browser_mgr.launch = AsyncMock(side_effect=ValueError("Invalid proxy scheme 'ftp'"))
+    monkeypatch.setattr(
+        main.browser_mgr, "launch",
+        AsyncMock(side_effect=ValueError("Invalid proxy scheme 'ftp'")),
+    )
     resp = app_client.post(f"/api/profiles/{pid}/launch")
     assert resp.status_code == 400
     assert "ftp" in resp.json()["detail"]
 
 
-def test_launch_failure_500(app_client: TestClient):
+def test_launch_failure_500(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """Generic exception from browser_mgr.launch should map to 500."""
     create = app_client.post("/api/profiles", json={"name": "Crash"})
     pid = create.json()["id"]
-    main.browser_mgr.launch = AsyncMock(side_effect=RuntimeError("Xvnc failed"))
+    monkeypatch.setattr(
+        main.browser_mgr, "launch", AsyncMock(side_effect=RuntimeError("Xvnc failed")),
+    )
     resp = app_client.post(f"/api/profiles/{pid}/launch")
     assert resp.status_code == 500
     assert resp.json()["detail"] == "Failed to launch browser"
@@ -172,6 +963,326 @@ def test_launch_failure_500(app_client: TestClient):
 def test_stop_not_running(app_client: TestClient):
     resp = app_client.post("/api/profiles/nonexistent/stop")
     assert resp.status_code == 404
+
+
+# ── Viewer Sessions ──────────────────────────────────────────────────────────
+
+
+def test_viewer_token_not_running(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/viewer-token")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Profile not running"
+
+
+def test_viewer_token_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ViewerTok"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    resp = app_client.post(f"/api/profiles/{pid}/viewer-token")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["token"]
+    assert data["viewer_url"] == f"/viewer/{data['token']}/"
+    assert data["expires_in"] == 3600
+
+    # Token actually validates against the store
+    session = main.viewer_tokens.validate(data["token"])
+    assert session is not None
+    assert session.profile_id == pid
+    assert session.ws_port == 6100
+
+    # Cleanup
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_token_fresh_per_call(app_client: TestClient):
+    """Each call issues a fresh token; older tokens stay valid until expiry."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerFresh"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    t1 = app_client.post(f"/api/profiles/{pid}/viewer-token").json()["token"]
+    t2 = app_client.post(f"/api/profiles/{pid}/viewer-token").json()["token"]
+    assert t1 != t2
+    assert main.viewer_tokens.validate(t1) is not None
+    assert main.viewer_tokens.validate(t2) is not None
+
+    # Cleanup
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_stop_revokes_viewer_tokens(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """Stopping a profile revokes its viewer tokens."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerStop"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    # Model Playwright: is_closed() is sync, close() is a coroutine.
+    mock.context = MagicMock()
+    mock.context.is_closed.return_value = False
+    mock.context.close = AsyncMock()
+    monkeypatch.setattr(main.browser_mgr.vnc, "stop_vnc", AsyncMock())
+    token = main.viewer_tokens.issue(pid, 6100)
+
+    resp = app_client.post(f"/api/profiles/{pid}/stop")
+    assert resp.status_code == 200
+    assert main.viewer_tokens.validate(token) is None
+
+    # Cleanup
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_delete_profile_revokes_viewer_tokens(app_client: TestClient):
+    """Deleting a (stopped) profile revokes its viewer tokens unconditionally."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerDel"})
+    pid = create.json()["id"]
+    token = main.viewer_tokens.issue(pid, 6100)
+
+    resp = app_client.delete(f"/api/profiles/{pid}")
+    assert resp.status_code == 200
+    assert main.viewer_tokens.validate(token) is None
+
+
+# ── Viewer Auth (nginx auth_request) ─────────────────────────────────────────
+
+
+def test_viewer_auth_missing_original_uri(app_client: TestClient):
+    resp = app_client.get("/api/viewer-auth")
+    assert resp.status_code == 403
+
+
+def test_viewer_auth_non_viewer_uri(app_client: TestClient):
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": "/api/profiles"})
+    assert resp.status_code == 403
+
+
+def test_viewer_auth_bad_token(app_client: TestClient):
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": "/viewer/bogus/"})
+    assert resp.status_code == 403
+
+
+def test_viewer_auth_profile_stopped(app_client: TestClient):
+    """Valid token but the profile is no longer running → 403.
+
+    Must be 403 (or 401): nginx auth_request turns any other non-2xx into a
+    500 for the client. Verified live against the shipped config — a 404
+    subrequest logs "auth request unexpected status: 404" and serves 500.
+    """
+    create = app_client.post("/api/profiles", json={"name": "ViewerGone"})
+    pid = create.json()["id"]
+    token = main.viewer_tokens.issue(pid, 6100)  # no running profile registered
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 403
+
+    # Cleanup
+    main.viewer_tokens.revoke_profile(pid)
+
+
+def test_viewer_auth_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ViewerOk"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-under-test")
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 200
+    assert resp.headers["X-Viewer-Upstream"] == "127.0.0.1:6100"
+
+    # Nested asset paths (with query strings) share the same token
+    resp = app_client.get(
+        "/api/viewer-auth",
+        headers={"X-Original-URI": f"/viewer/{token}/app/dist/main.js?v=1"},
+    )
+    assert resp.status_code == 200
+
+    # Cleanup
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_auth_rejects_a_token_from_a_previous_launch(app_client: TestClient):
+    """A token whose epoch does not match the live session is refused.
+
+    Unreachable over HTTP as the code stands — every teardown path revokes
+    before `running` can be replaced (see
+    test_teardown_revokes_before_the_profile_can_be_relaunched). This exercises
+    the guard directly, because the whole point of keeping it is to catch a
+    future reorder of that ordering: without it a surviving token would be
+    handed the NEW session's upstream and the NEW display's credentials.
+    """
+    create = app_client.post("/api/profiles", json={"name": "ViewerStale"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)  # session_epoch == "epoch-under-test"
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-from-a-dead-launch")
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Viewer token is stale"
+    # and nginx is told nothing it could route on
+    assert "X-Viewer-Upstream" not in resp.headers
+
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_auth_rejects_a_token_for_a_different_ws_port(app_client: TestClient):
+    """The second assertion, which cannot fire on its own but must still hold."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerPort"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)  # ws_port == 6100
+    token = main.viewer_tokens.issue(pid, 6199, session_epoch="epoch-under-test")
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 403
+    assert "X-Viewer-Upstream" not in resp.headers
+
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_auth_injects_kasm_basic_auth(app_client: TestClient, monkeypatch):
+    """When per-display Kasm credentials exist, viewer-auth hands them to nginx."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerAuth"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-under-test")
+    monkeypatch.setattr(
+        main.browser_mgr.vnc, "get_api_credentials", lambda _d: ("manager", "pw123")
+    )
+
+    resp = app_client.get("/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"})
+    assert resp.status_code == 200
+    import base64
+
+    expected = "Basic " + base64.b64encode(b"manager:pw123").decode()
+    assert resp.headers["X-Viewer-Authorization"] == expected
+
+    # Cleanup
+    main.viewer_tokens.revoke_profile(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_kasm_stats_not_running(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/kasm-stats")
+    assert resp.status_code == 404
+
+
+def test_kasm_stats_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "StatsOk"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    bottleneck_resp = MagicMock()
+    bottleneck_resp.status_code = 200
+    bottleneck_resp.json.return_value = {"code": 0, "bottleneck": "cpu"}
+    sessions_resp = MagicMock()
+    sessions_resp.status_code = 200
+    sessions_resp.json.return_value = {"users": [{"username": "manager"}]}
+    frame_resp = MagicMock()
+    frame_resp.status_code = 200
+    frame_resp.json.return_value = {"clients": {"all": {"fps": 60}}}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=[bottleneck_resp, sessions_resp, frame_resp])
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/kasm-stats")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["bottleneck"] == {"code": 0, "bottleneck": "cpu"}
+    assert data["sessions"] == {"users": [{"username": "manager"}]}
+    assert data["frame"] == {"clients": {"all": {"fps": 60}}}
+
+    # Cleanup
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_kasm_stats_no_viewers_skips_frame_stats(app_client: TestClient):
+    """get_frame_stats hangs with no clients — it must not be called."""
+    create = app_client.post("/api/profiles", json={"name": "StatsEmpty"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    bottleneck_resp = MagicMock()
+    bottleneck_resp.status_code = 200
+    bottleneck_resp.json.return_value = {}
+    sessions_resp = MagicMock()
+    sessions_resp.status_code = 200
+    sessions_resp.json.return_value = {"users": []}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=[bottleneck_resp, sessions_resp])
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/kasm-stats")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["frame"] is None
+    assert mock_client.get.await_count == 2  # no get_frame_stats call
+
+    # Cleanup
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_kasm_stats_frame_stats_failure_isolated(app_client: TestClient):
+    """Frame-stats errors (503/timeout) must not fail the whole endpoint."""
+    create = app_client.post("/api/profiles", json={"name": "StatsIso"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    bottleneck_resp = MagicMock()
+    bottleneck_resp.status_code = 200
+    bottleneck_resp.json.return_value = {"manager": {}}
+    sessions_resp = MagicMock()
+    sessions_resp.status_code = 200
+    sessions_resp.json.return_value = {"users": [{"username": "manager"}]}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(
+        side_effect=[bottleneck_resp, sessions_resp, ConnectionError("timeout")]
+    )
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/kasm-stats")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["bottleneck"] == {"manager": {}}
+    assert data["frame"] is None
+
+    # Cleanup
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_kasm_stats_kasm_unreachable(app_client: TestClient):
+    """502 when the KasmVNC stats endpoint is down."""
+    create = app_client.post("/api/profiles", json={"name": "StatsDown"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.get(f"/api/profiles/{pid}/kasm-stats")
+
+    assert resp.status_code == 502
+
+    # Cleanup
+    main.browser_mgr.running.pop(pid, None)
 
 
 # ── System Status ────────────────────────────────────────────────────────────
@@ -189,6 +1300,31 @@ def test_system_status(app_client: TestClient):
     assert data["running_count"] == 0
     assert data["binary_version"] == "0.0.0-test"
     assert data["profiles_total"] >= 1
+
+
+def test_system_check(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
+    monkeypatch.delenv("CLOAKBROWSER_LICENSE_KEY", raising=False)
+
+    resp = app_client.get("/api/system-check")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["gpu_mode"] == "swiftshader"
+    assert data["binary_version"] == "0.0.0-test"
+    assert data["license_configured"] is False
+    assert data["kasmvnc_version"] == "1.5.0"
+    assert data["disk_total_bytes"] > 0
+    assert 0.0 <= data["disk_percent_used"] <= 100.0
+
+
+def test_system_check_reflects_a_configured_license(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
+    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", "a-real-key")
+
+    resp = app_client.get("/api/system-check")
+
+    assert resp.json()["license_configured"] is True
 
 
 # ── Launch Args ─────────────────────────────────────────────────────────────
@@ -285,8 +1421,11 @@ def test_set_clipboard_success(app_client: TestClient):
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
 
-    # Cleanup
+    # Cleanup — including the tracked xclip: browser_mgr is a session-wide
+    # singleton and so is _xclip_procs.
     main.browser_mgr.running.pop(pid, None)
+    main._xclip_procs.pop(100, None)
+    main._xclip_locks.pop(100, None)
 
 
 def test_get_clipboard_from_page(app_client: TestClient):
@@ -315,6 +1454,167 @@ def test_get_clipboard_from_page(app_client: TestClient):
     main.browser_mgr.running.pop(pid, None)
 
 
+# ── Tab manager ──────────────────────────────────────────────────────────────
+
+
+def _mock_page(url: str, title: str = "", favicon: str | None = None) -> AsyncMock:
+    page = AsyncMock()
+    page.url = url
+    page.title = AsyncMock(return_value=title)
+    page.evaluate = AsyncMock(return_value=favicon)
+    page.close = AsyncMock()
+    return page
+
+
+def test_list_tabs_not_running(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/tabs")
+    assert resp.status_code == 404
+
+
+def test_list_tabs_returns_title_url_favicon_in_order(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "Tabs"})
+    pid = create.json()["id"]
+
+    page_a = _mock_page("https://a.example/", "Site A", "https://a.example/favicon.ico")
+    page_b = _mock_page("https://b.example/", "Site B", None)
+
+    mock_context = MagicMock()
+    mock_context.pages = [page_a, page_b]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/tabs")
+        assert resp.status_code == 200
+        tabs = resp.json()["tabs"]
+        assert tabs == [
+            {"index": 0, "title": "Site A", "url": "https://a.example/",
+             "favicon": "https://a.example/favicon.ico"},
+            {"index": 1, "title": "Site B", "url": "https://b.example/", "favicon": None},
+        ]
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_list_tabs_falls_back_to_url_when_title_is_empty(app_client: TestClient):
+    # An about:blank tab (or one still loading) reports an empty title — the
+    # panel must show something identifiable rather than a blank row.
+    create = app_client.post("/api/profiles", json={"name": "TabsBlank"})
+    pid = create.json()["id"]
+
+    page = _mock_page("about:blank", title="")
+    mock_context = MagicMock()
+    mock_context.pages = [page]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/tabs")
+        assert resp.json()["tabs"][0]["title"] == "about:blank"
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_list_tabs_survives_a_wedged_page(app_client: TestClient):
+    # One tab whose title()/evaluate() never resolve must not take the whole
+    # listing down with it — same guarantee _read_clipboard_from_pages makes.
+    create = app_client.post("/api/profiles", json={"name": "TabsWedged"})
+    pid = create.json()["id"]
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(10)
+
+    wedged = AsyncMock()
+    wedged.url = "https://stuck.example/"
+    wedged.title = AsyncMock(side_effect=_hang)
+    wedged.evaluate = AsyncMock(side_effect=_hang)
+    good = _mock_page("https://ok.example/", "Fine")
+
+    mock_context = MagicMock()
+    mock_context.pages = [wedged, good]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        with patch("backend.main._TAB_PAGE_TIMEOUT_S", 0.05):
+            resp = app_client.get(f"/api/profiles/{pid}/tabs")
+        assert resp.status_code == 200
+        tabs = resp.json()["tabs"]
+        assert tabs[0] == {
+            "index": 0, "title": "https://stuck.example/",
+            "url": "https://stuck.example/", "favicon": None,
+        }
+        assert tabs[1]["title"] == "Fine"
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_close_tab_not_running(app_client: TestClient):
+    resp = app_client.delete("/api/profiles/nonexistent/tabs/0")
+    assert resp.status_code == 404
+
+
+def test_close_tab_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CloseTab"})
+    pid = create.json()["id"]
+
+    page_a = _mock_page("https://a.example/", "A")
+    page_b = _mock_page("https://b.example/", "B")
+    mock_context = MagicMock()
+    mock_context.pages = [page_a, page_b]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}/tabs/1")
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        page_b.close.assert_awaited_once()
+        page_a.close.assert_not_called()
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_close_tab_invalid_index(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CloseTabBad"})
+    pid = create.json()["id"]
+
+    mock_context = MagicMock()
+    mock_context.pages = [_mock_page("https://a.example/", "A")]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}/tabs/5")
+        assert resp.status_code == 404
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_close_tab_reports_500_when_close_fails(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CloseTabFail"})
+    pid = create.json()["id"]
+
+    page = _mock_page("https://a.example/", "A")
+    page.close = AsyncMock(side_effect=RuntimeError("target closed"))
+    mock_context = MagicMock()
+    mock_context.pages = [page]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}/tabs/0")
+        assert resp.status_code == 500
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
 # ── Response shape ───────────────────────────────────────────────────────────
 
 
@@ -323,7 +1623,7 @@ def test_profile_response_has_status_field(app_client: TestClient):
     resp = app_client.get("/api/profiles")
     for profile in resp.json():
         assert "status" in profile
-        assert profile["status"] in ("running", "stopped")
+        assert profile["status"] in ("running", "starting", "stopping", "stopped")
 
 
 def test_profile_response_has_cdp_url_field(app_client: TestClient):
@@ -386,6 +1686,10 @@ def _mock_running_profile(pid: str) -> MagicMock:
     mock.ws_port = 6100
     mock.cdp_port = 5100
     mock.profile_id = pid
+    mock.proc = None
+    # Real value, not a MagicMock: viewer_auth compares it against the token's
+    # epoch, and a MagicMock would make every token look stale.
+    mock.session_epoch = "epoch-under-test"
     main.browser_mgr.running[pid] = mock
     return mock
 
@@ -497,21 +1801,6 @@ def test_cdp_json_version_chrome_unreachable(app_client: TestClient):
 # ── WebSocket Origin Validation ──────────────────────────────────────────────
 
 
-def test_vnc_ws_rejects_cross_origin(app_client: TestClient):
-    """VNC WebSocket should reject cross-origin browser connections."""
-    create = app_client.post("/api/profiles", json={"name": "OriginVnc"})
-    pid = create.json()["id"]
-    _mock_running_profile(pid)
-
-    with pytest.raises(Exception):
-        with app_client.websocket_connect(
-            f"/api/profiles/{pid}/vnc",
-            headers={"origin": "http://evil.com"},
-        ):
-            pass
-    main.browser_mgr.running.pop(pid, None)
-
-
 def test_cdp_ws_rejects_cross_origin(app_client: TestClient):
     """CDP WebSocket should reject cross-origin browser connections."""
     create = app_client.post("/api/profiles", json={"name": "OriginCdp"})
@@ -533,12 +1822,12 @@ def test_ws_allows_same_origin(app_client: TestClient):
     pid = create.json()["id"]
     _mock_running_profile(pid)
 
-    # Same-origin passes Origin check. VNC proxy then fails to connect to
-    # real KasmVNC (not running), but that's fine — we're testing Origin only.
-    # The connection is accepted (no 4403), then closes due to VNC connect error.
+    # Same-origin passes Origin check. The CDP proxy then fails to reach real
+    # Chrome (not running) and closes — fine, we're testing Origin only.
+    # The connection is accepted (no 4403), then closes on CDP connect error.
     try:
         with app_client.websocket_connect(
-            f"/api/profiles/{pid}/vnc",
+            f"/api/profiles/{pid}/cdp",
             headers={"origin": "http://testserver"},
         ) as ws:
             pass  # connection accepted = Origin check passed
@@ -555,8 +1844,1118 @@ def test_ws_allows_no_origin(app_client: TestClient):
     _mock_running_profile(pid)
 
     try:
-        with app_client.websocket_connect(f"/api/profiles/{pid}/vnc") as ws:
+        with app_client.websocket_connect(f"/api/profiles/{pid}/cdp") as ws:
             pass
     except Exception as exc:
         assert "4403" not in str(exc)
     main.browser_mgr.running.pop(pid, None)
+
+
+def test_kasm_stats_upstream_error_is_502(app_client: TestClient):
+    """A Kasm 401/5xx must not be handed back as 200 with an HTML body."""
+    create = app_client.post("/api/profiles", json={"name": "StatsAuthFail"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    unauthorized = MagicMock()
+    unauthorized.status_code = 401
+    unauthorized.text = "<html>401 Unauthorized</html>"
+    unauthorized.json.side_effect = ValueError("not json")
+    sessions_resp = MagicMock()
+    sessions_resp.status_code = 200
+    sessions_resp.json.return_value = {"users": []}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=[unauthorized, sessions_resp])
+
+    try:
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            resp = app_client.get(f"/api/profiles/{pid}/kasm-stats")
+        assert resp.status_code == 502
+        assert "401" in resp.json()["detail"]
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_delete_while_starting_conflicts(app_client: TestClient):
+    """Deleting mid-launch would rmtree the user_data_dir under Chromium."""
+    create = app_client.post("/api/profiles", json={"name": "DeleteRace"})
+    pid = create.json()["id"]
+
+    main.browser_mgr._launching.add(pid)
+    try:
+        assert app_client.delete(f"/api/profiles/{pid}").status_code == 409
+    finally:
+        main.browser_mgr._launching.discard(pid)
+
+    # still there, and deletable once the launch settles
+    assert app_client.get(f"/api/profiles/{pid}").status_code == 200
+    assert app_client.delete(f"/api/profiles/{pid}").status_code == 200
+
+
+def test_stop_while_starting_conflicts(app_client: TestClient):
+    """Mid-launch is not "not running" — 409, not 404."""
+    create = app_client.post("/api/profiles", json={"name": "StopRace"})
+    pid = create.json()["id"]
+
+    main.browser_mgr._pending_auto_launch.add(pid)
+    try:
+        assert app_client.post(f"/api/profiles/{pid}/stop").status_code == 409
+    finally:
+        main.browser_mgr._pending_auto_launch.discard(pid)
+
+    assert app_client.post(f"/api/profiles/{pid}/stop").status_code == 404
+
+
+def test_browser_mgr_singleton_is_not_permanently_shadowed():
+    """No test may leave a mock bolted onto the shared BrowserManager.
+
+    browser_mgr is a module-level singleton. A plain `main.browser_mgr.stop =
+    AsyncMock()` is never undone, so every later test that exercises stop()
+    or launch() silently asserts against the mock instead of production code.
+    monkeypatch.setattr restores on teardown; assignment does not.
+    """
+    for name in ("stop", "launch"):
+        bound = getattr(main.browser_mgr, name)
+        assert getattr(bound, "__func__", None) is getattr(BrowserManager, name), (
+            f"browser_mgr.{name} is still a test double — "
+            "use monkeypatch.setattr instead of assignment"
+        )
+
+
+def test_viewer_auth_rejects_a_token_from_a_previous_run(app_client: TestClient):
+    """Upstream and credentials must describe the same instance."""
+    create = app_client.post("/api/profiles", json={"name": "ViewerStale"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    mock.ws_port = 6105  # relaunched on a different display
+    token = main.viewer_tokens.issue(
+        pid, 6100, session_epoch="epoch-under-test",  # token from the previous run
+    )
+
+    try:
+        resp = app_client.get(
+            "/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"},
+        )
+        assert resp.status_code == 403
+    finally:
+        main.viewer_tokens.revoke_profile(pid)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_delete_rechecks_after_stopping(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """A launch claiming the profile during stop() must not get its dir deleted."""
+    create = app_client.post("/api/profiles", json={"name": "DeleteAfterStop"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    async def stop_then_relaunch(_pid: str) -> bool:
+        # what a concurrent POST /launch would do while stop() awaits the close
+        main.browser_mgr.running.pop(_pid, None)
+        main.browser_mgr._launching.add(_pid)
+        return True
+
+    monkeypatch.setattr(main.browser_mgr, "stop", stop_then_relaunch)
+    try:
+        resp = app_client.delete(f"/api/profiles/{pid}")
+        assert resp.status_code == 409
+        # and the profile still exists
+        assert app_client.get(f"/api/profiles/{pid}").status_code == 200
+    finally:
+        main.browser_mgr._launching.discard(pid)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_delete_refuses_when_the_browser_did_not_close(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """A wedged teardown must not let rmtree run under a live Chromium."""
+    create = app_client.post("/api/profiles", json={"name": "DeleteWedged"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    async def stop_but_not_closed(target: str) -> bool:
+        main.browser_mgr.running.pop(target, None)
+        return False  # bounded close timed out; Chromium may still be alive
+
+    monkeypatch.setattr(main.browser_mgr, "stop", stop_but_not_closed)
+    try:
+        assert app_client.delete(f"/api/profiles/{pid}").status_code == 409
+        assert app_client.get(f"/api/profiles/{pid}").status_code == 200
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_raced_launch_is_409_not_500(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """Losing the launch race is a conflict, not a server error."""
+    from backend.browser_manager import ProfileAlreadyRunning
+
+    create = app_client.post("/api/profiles", json={"name": "RacedLaunch"})
+    pid = create.json()["id"]
+
+    async def already(_profile):
+        raise ProfileAlreadyRunning("Profile is already running")
+
+    monkeypatch.setattr(main.browser_mgr, "launch", already)
+    assert app_client.post(f"/api/profiles/{pid}/launch").status_code == 409
+
+
+def test_launch_is_blocked_while_a_delete_is_in_flight(app_client: TestClient):
+    """The delete claim closes the window the post-stop re-check only narrowed."""
+    create = app_client.post("/api/profiles", json={"name": "DeleteClaim"})
+    pid = create.json()["id"]
+
+    main.browser_mgr.claim_for_delete(pid)
+    try:
+        assert app_client.post(f"/api/profiles/{pid}/launch").status_code == 409
+    finally:
+        main.browser_mgr.release_delete_claim(pid)
+
+    # released again once the delete finishes
+    assert main.browser_mgr.is_starting(pid) is False
+
+
+def test_concurrent_delete_is_refused_rather_than_sharing_the_claim(
+    app_client: TestClient,
+):
+    """The second delete must not be able to release the first one's claim."""
+    create = app_client.post("/api/profiles", json={"name": "DoubleDelete"})
+    pid = create.json()["id"]
+
+    assert main.browser_mgr.claim_for_delete(pid) is True
+    try:
+        # a second delete arriving while the first is in flight
+        assert app_client.delete(f"/api/profiles/{pid}").status_code == 409
+        # and the first claim is still held, so launches stay blocked
+        assert app_client.post(f"/api/profiles/{pid}/launch").status_code == 409
+    finally:
+        main.browser_mgr.release_delete_claim(pid)
+
+    assert main.browser_mgr.claim_for_delete(pid) is True
+    main.browser_mgr.release_delete_claim(pid)
+
+
+def test_delete_refuses_while_a_previous_stop_is_still_wedged(app_client: TestClient):
+    """The round-4 guard only fired when the delete itself did the stop."""
+    create = app_client.post("/api/profiles", json={"name": "WedgedThenDelete"})
+    pid = create.json()["id"]
+
+    _wedge(pid)  # a previous /stop left Chromium alive
+    try:
+        assert app_client.delete(f"/api/profiles/{pid}").status_code == 409
+        assert app_client.post(f"/api/profiles/{pid}/launch").status_code == 409
+        assert app_client.get(f"/api/profiles/{pid}").status_code == 200
+    finally:
+        main.browser_mgr._closing.pop(pid, None)
+
+    assert app_client.delete(f"/api/profiles/{pid}").status_code == 200
+
+
+def test_manual_launch_has_a_server_side_deadline(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """A wedged launch must not hang the request and strand `_launching`."""
+    import asyncio as aio
+
+    create = app_client.post("/api/profiles", json={"name": "LaunchHang"})
+    pid = create.json()["id"]
+
+    async def never_returns(_profile):
+        await aio.sleep(3600)
+
+    monkeypatch.setattr(main.browser_mgr, "launch", never_returns)
+    monkeypatch.setattr(main, "LAUNCH_TIMEOUT_S", 0.05)
+    resp = app_client.post(f"/api/profiles/{pid}/launch")
+    assert resp.status_code == 504
+
+
+def test_delete_does_not_block_the_event_loop(app_client: TestClient, monkeypatch):
+    """rmtree of a large profile dir must not stall every other request."""
+    create = app_client.post("/api/profiles", json={"name": "BigDelete"})
+    body = create.json()
+    pid = body["id"]
+    # the dir only exists once the profile has been launched at least once
+    pathlib.Path(body["user_data_dir"]).mkdir(parents=True, exist_ok=True)
+
+    called: dict[str, object] = {}
+    real_rmtree = main.shutil.rmtree
+
+    def tracking_rmtree(path, **kw):
+        import asyncio as aio
+        # An executor thread has no running loop; the loop's own thread does.
+        # Thread NAMES prove nothing here — TestClient already runs the app off
+        # the main thread.
+        try:
+            aio.get_running_loop()
+            called["on_event_loop"] = True
+        except RuntimeError:
+            called["on_event_loop"] = False
+        return real_rmtree(path, **kw)
+
+    monkeypatch.setattr(main.shutil, "rmtree", tracking_rmtree)
+    assert app_client.delete(f"/api/profiles/{pid}").status_code == 200
+    assert called.get("on_event_loop") is False
+
+
+def test_status_endpoint_probes_off_the_event_loop(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """_browser_alive opens a TCP connection; GET /status must not do that on
+    the loop that also serves nginx's viewer auth_request subrequests."""
+    import asyncio as aio
+
+    create = app_client.post("/api/profiles", json={"name": "ProbeLoop"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    seen: dict[str, bool] = {}
+
+    def probing(_running):
+        try:
+            aio.get_running_loop()
+            seen["on_loop"] = True
+        except RuntimeError:
+            seen["on_loop"] = False
+        return True
+
+    monkeypatch.setattr(main.browser_mgr, "_browser_alive", probing)
+    try:
+        assert app_client.get(f"/api/profiles/{pid}/status").status_code == 200
+        assert seen.get("on_loop") is False
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── "stopping" lifecycle ─────────────────────────────────────────────────────
+
+
+def test_a_teardown_in_flight_tells_one_coherent_story(app_client: TestClient):
+    """One state, one answer, on every path.
+
+    A wedged teardown used to produce four mutually contradictory answers:
+    list/detail/status said "stopped", launch said "Profile is already
+    running", stop said 404 "Profile is not running", and only DELETE told the
+    truth. The UI rendered the grey dot and an enabled Launch button that was
+    guaranteed to 409.
+    """
+    create = app_client.post("/api/profiles", json={"name": "Wedged"})
+    pid = create.json()["id"]
+    _wedge(pid)
+    try:
+        assert app_client.get("/api/profiles").json()[0]["status"] == "stopping"
+        assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "stopping"
+        assert app_client.put(
+            f"/api/profiles/{pid}", json={"name": "Wedged"},
+        ).json()["status"] == "stopping"
+
+        status = app_client.get(f"/api/profiles/{pid}/status").json()
+        assert status["status"] == "stopping"
+        # nothing left to probe: same shape as "stopped"
+        assert status["xvnc_alive"] is None
+        assert status["browser_alive"] is None
+        assert status["vnc_ws_port"] is None
+        assert status["cdp_url"] is None
+
+        detail = "Browser is still shutting down; try again"
+        launch = app_client.post(f"/api/profiles/{pid}/launch")
+        assert launch.status_code == 409
+        assert launch.json()["detail"] == detail
+
+        stop = app_client.post(f"/api/profiles/{pid}/stop")
+        assert stop.status_code == 409
+        assert stop.json()["detail"] == detail
+
+        delete = app_client.delete(f"/api/profiles/{pid}")
+        assert delete.status_code == 409
+        assert delete.json()["detail"] == detail
+    finally:
+        main.browser_mgr._closing.pop(pid, None)
+
+    assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "stopped"
+
+
+def test_starting_wins_over_a_teardown_claim(app_client: TestClient):
+    """A launch holds a claim for its whole duration, so both can be true.
+
+    Every mutation path checks is_starting first and answers "Profile is
+    starting", so the status has to agree with the refusal the caller gets.
+    """
+    create = app_client.post("/api/profiles", json={"name": "Both"})
+    pid = create.json()["id"]
+    _wedge(pid)
+    main.browser_mgr._launching.add(pid)
+    try:
+        assert app_client.get(f"/api/profiles/{pid}/status").json()["status"] == "starting"
+        assert app_client.get(f"/api/profiles/{pid}").json()["status"] == "starting"
+        assert app_client.post(f"/api/profiles/{pid}/launch").json()["detail"] == (
+            "Profile is already starting"
+        )
+    finally:
+        main.browser_mgr._launching.discard(pid)
+        main.browser_mgr._closing.pop(pid, None)
+
+
+def test_the_status_endpoint_never_mutates_the_teardown_claim(app_client: TestClient):
+    """The 3s poll reaches get_status on an EXECUTOR thread.
+
+    A probing, mutating check there raced the loop's own writes to _closing:
+    a `del` raised KeyError when the close handler removed the entry first,
+    and a re-write resurrected a claim stop() had already released.
+    """
+    create = app_client.post("/api/profiles", json={"name": "PollWedged"})
+    pid = create.json()["id"]
+    claim = _wedge(pid)
+    try:
+        for _ in range(5):
+            assert app_client.get(
+                f"/api/profiles/{pid}/status",
+            ).json()["status"] == "stopping"
+        assert main.browser_mgr._closing[pid] is claim
+        assert claim.sigterm_at is None
+    finally:
+        main.browser_mgr._closing.pop(pid, None)
+
+
+def test_the_lifespan_sweeper_releases_a_claim_with_no_user_action(
+    tmp_db, monkeypatch: pytest.MonkeyPatch,
+):
+    """Nothing else opens the valve once the status path is a pure peek.
+
+    Without the sweeper the profile shows an orange "stopping" dot and a
+    DISABLED "Shutting down…" button indefinitely — so the user's only escape
+    is a control they cannot click.
+    """
+    import time as _t
+    from unittest.mock import AsyncMock as _AM
+
+    monkeypatch.setattr(bm, "CLAIM_SWEEP_INTERVAL_S", 0.01)
+    monkeypatch.setattr(main.browser_mgr, "cleanup_stale", _AM())
+    monkeypatch.setattr(main.browser_mgr, "cleanup_all", _AM())
+    monkeypatch.setattr(main.browser_mgr.vnc, "cleanup_stale", _AM())
+
+    with TestClient(main.app) as client:
+        pid = client.post("/api/profiles", json={"name": "Sweepable"}).json()["id"]
+        # a claim whose process is provably gone: same pid, different starttime
+        claim = _wedge(pid)
+        claim.proc = bm.BrowserProcess(
+            pid=claim.proc.pid, starttime=claim.proc.starttime + 1,
+            user_data_dir=claim.proc.user_data_dir, cdp_port=claim.proc.cdp_port,
+        )
+        assert client.get(f"/api/profiles/{pid}").json()["status"] == "stopping"
+
+        deadline = _t.monotonic() + 5
+        while _t.monotonic() < deadline:
+            if client.get(f"/api/profiles/{pid}").json()["status"] == "stopped":
+                break
+            _t.sleep(0.02)
+        assert client.get(f"/api/profiles/{pid}").json()["status"] == "stopped"
+        assert pid not in main.browser_mgr._closing
+
+
+# ── viewer token session identity ────────────────────────────────────────────
+
+
+def test_viewer_auth_rejects_a_token_from_a_previous_session_on_the_same_port(
+    app_client: TestClient,
+):
+    """allocate() gap-fills, so a relaunch reuses the identical ws_port.
+
+    The port comparison therefore can never fire for the case it was written
+    for; only a per-launch nonce can tell two sessions apart.
+    """
+    create = app_client.post("/api/profiles", json={"name": "EpochStale"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    token = main.viewer_tokens.issue(pid, 6100, session_epoch="epoch-1")
+
+    # relaunched: same display, same ws_port, new session
+    mock.session_epoch = "epoch-2"
+    try:
+        resp = app_client.get(
+            "/api/viewer-auth", headers={"X-Original-URI": f"/viewer/{token}/"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Viewer token is stale"
+    finally:
+        main.viewer_tokens.revoke_profile(pid)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_viewer_token_carries_the_running_session_epoch(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "EpochOk"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    try:
+        token = app_client.post(f"/api/profiles/{pid}/viewer-token").json()["token"]
+        assert main.viewer_tokens.validate(token).session_epoch == "epoch-under-test"
+    finally:
+        main.viewer_tokens.revoke_profile(pid)
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── AuthMiddleware robustness ────────────────────────────────────────────────
+
+
+def _auth_scope(header: bytes) -> dict:
+    return {"type": "http", "path": "/api/profiles", "headers": [(b"authorization", header)]}
+
+
+def test_a_non_ascii_authorization_header_is_unauthenticated_not_a_crash(monkeypatch):
+    """httpx refuses to send these, so this has to be asserted at the ASGI layer.
+
+    A bare latin-1 byte used to raise UnicodeDecodeError out of val.decode(),
+    and a well-formed non-ASCII token raised TypeError out of
+    hmac.compare_digest — both surfacing as an unauthenticated HTTP 500 with a
+    traceback, before any authentication decision.
+    """
+    monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
+    assert main._check_auth(_auth_scope(b"Bearer \xe9vil")) is False
+    assert main._check_auth(_auth_scope(b"Bearer \xc3\xa9vil")) is False
+    assert main._check_auth(_auth_scope(b"Bearer test-secret")) is True
+    assert main._check_auth(
+        {"type": "http", "path": "/api/profiles",
+         "headers": [(b"cookie", b"auth_token=\xe9vil")]},
+    ) is False
+
+
+# ── Per-profile capability URLs ──────────────────────────────────────────────
+
+_CAPABILITY_UUID = "308d4c96-cff6-468e-b0c2-93f388220aa4"
+
+
+@pytest.mark.parametrize("path", [
+    f"/api/profiles/{_CAPABILITY_UUID}",
+    f"/api/profiles/{_CAPABILITY_UUID}/cdp",
+    f"/api/profiles/{_CAPABILITY_UUID}/cdp/json/version",
+    f"/api/profiles/{_CAPABILITY_UUID}/cdp/devtools/page/ABC123",
+    f"/api/profiles/{_CAPABILITY_UUID.upper()}/status",
+])
+def test_per_profile_paths_carry_their_own_credential(path: str):
+    """The id authenticates the route, so no CDP client needs a bearer token.
+
+    A WebSocket handshake cannot carry an Authorization header from Playwright,
+    Puppeteer or chrome-remote-interface, so requiring one there means
+    requiring a patched client.
+    """
+    assert main._PROFILE_CAPABILITY_PATH.match(path) is not None
+
+
+@pytest.mark.parametrize("path", [
+    "/api/profiles",           # the listing this whole design exists to protect
+    "/api/profiles/",
+    "/api/profiles/../profiles",
+    "/api/profiles/not-a-uuid",
+    "/api/profiles/308d4c96",                              # truncated
+    f"/api/profiles/{_CAPABILITY_UUID}x",                  # trailing junk
+    f"/api/profiles/{_CAPABILITY_UUID[:-1]}",              # one char short
+    "/api/profiles/308d4c96_cff6_468e_b0c2_93f388220aa4",  # underscores
+    "/api/profiles/zzzzzzzz-cff6-468e-b0c2-93f388220aa4",  # non-hex
+])
+def test_enumeration_paths_are_never_treated_as_a_capability(path: str):
+    """Anything that is not one canonical uuid still needs the token.
+
+    The collection route is the enumeration the capability model depends on
+    keeping shut: with it open, one unauthenticated GET yields every id and
+    therefore every profile's CDP.
+    """
+    assert main._PROFILE_CAPABILITY_PATH.match(path) is None
+
+
+def test_capability_url_reaches_the_route_without_a_token(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """End to end through the middleware: not 401, i.e. the route ran."""
+    monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
+    resp = app_client.get(f"/api/profiles/{_CAPABILITY_UUID}")
+    assert resp.status_code != 401
+    assert resp.status_code == 404  # unknown id, but the handler decided that
+
+
+def test_listing_and_creating_profiles_still_demand_the_token(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """The two routes that would hand out ids stay closed."""
+    monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
+    assert app_client.get("/api/profiles").status_code == 401
+    assert app_client.post("/api/profiles", json={"name": "x"}).status_code == 401
+    # and still work with it
+    assert app_client.get(
+        "/api/profiles", headers={"Authorization": "Bearer test-secret"},
+    ).status_code == 200
+
+
+# ── Clipboard robustness ─────────────────────────────────────────────────────
+
+
+def test_get_clipboard_skips_a_wedged_page_instead_of_dying_on_it(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """page.evaluate has no timeout in playwright 1.60 and hangs forever.
+
+    One page running `while(true){}` used to kill this endpoint permanently
+    for that profile: the loop never reached the next page or the xclip
+    fallback, and uvicorn does not cancel a handler when the client gives up,
+    so every poll added another immortal task.
+    """
+    import asyncio as aio
+    import time as _t
+
+    monkeypatch.setattr(main, "_CLIPBOARD_PAGE_TIMEOUT_S", 0.05)
+
+    # Real coroutine functions, not AsyncMock: an AsyncMock side_effect that
+    # returns a coroutine hands it back as the RESULT, so nothing ever hangs
+    # and the test would pass against an unbounded evaluate.
+    async def wedged_evaluate(_js):
+        await aio.sleep(3600)
+
+    reached: list[str] = []
+
+    async def good_evaluate(_js):
+        reached.append(_js)
+        return "from the second tab"
+
+    wedged = MagicMock()
+    wedged.evaluate = wedged_evaluate
+    good = MagicMock()
+    good.evaluate = good_evaluate
+
+    create = app_client.post("/api/profiles", json={"name": "ClipWedged"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    mock.context = MagicMock()
+    mock.context.pages = [wedged, good]
+
+    try:
+        started = _t.monotonic()
+        resp = app_client.get(f"/api/profiles/{pid}/clipboard")
+        elapsed = _t.monotonic() - started
+        assert resp.status_code == 200
+        assert resp.json()["text"] == "from the second tab"
+        assert reached, "the wedged tab must be skipped, not fatal"
+        assert elapsed < 3.0
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_get_clipboard_caps_the_response_at_1mb(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ClipHuge"})
+    pid = create.json()["id"]
+    page = AsyncMock()
+    page.evaluate = AsyncMock(return_value="x" * (main._CLIPBOARD_MAX_READ + 500))
+    mock = _mock_running_profile(pid)
+    mock.context = MagicMock()
+    mock.context.pages = [page]
+    try:
+        resp = app_client.get(f"/api/profiles/{pid}/clipboard")
+        assert len(resp.json()["text"]) == main._CLIPBOARD_MAX_READ
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_clipboard_endpoints_degrade_when_xclip_is_missing(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """No xclip is the README's local-dev path; it must not be a 500."""
+    create = app_client.post("/api/profiles", json={"name": "NoXclip"})
+    pid = create.json()["id"]
+    mock = _mock_running_profile(pid)
+    mock.context = MagicMock()
+    mock.context.pages = []
+
+    async def missing(*_a, **_k):
+        raise FileNotFoundError(2, "No such file or directory", "xclip")
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", missing)
+    try:
+        assert app_client.get(f"/api/profiles/{pid}/clipboard").json() == {"text": ""}
+        post = app_client.post(f"/api/profiles/{pid}/clipboard", json={"text": "hi"})
+        assert post.status_code == 503
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+        main._xclip_procs.pop(100, None)
+        main._xclip_locks.pop(100, None)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_set_clipboard_leaves_no_orphan_xclip(
+    tmp_db, monkeypatch: pytest.MonkeyPatch,
+):
+    """Three pastes in the same millisecond used to orphan two xclips.
+
+    The pop/spawn/store sequence contains two awaits, so every caller popped
+    the same entry and only the last was tracked. The untracked ones owned the
+    X11 CLIPBOARD selection, were never killed, and outlived the request.
+    """
+    import asyncio as aio
+
+    spawned: list[MagicMock] = []
+
+    async def fake_exec(*_a, **_k):
+        await aio.sleep(0)                      # the real await points
+        proc = MagicMock()
+        proc.returncode = None
+        proc.stdin = MagicMock()
+        proc.stdin.drain = AsyncMock()
+
+        async def wait():
+            proc.returncode = -9
+        proc.wait = wait
+        proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
+    pid = "clip-race"
+    mock = MagicMock(spec=RunningProfile)
+    mock.display = 100
+    main.browser_mgr.running[pid] = mock
+    try:
+        await aio.gather(*(
+            main.set_clipboard(pid, main.ClipboardRequest(text=f"t{i}"))
+            for i in range(3)
+        ))
+        assert len(spawned) == 3
+        survivors = [p for p in spawned if p.returncode is None]
+        assert len(survivors) == 1
+        assert main._xclip_procs[100] is survivors[0]
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+        main._xclip_procs.pop(100, None)
+        main._xclip_locks.pop(100, None)
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_profile_reaps_its_xclip(monkeypatch: pytest.MonkeyPatch):
+    """An xclip must not outlive the X server it holds a selection on."""
+    mgr = bm.BrowserManager()
+    mgr.add_display_released_hook(main._reap_xclip_for_display)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.kill = MagicMock(side_effect=lambda: setattr(proc, "returncode", -9))
+    main._xclip_procs[100] = proc
+
+    context = MagicMock()
+    context.is_closed.return_value = False
+    context.close = AsyncMock()
+    mgr.running["p1"] = bm.RunningProfile(
+        profile_id="p1", context=context, display=100, ws_port=6100, cdp_port=5100,
+    )
+    monkeypatch.setattr(mgr.vnc, "stop_vnc", AsyncMock())
+    try:
+        await mgr.stop("p1")
+        proc.kill.assert_called_once()
+        assert 100 not in main._xclip_procs
+    finally:
+        main._xclip_procs.pop(100, None)
+
+
+# ── CDP WebSocket proxy data plane ───────────────────────────────────────────
+
+
+class _FakeCdpSocket:
+    """Minimal stand-in for the `websockets` client connection."""
+
+    def __init__(self):
+        import asyncio as aio
+
+        self.received: list[object] = []
+        self.outbound: aio.Queue = aio.Queue()
+        self.closed = False
+
+    async def send(self, message):
+        self.received.append(message)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        message = await self.outbound.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        self.closed = True
+        return False
+
+
+def test_cdp_proxy_forwards_frames_in_both_directions(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """Dropping ALL client->CDP forwarding used to leave the suite green.
+
+    README documents /api/profiles/<id>/cdp as a public integration surface;
+    a broken pump makes connect_over_cdp() hang at the handshake with no
+    server-side error.
+    """
+    import types
+
+    create = app_client.post("/api/profiles", json={"name": "CdpPump"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    fake = _FakeCdpSocket()
+    fake_module = types.SimpleNamespace(connect=lambda *_a, **_k: fake)
+    monkeypatch.setitem(__import__("sys").modules, "websockets", fake_module)
+
+    version = MagicMock()
+    version.json.return_value = {"webSocketDebuggerUrl": "ws://127.0.0.1:5100/devtools/browser/x"}
+    client = MagicMock()
+    client.get = AsyncMock(return_value=version)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(main.httpx, "AsyncClient", lambda *a, **k: client)
+
+    try:
+        with app_client.websocket_connect(f"/api/profiles/{pid}/cdp") as ws:
+            ws.send_text('{"id":1,"method":"Target.getTargets"}')
+            fake.outbound.put_nowait('{"id":1,"result":{}}')
+            assert ws.receive_text() == '{"id":1,"result":{}}'
+        assert '{"id":1,"method":"Target.getTargets"}' in fake.received
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_page_proxy_targets_the_requested_devtools_path(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    import types
+
+    create = app_client.post("/api/profiles", json={"name": "CdpPage"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+
+    fake = _FakeCdpSocket()
+    urls: list[str] = []
+
+    def connect(url, **_k):
+        urls.append(url)
+        return fake
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "websockets", types.SimpleNamespace(connect=connect),
+    )
+    try:
+        with app_client.websocket_connect(
+            f"/api/profiles/{pid}/cdp/devtools/page/ABC",
+        ) as ws:
+            ws.send_bytes(b"\x01\x02")
+            fake.outbound.put_nowait(b"\x03")
+            assert ws.receive_bytes() == b"\x03"
+        assert urls == ["ws://127.0.0.1:5100/devtools/page/ABC"]
+        assert b"\x01\x02" in fake.received
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── Headless profiles have no display, no Xvnc and no viewer ─────────────────
+
+
+def _mock_headless_running_profile(pid: str) -> MagicMock:
+    """A running headless profile: no display, no ws_port."""
+    mock = _mock_running_profile(pid)
+    mock.display = None
+    mock.ws_port = None
+    # spec=RunningProfile does not expose dataclass fields that have no
+    # class-level default, so `context` has to be attached by hand.
+    mock.context = MagicMock()
+    return mock
+
+
+def test_headless_profile_reports_no_display_or_vnc_port(app_client: TestClient):
+    """A headless profile has no X server, so it must not advertise one.
+
+    Reporting a display it does not own is what made the UI offer a viewer
+    affordance onto an empty root window.
+    """
+    create = app_client.post(
+        "/api/profiles", json={"name": "Headless", "headless": True},
+    )
+    pid = create.json()["id"]
+    _mock_headless_running_profile(pid)
+    try:
+        body = app_client.get(f"/api/profiles/{pid}/status").json()
+        assert body["status"] == "running"
+        assert body["display"] is None
+        assert body["vnc_ws_port"] is None
+        assert body["xvnc_alive"] is None      # nothing to be alive
+        listed = app_client.get("/api/profiles").json()
+        entry = next(p for p in listed if p["id"] == pid)
+        assert entry["status"] == "running"
+        assert entry["vnc_ws_port"] is None
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_headless_profile_refuses_a_viewer_token(app_client: TestClient):
+    """409, not 404: the profile IS running, it just cannot be viewed.
+
+    404 routes the viewer's state machine to endSession("Browser session
+    ended"), which claims the browser died when it is running perfectly well.
+    """
+    create = app_client.post(
+        "/api/profiles", json={"name": "HeadlessTok", "headless": True},
+    )
+    pid = create.json()["id"]
+    _mock_headless_running_profile(pid)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/viewer-token")
+        assert resp.status_code == 409
+        assert "headless" in resp.json()["detail"].lower()
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_headless_profile_refuses_the_x_clipboard(app_client: TestClient):
+    """No X server means no X clipboard; ":None" as a DISPLAY is not an answer."""
+    create = app_client.post(
+        "/api/profiles", json={"name": "HeadlessClip", "headless": True},
+    )
+    pid = create.json()["id"]
+    _mock_headless_running_profile(pid)
+    try:
+        resp = app_client.post(
+            f"/api/profiles/{pid}/clipboard", json={"text": "hello"},
+        )
+        assert resp.status_code == 409
+        # The read side degrades instead of erroring: the Playwright leg is
+        # still valid headless, only the xclip fallback is unreachable.
+        mock = main.browser_mgr.running[pid]
+        mock.context.pages = []
+        assert app_client.get(f"/api/profiles/{pid}/clipboard").json() == {"text": ""}
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_headless_launch_returns_200_with_null_display(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """LaunchResponse must accept the nulls a headless launch produces.
+
+    vnc_ws_port and display were non-nullable, so a headless launch raised
+    ResponseValidationError AFTER the browser had already started: the caller
+    saw 500 for an operation that succeeded, and the retry then answered 409.
+    """
+    create = app_client.post(
+        "/api/profiles", json={"name": "HeadlessLaunch", "headless": True},
+    )
+    pid = create.json()["id"]
+
+    async def fake_launch(_profile):
+        return _mock_headless_running_profile(pid)
+
+    monkeypatch.setattr(main.browser_mgr, "launch", fake_launch)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/launch")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "running"
+        assert body["vnc_ws_port"] is None
+        assert body["display"] is None
+        assert body["cdp_url"] == f"/api/profiles/{pid}/cdp"
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+# ── SPA catch-all containment ────────────────────────────────────────────────
+
+
+def test_spa_serves_a_real_asset(tmp_path: pathlib.Path):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    asset = dist / "assets" / "main.js"
+    asset.write_text("console.log(1)")
+    assert main._resolve_spa_file(dist, "assets/main.js") == asset.resolve()
+
+
+def test_spa_refuses_to_escape_the_build_directory(tmp_path: pathlib.Path):
+    """`base / full_path` discards the base when full_path is absolute.
+
+    The catch-all is not behind the auth middleware (that gates only /api/*),
+    and nginx forwards a percent-encoded %2f without decoding it, so an
+    unauthenticated GET /%2fdata/profiles.db arrived here as "/data/profiles.db"
+    and returned the SQLite profile database.
+
+    Every attack below targets a file that REALLY EXISTS, created here rather
+    than assumed present on the host — otherwise the vulnerable implementation
+    also returns None (via is_file()) and the test passes for the wrong reason.
+    """
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html></html>")
+    secret = tmp_path / "profiles.db"
+    secret.write_text("SQLite format 3\x00")
+
+    # absolute — the case Path.__truediv__ silently swallows
+    assert main._resolve_spa_file(dist, str(secret)) is None
+    # traversal to the same real file, relative to the build dir
+    assert main._resolve_spa_file(dist, "../profiles.db") is None
+    assert main._resolve_spa_file(dist, "a/../../profiles.db") is None
+    assert main._resolve_spa_file(dist, "..") is None
+    # and the containment rule holds for a genuine absolute system path
+    assert main._resolve_spa_file(dist, "/etc/passwd") is None
+
+
+def test_spa_refuses_a_symlink_pointing_outside_the_build(tmp_path: pathlib.Path):
+    """resolve() follows links, so a link planted in the build cannot escape."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("nope")
+    (dist / "leak").symlink_to(secret)
+    assert main._resolve_spa_file(dist, "leak") is None
+
+
+def test_spa_falls_through_to_index_for_client_routes(tmp_path: pathlib.Path):
+    """A real SPA route is not a file, and must not 404."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html></html>")
+    assert main._resolve_spa_file(dist, "profiles/abc") is None
+    assert main._resolve_spa_file(dist, "") is None
+
+
+# ── Cookie warmup ────────────────────────────────────────────────────────────
+# cookie_warmup.run() itself is exercised directly (with a fake context and a
+# monkeypatched-down duration) in test_cookie_warmup.py — these tests only
+# check the HTTP wiring, so `cookie_warmup.run` is patched out here to a
+# controllable stand-in rather than run for real against a mocked context.
+
+
+def _mock_running_profile_with_context() -> MagicMock:
+    mock_context = MagicMock()
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.context = mock_context
+    return mock_running
+
+
+def test_start_cookie_warmup_requires_a_running_profile(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "WarmupNotRunning"})
+    pid = create.json()["id"]
+    resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+    assert resp.status_code == 404
+
+
+def test_start_cookie_warmup_unknown_profile_is_404(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/cookie-warmup/start")
+    assert resp.status_code == 404
+
+
+def test_start_cookie_warmup_returns_idle_state_immediately(app_client: TestClient):
+    """asyncio.create_task schedules the run, it does not execute it inline —
+    the response reflects new_status()'s starting point, not a completed run,
+    regardless of how fast the (here, patched-out) run() itself finishes."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupStart"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+    try:
+        with patch.object(main.cookie_warmup, "run", new=AsyncMock(return_value=None)):
+            resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["state"] == "idle"
+        assert body["sites_visited"] == 0
+        assert body["sites_total"] == len(cookie_warmup.WARMUP_SITES)
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_start_cookie_warmup_conflicts_when_already_running(app_client: TestClient):
+    """A not-yet-done task recorded for this profile is enough to conflict —
+    no need to race a real warmup run to exercise this check."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupConflict"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+    fake_in_flight_task = MagicMock()
+    fake_in_flight_task.done.return_value = False
+    main._warmup_tasks[pid] = fake_in_flight_task
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+        assert resp.status_code == 409
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_cookie_warmup_status_unknown_profile_is_404(app_client: TestClient):
+    resp = app_client.get("/api/profiles/nonexistent/cookie-warmup/status")
+    assert resp.status_code == 404
+
+
+def test_cookie_warmup_status_defaults_to_idle_before_ever_starting(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "WarmupIdle"})
+    pid = create.json()["id"]
+    resp = app_client.get(f"/api/profiles/{pid}/cookie-warmup/status")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "idle"
+
+
+def test_cookie_warmup_status_reports_a_completed_run(app_client: TestClient):
+    """The task scheduled by /start is fire-and-forget, so this polls briefly
+    for it to actually run rather than assuming it beat the next request —
+    real work here is a MagicMock context and no real awaits, so it settles
+    within one or two event-loop turns in practice."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupDone"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+
+    async def _finish_immediately(context, status, is_still_running):
+        status.state = "running"
+        status.sites_visited = len(cookie_warmup.WARMUP_SITES)
+        status.state = "done"
+
+    try:
+        with patch.object(main.cookie_warmup, "run", new=AsyncMock(side_effect=_finish_immediately)):
+            app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+            body = {}
+            for _ in range(20):
+                body = app_client.get(f"/api/profiles/{pid}/cookie-warmup/status").json()
+                if body["state"] == "done":
+                    break
+                time.sleep(0.01)
+        assert body["state"] == "done"
+        assert body["sites_visited"] == len(cookie_warmup.WARMUP_SITES)
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_stop_cookie_warmup_with_none_running_is_404(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "WarmupStopNone"})
+    pid = create.json()["id"]
+    resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/stop")
+    assert resp.status_code == 404
+
+
+async def _never_finishes(context, status, is_still_running):
+    await asyncio.Event().wait()  # only ends via cancellation
+
+
+def test_stop_cookie_warmup_cancels_the_in_flight_task(app_client: TestClient):
+    """/stop awaits the cancelled task as part of its own request handling,
+    so the task is guaranteed done by the time this response comes back —
+    no polling needed, unlike the "did it finish on its own" test above."""
+    create = app_client.post("/api/profiles", json={"name": "WarmupStop"})
+    pid = create.json()["id"]
+    main.browser_mgr.running[pid] = _mock_running_profile_with_context()
+    try:
+        with patch.object(main.cookie_warmup, "run", new=AsyncMock(side_effect=_never_finishes)):
+            app_client.post(f"/api/profiles/{pid}/cookie-warmup/start")
+            resp = app_client.post(f"/api/profiles/{pid}/cookie-warmup/stop")
+        assert resp.status_code == 200
+        assert main._warmup_tasks[pid].done()
+    finally:
+        main._warmup_tasks.pop(pid, None)
+        main._warmup_status.pop(pid, None)
+        main.browser_mgr.running.pop(pid, None)

@@ -1,0 +1,84 @@
+# NVIDIA GPU overlay — opt in on a host with an NVIDIA GPU and the NVIDIA
+# container toolkit installed.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d --build
+#
+# What this buys, and what it does not:
+#
+#   KasmVNC NVENC encode  — YES. Xvnc encodes the framebuffer on the GPU
+#     (h264_nvenc). This is the win, and it is why KASM_ENCODING_POLICY defaults
+#     to `video` here: under the repo-wide default of `server-authoritative`
+#     Xvnc is started with -IgnoreClientSettingsKasm, which makes -videoCodec
+#     structurally unreachable, so no codec — hardware or software — is ever
+#     negotiated. Read the KASM_ENCODING_POLICY notes in backend/vnc_manager.py
+#     before changing it: the trade is that the client, not the server, then
+#     owns the quality settings.
+#
+#   Chromium GPU         — see CHROME_GPU_ACCEL in the README. The browser draws
+#     into KasmVNC's Xvnc, which is a virtual X server with no NVIDIA GLX and no
+#     DRI3 on the closed driver, so what is accelerated is the ANGLE/EGL path
+#     rather than X11 presentation.
+#
+#   KasmVNC -hw3d        — NO, and deliberately. -hw3d is DRI3 screen capture,
+#     which the closed NVIDIA driver does not implement; _hw3d_flags() detects
+#     the nvidia driver on the render node and stays on software capture. That
+#     detection is a hard requirement, not a nicety: xvnc_init_dri3() calls
+#     FatalError() when DRI3 init fails, so forcing it (KASM_HW3D=1) makes Xvnc
+#     die at startup and every POST /launch answer 500. NVENC is independent of
+#     it — encode runs through CUDA, not DRI3, and needs no -hw3d/-drinode.
+#
+# No `devices:` mapping for /dev/dri. The NVIDIA runtime already injects the
+# render node along with the driver libraries (verified: card1 + renderD128 are
+# present inside the container with `--gpus all` and no device mapping), and a
+# hardcoded mapping is exactly what breaks container creation on hosts where the
+# path is absent.
+services:
+  # Builds ./Dockerfile so Dockerfile.nvidia can layer on it via
+  # additional_contexts below. Referencing it as a build context is what makes a
+  # single `--build` produce both images, in the right order, from one recipe.
+  #
+  # `replicas: 0` is what keeps it out of `up` — it is a build input, not a
+  # service to run. NOT `profiles:`, which reads like the obvious answer and is
+  # wrong: a profile removes the service from the resolved model entirely, so
+  # `additional_contexts: service:manager-base` below then fails config with
+  # "declares unknown service manager-base as additional contexts base".
+  manager-base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cloakbrowser-manager-base:latest
+    deploy:
+      replicas: 0
+
+  manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+      additional_contexts:
+        base: "service:manager-base"
+    # `deploy.resources` is the portable spelling and is honoured by
+    # `docker compose up` (it is not Swarm-only), equivalent to `--gpus all`.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility, graphics]
+    environment:
+      # Without this the codec below is never negotiated at all — see above.
+      - KASM_ENCODING_POLICY=${KASM_ENCODING_POLICY:-video}
+      # h264_nvenc is the safe default across NVIDIA generations; the trailing
+      # h264 is an availability fallback, so a host that cannot open NVENC gets
+      # software H.264 rather than dropping out of video mode to JPEG/WebP
+      # entirely. It is NOT a preference order — KasmVNC filters its own
+      # hardcoded candidate order by this set, so NVENC still wins wherever it
+      # opens. hevc_nvenc also probes fine on Ampere; av1_nvenc parses but needs
+      # Ada or newer and otherwise probes out to "capability: none" (measured on
+      # an RTX 3080 Ti: "Provided device doesn't support required NVENC
+      # features"). To pin H.265 pass h265_nvenc alone.
+      - KASM_VIDEO_CODEC=${KASM_VIDEO_CODEC:-h264_nvenc,h264}
+      # Chromium NVIDIA acceleration; `auto` engages it only when an NVIDIA
+      # device node is actually present, so this overlay is still safe to leave
+      # in place on a host whose GPU has been removed.
+      - CHROME_GPU_ACCEL=${CHROME_GPU_ACCEL:-auto}

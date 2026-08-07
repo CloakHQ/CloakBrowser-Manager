@@ -13,6 +13,7 @@ from backend.models import (
     StatusResponse,
     TagCreate,
     TagResponse,
+    ViewerTokenResponse,
 )
 
 
@@ -175,6 +176,28 @@ def test_profile_status_response_cdp_url_stopped():
     assert r.cdp_url is None
 
 
+def test_profile_status_response_alive_defaults_null():
+    r = ProfileStatusResponse(status="stopped")
+    assert r.xvnc_alive is None
+    assert r.browser_alive is None
+
+
+def test_profile_status_response_alive_fields():
+    r = ProfileStatusResponse(status="running", xvnc_alive=True, browser_alive=False)
+    assert r.xvnc_alive is True
+    assert r.browser_alive is False
+
+
+# ── ViewerTokenResponse ──────────────────────────────────────────────────────
+
+
+def test_viewer_token_response():
+    r = ViewerTokenResponse(token="abc123", viewer_url="/viewer/abc123/", expires_in=300)
+    assert r.token == "abc123"
+    assert r.viewer_url == "/viewer/abc123/"
+    assert r.expires_in == 300
+
+
 # ── ProfileResponse ────────────────────────────────────────────────────────
 
 
@@ -195,3 +218,46 @@ def test_profile_response_cdp_url_default_none():
         created_at="2026-01-01T00:00:00", updated_at="2026-01-01T00:00:00",
     )
     assert r.cdp_url is None
+
+
+# ── lifecycle contract ───────────────────────────────────────────────────────
+
+
+def test_the_lifecycle_literal_is_exactly_the_frontends_four_values():
+    """This set is a cross-language contract with api.ts's PROFILE_LIFECYCLES.
+
+    A value added on one side only is invisible until runtime: the backend
+    would emit a string the viewer's classify() has never heard of, and the
+    UI would fall through to whatever its default branch happens to be.
+    """
+    import typing
+
+    from backend.models import ProfileLifecycleT
+
+    assert set(typing.get_args(ProfileLifecycleT)) == {
+        "running", "starting", "stopping", "stopped",
+    }
+
+
+@pytest.mark.parametrize("status", ["running", "starting", "stopping", "stopped"])
+def test_status_responses_accept_every_lifecycle_value(status: str):
+    assert ProfileStatusResponse(status=status).status == status
+    assert ProfileResponse(
+        id="abc", name="Test", fingerprint_seed=1,
+        user_data_dir="/data/profiles/abc",
+        created_at="2026-01-01T00:00:00", updated_at="2026-01-01T00:00:00",
+        status=status,
+    ).status == status
+
+
+def test_an_unknown_lifecycle_value_is_rejected_rather_than_leaked():
+    """A typo must fail here, not at the viewer's state machine."""
+    with pytest.raises(ValidationError):
+        ProfileStatusResponse(status="closing")
+    with pytest.raises(ValidationError):
+        ProfileResponse(
+            id="abc", name="Test", fingerprint_seed=1,
+            user_data_dir="/data/profiles/abc",
+            created_at="2026-01-01T00:00:00", updated_at="2026-01-01T00:00:00",
+            status="closing",
+        )

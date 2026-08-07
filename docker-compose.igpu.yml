@@ -1,0 +1,87 @@
+# Integrated-GPU overlay — Intel or AMD, on any host that has a /dev/dri render
+# node driven by the open-source stack.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.igpu.yml up -d --build
+#
+# What this buys, and what it does not:
+#
+#   KasmVNC VAAPI encode — YES. Xvnc encodes the framebuffer on the GPU
+#     (h264_vaapi). This is the win, and it is why KASM_ENCODING_POLICY defaults
+#     to `video` here: under the repo-wide default of `server-authoritative`
+#     Xvnc is started with -IgnoreClientSettingsKasm, which makes -videoCodec
+#     structurally unreachable, so no codec — hardware or software — is ever
+#     negotiated. Read the KASM_ENCODING_POLICY notes in backend/vnc_manager.py
+#     before changing it: the trade is that the client, not the server, then
+#     owns the quality settings.
+#
+#   KasmVNC -hw3d        — YES, and this is the difference from the NVIDIA path.
+#     DRI3 screen capture is implemented by the open-source drivers, so
+#     _hw3d_flags() enables it automatically on any render node whose driver is
+#     not `nvidia`. Nothing to configure; KASM_HW3D=0 turns it off.
+#
+#   Chromium GPU         — YES, through Mesa, on ANGLE's Vulkan backend (radv or
+#     anv). Measured on an AMD Raphael iGPU: vulkan gives webgl=enabled +
+#     gpu_compositing=enabled, while the more obvious gl-egl reaches radeonsi and
+#     then composites every frame back through the CPU
+#     (gpu_compositing=disabled_software). Host-specific and silent when wrong, so
+#     it stays a knob: CHROME_ANGLE_BACKEND, and
+#     `gpu_probe.py --vendor igpu --angle-backend <name>` settles it.
+#
+#   Chromium video decode — no. Left alone deliberately: VA-API decode in
+#     Chromium wants to import the decoded frame for compositing, and how well
+#     that works through a virtual X server varies enough that enabling it by
+#     default would trade working playback for a benchmark.
+#
+# Unlike docker-compose.nvidia.yml there is no `deploy.resources.devices`
+# reservation and nothing is injected at run time: the whole Mesa userspace is
+# baked into Dockerfile.igpu and reaches the GPU through the mapped render node.
+# Docker hard-fails container creation when a `devices:` source path is missing,
+# which is why this mapping lives in an overlay rather than the default file.
+services:
+  # Builds ./Dockerfile so Dockerfile.igpu can layer on it via
+  # additional_contexts below. Referencing it as a build context is what makes a
+  # single `--build` produce both images, in the right order, from one recipe.
+  #
+  # `replicas: 0` is what keeps it out of `up` — it is a build input, not a
+  # service to run. NOT `profiles:`, which reads like the obvious answer and is
+  # wrong: a profile removes the service from the resolved model entirely, so
+  # `additional_contexts: service:manager-base` below then fails config with
+  # "declares unknown service manager-base as additional contexts base".
+  manager-base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cloakbrowser-manager-base:latest
+    deploy:
+      replicas: 0
+
+  manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.igpu
+      additional_contexts:
+        base: "service:manager-base"
+    devices:
+      - "/dev/dri:/dev/dri"
+    environment:
+      # Without this the codec below is never negotiated at all — see above.
+      - KASM_ENCODING_POLICY=${KASM_ENCODING_POLICY:-video}
+      # h264_vaapi is the one hardware encoder that essentially every Intel and
+      # AMD iGPU with an encode block implements (check yours with `vainfo`: it
+      # needs VAProfileH264* / VAEntrypointEncSlice). The trailing h264 is an
+      # availability fallback, so a host whose VAAPI encoder will not open gets
+      # software H.264 rather than dropping out of video mode to JPEG/WebP
+      # entirely. It is NOT a preference order — KasmVNC filters its own
+      # hardcoded candidate order by this set, so VAAPI still wins wherever it
+      # opens. To pin H.265 (fewer bits, and a decode path some browsers gate
+      # behind hardware support) pass h265_vaapi alone. av1_vaapi needs an
+      # AV1-encode-capable block: Intel Arc/Meteor Lake or AMD RDNA3 and newer —
+      # Raphael/Mendocino-class iGPUs decode AV1 but do not encode it.
+      - KASM_VIDEO_CODEC=${KASM_VIDEO_CODEC:-h264_vaapi,h264}
+      # `auto` resolves to the Mesa path when a non-nvidia render node is
+      # present, so this overlay stays correct on a host whose GPU is later
+      # removed — it degrades to SwiftShader instead of failing.
+      - CHROME_GPU_ACCEL=${CHROME_GPU_ACCEL:-auto}
+      # Which ANGLE backend binds hardware is per-host. Left at the backend's
+      # default (gl-egl) unless set; `vulkan` and `gl` are the alternatives.
+      - CHROME_ANGLE_BACKEND

@@ -1,0 +1,23 @@
+# Cloudflare Tunnel sidecar for the Manager.
+#
+# A thin wrapper around the official binary rather than the official IMAGE,
+# because cloudflare/cloudflared is distroless: it has no shell, so the
+# token-vs-quick-tunnel decision cannot be made in a compose `command:` and has
+# to live in a script that needs an interpreter to run. The binary itself is
+# copied straight from the upstream image, so this is still the vendor build —
+# only the process that chooses its arguments is ours.
+FROM debian:trixie-slim
+
+# cloudflared dials the Cloudflare edge over TLS and verifies it; without a
+# trust store every connection fails with an opaque x509 error.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=cloudflare/cloudflared:latest \
+     /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+
+COPY docker/tunnel-entrypoint.sh /tunnel-entrypoint.sh
+RUN chmod +x /tunnel-entrypoint.sh
+
+ENTRYPOINT ["/tunnel-entrypoint.sh"]

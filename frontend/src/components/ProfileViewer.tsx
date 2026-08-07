@@ -1,206 +1,155 @@
 import { useEffect, useRef, useState } from "react";
-import { ClipboardCopy, Code2, Maximize2, Minimize2 } from "lucide-react";
-import { api } from "../lib/api";
+import {
+  ClipboardCopy,
+  Code2,
+  ExternalLink,
+  Maximize2,
+  Minimize2,
+  MonitorOff,
+  RefreshCw,
+  WifiOff,
+} from "lucide-react";
+import { useViewerSession, type ViewerState } from "../hooks/useViewerSession";
 
 interface ProfileViewerProps {
   profileId: string;
   cdpUrl: string | null;
   clipboardSync: boolean;
-  onDisconnect: () => void;
+  /** Terminal only: the browser session really ended (not a transient drop). */
+  onSessionEnded: () => void;
 }
 
-// X11 keysym for V key (Ctrl is already held in VNC by the time we intercept)
-const XK_v = 0x0076;
+/**
+ * How often the last frame is copied out of the client while connected.
+ *
+ * It has to be periodic: the embedded client destroys its framebuffer canvas
+ * on disconnect, so by the time we learn the connection dropped there is
+ * nothing left to copy. 2s keeps the frozen frame recent enough to read while
+ * costing one downscaled drawImage — the source is already a GPU texture and
+ * the destination is <=640px wide, so no pixels are ever read back.
+ */
+const LAST_FRAME_SNAPSHOT_MS = 2_000;
+/** The overlay dims it anyway; full resolution buys nothing. */
+const SNAPSHOT_MAX_WIDTH = 640;
 
-export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboardSync, onDisconnect }: ProfileViewerProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const rfbRef = useRef<any>(null);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+/**
+ * The client's framebuffer canvas inside the iframe document, if we can see it.
+ *
+ * KasmVNC 1.5.0 (ui-BOjwDkC7.js) builds six canvases and only one is the
+ * framebuffer: the Display constructor does `_screen.appendChild(this._canvas)`
+ * after setting `margin:auto`. The others are excluded by construction rather
+ * than by name, because the bundle is minified and its class names are not a
+ * stable contract:
+ *   - the backbuffer and the WebGL surface are never appended, so
+ *     querySelectorAll — which only walks the document tree — never
+ *     returns them in the first place
+ *   - the cursor canvas is `visibility:hidden`  -> computed style
+ *   - the watermark canvas starts 0x0, as does the framebuffer
+ *     before its first frame                    -> zero area
+ * Whatever is left with the largest bitmap is the screen.
+ */
+export function pickFramebufferCanvas(doc: Document | null): HTMLCanvasElement | null {
+  if (!doc) return null;
+  let best: HTMLCanvasElement | null = null;
+  for (const canvas of Array.from(doc.querySelectorAll("canvas"))) {
+    if (canvas.width === 0 || canvas.height === 0) continue;
+    const style = doc.defaultView?.getComputedStyle(canvas);
+    if (style && (style.visibility === "hidden" || style.display === "none")) continue;
+    if (best === null || canvas.width * canvas.height > best.width * best.height) {
+      best = canvas;
+    }
+  }
+  return best;
+}
+
+/**
+ * Copy the client's current frame into our own canvas. Returns whether it
+ * produced an image.
+ *
+ * Never reads pixels back. Drawing a tainted canvas taints the destination but
+ * does not throw, whereas toDataURL/getImageData on one would — so keeping the
+ * result as a canvas rather than a data URL is what makes this safe regardless
+ * of how the client sourced its frames.
+ */
+export function captureLastFrame(
+  iframe: HTMLIFrameElement | null,
+  dest: HTMLCanvasElement | null,
+): boolean {
+  if (!iframe || !dest) return false;
+  let doc: Document | null = null;
+  try {
+    doc = iframe.contentDocument;
+  } catch {
+    return false; // not same-origin; nothing to read
+  }
+  const source = pickFramebufferCanvas(doc);
+  if (!source) return false;
+  const ctx = dest.getContext("2d");
+  if (!ctx) return false;
+  const scale = Math.min(1, SNAPSHOT_MAX_WIDTH / source.width);
+  dest.width = Math.max(1, Math.round(source.width * scale));
+  dest.height = Math.max(1, Math.round(source.height * scale));
+  try {
+    ctx.drawImage(source, 0, 0, dest.width, dest.height);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+const STATUS_META: Record<ViewerState, { dot: string; label: string }> = {
+  idle: { dot: "bg-yellow-400 animate-pulse", label: "Connecting..." },
+  connecting: { dot: "bg-yellow-400 animate-pulse", label: "Connecting..." },
+  connected: { dot: "bg-emerald-400", label: "Connected" },
+  reconnecting: { dot: "bg-yellow-400 animate-pulse", label: "Reconnecting..." },
+  "session-ended": { dot: "bg-red-400", label: "Session ended" },
+  fatal: { dot: "bg-red-400", label: "Connection failed" },
+};
+
+export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboardSync, onSessionEnded }: ProfileViewerProps) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const snapshotRef = useRef<HTMLCanvasElement>(null);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [clipboardSync, setClipboardSync] = useState(initialClipboardSync);
   const [cdpCopied, setCdpCopied] = useState(false);
 
+  const session = useViewerSession({ profileId, clipboardSync });
+
+  // 1s ticker so the "next retry in Ns" countdown stays fresh
+  const [, setTick] = useState(0);
   useEffect(() => {
-    let rfb: any = null;
-    let cancelled = false;
+    if (session.state !== "reconnecting" || session.nextRetryAt === null) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [session.state, session.nextRetryAt]);
 
-    async function connect() {
-      try {
-        // Import noVNC dynamically
-        const { default: RFB } = await import("@novnc/novnc/core/rfb.js");
+  const retryInSeconds =
+    session.nextRetryAt !== null
+      ? Math.max(0, Math.ceil((session.nextRetryAt - Date.now()) / 1000))
+      : null;
 
-        if (cancelled) return;
-
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/api/profiles/${profileId}/vnc`;
-
-        rfb = new RFB(containerRef.current!, wsUrl, {
-          wsProtocols: ["binary"],
-        });
-        rfbRef.current = rfb;
-
-        rfb.scaleViewport = true;
-        rfb.resizeSession = false;
-        rfb.showDotCursor = true;
-
-        rfb.addEventListener("connect", () => {
-          if (!cancelled) setConnected(true);
-        });
-
-        rfb.addEventListener("disconnect", () => {
-          if (!cancelled) {
-            setConnected(false);
-            onDisconnect();
-          }
-        });
-
-        rfb.addEventListener("securityfailure", (e: any) => {
-          setError(`Security failure: ${e.detail.reason}`);
-        });
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to connect");
-        }
-      }
-    }
-
-    connect();
-
-    return () => {
-      cancelled = true;
-      if (rfb) {
-        try {
-          rfb.disconnect();
-        } catch (err) {
-          console.debug("[vnc] disconnect cleanup failed:", err);
-        }
-      }
-      rfbRef.current = null;
-    };
-  }, [profileId, onDisconnect]);
-
-  // Host→VNC: intercept Ctrl+V/Cmd+V at keydown (capture phase)
-  // Must fire BEFORE noVNC's canvas listener to prevent the race condition
+  // Keep a recent copy of the frame while the connection is up, so the
+  // reconnect overlay has something to dim. Only while connected AND visible:
+  // a hidden tab is not drawing anything new, so the copies would be identical.
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !clipboardSync || !connected) return;
-
-    const handleKeyDown = async (e: KeyboardEvent) => {
-      console.log("[clipboard] keydown:", e.key, "ctrl:", e.ctrlKey, "meta:", e.metaKey, "clipboardSync:", true);
-
-      const isPaste =
-        e.key === "v" && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
-      if (!isPaste) return;
-
-      console.log("[clipboard] intercepted Ctrl+V");
-
-      // Block noVNC from sending the keystroke before clipboard is updated
-      e.stopPropagation();
-      e.preventDefault();
-
-      const rfb = rfbRef.current;
-      if (!rfb) {
-        console.log("[clipboard] no rfb ref, aborting");
-        return;
-      }
-
-      try {
-        const text = await navigator.clipboard.readText();
-        console.log("[clipboard] host clipboard text:", text?.substring(0, 50), "len:", text?.length);
-        if (text) {
-          console.log("[clipboard] calling setClipboard API...");
-          await api.setClipboard(profileId, text);
-          console.log("[clipboard] setClipboard API success");
-        }
-      } catch (err) {
-        console.warn("[clipboard] error:", err);
-        setClipboardSync(false);
-        return;
-      }
-
-      // Send full Ctrl+V sequence to VNC. We can't rely on Ctrl still being
-      // held because the user may have released it during the async API call.
-      console.log("[clipboard] sending Ctrl+V to VNC");
-      rfb.sendKey(0xffe3, "ControlLeft", true);   // Ctrl press
-      rfb.sendKey(XK_v, "KeyV", true);             // V press
-      rfb.sendKey(XK_v, "KeyV", false);            // V release
-      rfb.sendKey(0xffe3, "ControlLeft", false);   // Ctrl release
-    };
-
-    // capture: true ensures we fire before noVNC's canvas listener
-    container.addEventListener("keydown", handleKeyDown, true);
-    return () => container.removeEventListener("keydown", handleKeyDown, true);
-  }, [profileId, clipboardSync, connected]);
-
-  // VNC→Host: listen for noVNC "clipboard" event (fired when proxy converts
-  // KasmVNC BinaryClipboard type 180 → standard ServerCutText type 3)
-  useEffect(() => {
-    const rfb = rfbRef.current;
-    console.log("[clipboard] VNC→Host effect: rfb=", !!rfb, "sync=", clipboardSync, "connected=", connected);
-    if (!rfb || !clipboardSync || !connected) return;
-
-    const handleClipboard = (e: any) => {
-      const text = e.detail?.text;
-      console.log("[clipboard] VNC→Host event fired, text:", text?.substring(0, 50), "len:", text?.length);
-      if (text) {
-        navigator.clipboard.writeText(text).then(() => {
-          console.log("[clipboard] writeText success");
-        }).catch((err) => {
-          console.warn("[clipboard] writeText failed:", err);
-        });
+    if (session.state !== "connected") return;
+    const capture = () => {
+      if (document.visibilityState !== "visible") return;
+      if (captureLastFrame(session.iframeRef.current, snapshotRef.current)) {
+        setHasSnapshot(true);
       }
     };
-
-    console.log("[clipboard] registering clipboard event listener on rfb");
-    rfb.addEventListener("clipboard", handleClipboard);
-    return () => {
-      console.log("[clipboard] removing clipboard event listener");
-      rfb.removeEventListener("clipboard", handleClipboard);
-    };
-  }, [clipboardSync, connected]);
-
-  // VNC→Host polling: Chrome doesn't write to X11 clipboard under KasmVNC,
-  // so type 180 events won't fire for Chrome copies. Poll via Playwright CDP.
-  useEffect(() => {
-    if (!clipboardSync || !connected) return;
-
-    let cancelled = false;
-    let lastText = "";
-
-    const poll = async () => {
-      if (cancelled) return;
-      try {
-        const { text } = await api.getClipboard(profileId);
-        if (text && text !== lastText) {
-          lastText = text;
-          console.log("[clipboard] poll: new VNC clipboard:", text.substring(0, 50), "len:", text.length);
-          await navigator.clipboard.writeText(text).catch((err) =>
-            console.warn("[clipboard] poll writeText failed:", err)
-          );
-        }
-      } catch (err) {
-        console.warn("[clipboard] poll error, stopping:", err);
-        cancelled = true;
-        return;
-      }
-      if (!cancelled) {
-        setTimeout(poll, 2000);
-      }
-    };
-
-    // Start polling after a short delay
-    const timer = setTimeout(poll, 2000);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [profileId, clipboardSync, connected]);
+    capture();
+    const id = setInterval(capture, LAST_FRAME_SNAPSHOT_MS);
+    return () => clearInterval(id);
+  }, [session.state, session.iframeRef]);
 
   const toggleFullscreen = () => {
-    if (!containerRef.current) return;
+    if (!wrapperRef.current) return;
     if (!document.fullscreenElement) {
-      containerRef.current.requestFullscreen();
+      wrapperRef.current.requestFullscreen();
       setFullscreen(true);
     } else {
       document.exitFullscreen();
@@ -216,37 +165,33 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     return () => document.removeEventListener("fullscreenchange", handleFsChange);
   }, []);
 
+  // The iframe consumes wheel events over the canvas itself; this guards the
+  // edges/toolbar so the page behind doesn't scroll.
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
+    const surface = surfaceRef.current;
+    if (!surface) return;
 
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
     };
 
-    container.addEventListener("wheel", handleWheel, { passive: false });
-    return () => container.removeEventListener("wheel", handleWheel);
+    surface.addEventListener("wheel", handleWheel, { passive: false });
+    return () => surface.removeEventListener("wheel", handleWheel);
   }, []);
 
-  if (error) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <p className="text-red-400 text-sm mb-2">Connection failed</p>
-          <p className="text-gray-500 text-xs">{error}</p>
-        </div>
-      </div>
-    );
-  }
+  const meta = STATUS_META[session.state];
 
   return (
-    <div className="relative h-full flex flex-col">
+    <div ref={wrapperRef} className="relative h-full flex flex-col bg-surface-0">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border">
         <div className="flex items-center gap-2">
-          <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-yellow-400 animate-pulse"}`} />
+          <span className={`h-2 w-2 rounded-full ${meta.dot}`} />
           <span className="text-xs text-gray-400">
-            {connected ? "Connected" : "Connecting..."}
+            {meta.label}
+            {session.state === "reconnecting" && session.attempt > 0 && (
+              <span className="text-gray-500"> (attempt {session.attempt})</span>
+            )}
           </span>
         </div>
         <div className="flex items-center gap-1">
@@ -266,10 +211,12 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
             </button>
           )}
           <button
-            onClick={() => { console.log("[clipboard] toggle:", !clipboardSync); setClipboardSync(!clipboardSync); }}
+            onClick={() => setClipboardSync(!clipboardSync)}
             className={`p-1 ${clipboardSync ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}
-            title={clipboardSync ? "Disable clipboard sync" : "Enable clipboard sync"}
-            disabled={!connected}
+            title={
+              (clipboardSync ? "Disable clipboard sync" : "Enable clipboard sync") +
+              " (applies on next connect)"
+            }
           >
             <ClipboardCopy className="h-3.5 w-3.5" />
           </button>
@@ -280,15 +227,102 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           >
             {fullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
           </button>
+          {session.iframeSrc && (
+            <button
+              onClick={() => window.open(session.iframeSrc as string, "_blank")}
+              className="text-gray-500 hover:text-gray-300 p-1"
+              title="Open in new tab"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
-      {/* VNC canvas container */}
+      {/* Display surface: native KasmVNC client in an iframe */}
       <div
-        ref={containerRef}
-        className="flex-1 bg-black overflow-hidden"
+        ref={surfaceRef}
+        className="relative flex-1 bg-black overflow-hidden"
         style={{ minHeight: 0 }}
-      />
+      >
+        {session.iframeSrc && (
+          <iframe
+            ref={session.iframeRef}
+            src={session.iframeSrc}
+            onLoad={session.handleIframeLoad}
+            className="h-full w-full border-0"
+            allow="clipboard-read; clipboard-write; fullscreen"
+            title="Browser session"
+          />
+        )}
+
+        {/* The last frame, held so the reconnect overlay dims a picture of the
+            session rather than a black rectangle. Always mounted — it has to
+            exist as a draw target the whole time the connection is up — and
+            merely hidden the rest of the time. `display:none` does not affect
+            drawing into it. */}
+        <canvas
+          ref={snapshotRef}
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+          style={{
+            display: session.state === "reconnecting" && hasSnapshot ? "block" : "none",
+          }}
+        />
+
+        {/* Reconnecting: keep the iframe mounted so the client can recover in
+            place — a remount would drop the session. The client destroys its
+            own framebuffer canvas on disconnect (measured), which is why the
+            frame above is copied out on a timer while connected rather than
+            grabbed here; by now there is nothing left to grab. */}
+        {session.state === "reconnecting" && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/60 px-4 text-center">
+            {session.offline ? (
+              <>
+                <WifiOff className="h-6 w-6 text-yellow-400" />
+                <p className="text-sm text-gray-200">
+                  Your network appears offline — will reconnect when it returns
+                </p>
+              </>
+            ) : (
+              <>
+                <RefreshCw className="h-6 w-6 text-yellow-400 animate-spin" />
+                <p className="text-sm text-gray-200">Connection lost — reconnecting</p>
+                <p className="text-xs text-gray-500">
+                  Attempt {session.attempt}
+                  {retryInSeconds !== null && ` · next retry in ${retryInSeconds}s`}
+                </p>
+                {session.degraded && (
+                  <div className="mt-2 flex flex-col items-center gap-2">
+                    <p className="text-xs text-gray-400">Still trying…</p>
+                    <button onClick={session.reconnectNow} className="btn-secondary">
+                      Reconnect now
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Terminal states */}
+        {(session.state === "session-ended" || session.state === "fatal") && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-surface-0/95 px-4 text-center">
+            <MonitorOff className="h-8 w-8 text-gray-500" />
+            <p className="text-sm text-gray-200">
+              {session.endReason ?? "Browser session ended"}
+            </p>
+            <div className="flex items-center gap-2">
+              <button onClick={session.reconnectNow} className="btn-secondary">
+                Try again
+              </button>
+              <button onClick={onSessionEnded} className="btn-primary">
+                Back to profile
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -1,0 +1,214 @@
+name: Test and publish Docker image
+
+# `publish` builds the CPU/software-render image (./Dockerfile, multi-arch:
+# amd64+arm64 via QEMU — cheap to emulate, so it stays multi-arch) and pushes
+# it to GHCR as ghcr.io/<owner>/cloakbrowser-manager. `publish-gpu` then
+# builds Dockerfile.igpu and Dockerfile.nvidia FROM that just-pushed image
+# (both are `FROM base` — see either Dockerfile's own top comment — so it
+# would be wasteful, not "reusable", to rebuild the CPU image's layers a
+# second and third time just to get a build-context name for them). Neither
+# GPU Dockerfile installs a real GPU driver — the NVIDIA one only installs
+# generic Vulkan/GLVND loaders (the driver itself is injected by the NVIDIA
+# Container Toolkit at `docker run` time) and the iGPU one only installs
+# Mesa/VA-API userspace packages — so building either needs no GPU hardware,
+# only validating acceleration at runtime does. Both build amd64-only: no
+# GPU vendor ships an arm64 desktop iGPU or an arm64 NVIDIA consumer/
+# datacenter card this repo targets, so there's no QEMU cost worth paying
+# there the way there is for the CPU image.
+#
+# Every variant gets its own GitHub Release, tagged sha-<shortsha>-<variant>.
+#
+# Both publish jobs are gated to this fork specifically, so a downstream
+# fork's own Actions runs don't push images/releases under an assumption that
+# only applies here.
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt pytest pytest-asyncio
+      - name: Test backend
+        run: python -m pytest -q
+      - uses: actions/setup-node@v7
+        with:
+          # 20 didn't have Object.groupBy (added in 21) — @cubone/react-file-manager's
+          # bundled dist code calls it directly with no polyfill, so `npm test`
+          # crashed here (jsdom+Node actually executes that code) while `vite
+          # build` never did (a browser bundler doesn't execute the app it
+          # bundles, and the shipped app only ever runs in a modern Chromium
+          # via KasmVNC, which has had it since Chrome 117). 24 matches the
+          # Active LTS this was developed and tested against locally.
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test -- --run
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.repository == 'cjangrist/CloakBrowser-Manager'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cpu
+            dockerfile: Dockerfile
+            image_suffix: ""
+            platforms: linux/amd64,linux/arm64
+    concurrency:
+      group: docker-publish-${{ github.ref }}-${{ matrix.name }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Compute short SHA
+        id: shortsha
+        run: echo "sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sha-${{ steps.shortsha.outputs.sha }}-${{ matrix.name }}
+          name: ${{ matrix.name }} @ ${{ steps.shortsha.outputs.sha }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            **Image:** `ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}:sha-${{ github.sha }}`
+            **Branch:** `${{ github.ref_name }}`
+
+            ```
+            docker pull ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}:sha-${{ github.sha }}
+            ```
+
+  # Runs after `publish` (not in parallel with it): both Dockerfiles here are
+  # `FROM base`, and `base` is this job's name for the CPU image `publish`
+  # just pushed — build-contexts below points it at that image by digest-
+  # stable sha tag rather than rebuilding the base layers again per variant.
+  # igpu and nvidia themselves DO build in parallel with each other (two
+  # matrix entries, no ordering between them).
+  publish-gpu:
+    needs: publish
+    if: github.event_name != 'pull_request' && github.repository == 'cjangrist/CloakBrowser-Manager'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: igpu
+            dockerfile: Dockerfile.igpu
+            image_suffix: "-igpu"
+          - name: nvidia
+            dockerfile: Dockerfile.nvidia
+            image_suffix: "-nvidia"
+    concurrency:
+      group: docker-publish-${{ github.ref }}-${{ matrix.name }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-contexts: |
+            base=docker-image://ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager:sha-${{ github.sha }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Compute short SHA
+        id: shortsha
+        run: echo "sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sha-${{ steps.shortsha.outputs.sha }}-${{ matrix.name }}
+          name: ${{ matrix.name }} @ ${{ steps.shortsha.outputs.sha }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            **Image:** `ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}:sha-${{ github.sha }}`
+            **Branch:** `${{ github.ref_name }}`
+
+            ```
+            docker pull ghcr.io/${{ github.repository_owner }}/cloakbrowser-manager${{ matrix.image_suffix }}:sha-${{ github.sha }}
+            ```

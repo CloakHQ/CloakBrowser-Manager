@@ -1,0 +1,33 @@
+# GPU passthrough overlay — opt in only if the host actually has /dev/dri.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Enables KasmVNC DRI3 screen capture (-hw3d) on AMD/Intel open-source drivers.
+# Closed-source NVIDIA does NOT support DRI3; the manager auto-detects that and
+# stays on software capture.
+#
+# This is the MINIMAL file, and probably not the one you want: it maps the device
+# and changes nothing else, so video encode stays software (no codec is
+# negotiated under the default policy) and Chromium stays on SwiftShader (the
+# base image carries no GLVND loader for ANGLE to reach Mesa through). For an
+# Intel or AMD iGPU that should actually encode and rasterise on the GPU, use
+# docker-compose.igpu.yml, which layers that userspace in and flips the two
+# settings those paths need. Keep this one for "capture only", or for a host
+# where you want the device visible and nothing else to change.
+#
+# This is the WRONG file for an NVIDIA GPU — use docker-compose.nvidia.yml.
+# "No DRI3" rules out -hw3d capture, but it does not rule out the GPU: NVENC
+# encode goes through CUDA and Chromium reaches the card through ANGLE/Vulkan,
+# neither of which needs DRI3. Mapping /dev/dri here would get you a render node
+# and none of that.
+#
+# VAAPI H.264/H.265/AV1 encode additionally requires KASM_ENCODING_POLICY=video:
+# under the default server-authoritative policy KasmVNC negotiates no video
+# codec at all, so the GPU accelerates capture only.
+#
+# Docker fails container creation outright when a mapped device node does not
+# exist, which is why this lives outside the default compose file.
+services:
+  manager:
+    devices:
+      - "/dev/dri:/dev/dri"

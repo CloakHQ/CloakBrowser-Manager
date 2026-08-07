@@ -1,0 +1,60 @@
+# Cloudflare Tunnel overlay — reach the Manager over the internet with a real
+# certificate, and stop publishing ports on the host entirely.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d --build
+#
+# Combine with the NVIDIA overlay by listing both (tunnel last, so its port
+# override wins):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
+#                  -f docker-compose.tunnel.yml up -d --build
+#
+# Why this exists, beyond convenience: the KasmVNC client refuses to negotiate
+# ANY video codec outside a secure context, because it gates them on WebCodecs
+# and browsers withhold WebCodecs from plain-http origins that are not
+# localhost. A tunnel hands out an https:// origin with a certificate the
+# browser already trusts, so hardware encoding works from any machine with no
+# self-signed click-through and no cert to distribute.
+#
+# Two modes, chosen automatically by docker/tunnel-entrypoint.sh:
+#
+#   CF_TUNNEL_TOKEN set    → named tunnel; the hostname and ingress rules come
+#                            from the Cloudflare dashboard, and the URL is
+#                            stable across restarts.
+#   CF_TUNNEL_TOKEN unset  → free quick tunnel on a random
+#                            *.trycloudflare.com name, printed to the tunnel's
+#                            log and REGENERATED ON EVERY RESTART. No account
+#                            needed; rate-limited and not meant for production.
+services:
+  manager:
+    # Nothing published on the host: the tunnel reaches the Manager over the
+    # compose network, which is the point of using one. `!override` is required
+    # — a plain empty list would MERGE with the base file's bindings and leave
+    # them in place.
+    ports: !override []
+
+  tunnel:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tunnel
+    image: cloakbrowser-manager-tunnel:latest
+    restart: unless-stopped
+    # Wait for the Manager's healthcheck rather than merely for its container:
+    # a quick tunnel that connects before nginx is listening publishes a name
+    # that 502s, and the name cannot be reissued without a restart.
+    depends_on:
+      manager:
+        condition: service_healthy
+    environment:
+      # cloudflared reads TUNNEL_TOKEN itself; CF_TUNNEL_TOKEN is the name on
+      # the outside so it reads as this project's setting rather than a global.
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+      # Plain HTTP to the Manager is correct here: TLS is terminated at
+      # Cloudflare's edge, this hop never leaves the compose network, and
+      # cloudflared sets X-Forwarded-Proto: https, which nginx.conf's
+      # $forwarded_proto map already honours so the SPA still advertises wss://.
+      - TUNNEL_ORIGIN=${CF_TUNNEL_ORIGIN:-http://manager:8080}
+      # Passed ONLY so the sidecar can refuse to publish an unauthenticated
+      # Manager to the internet. See docker/tunnel-entrypoint.sh.
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - TUNNEL_ALLOW_NO_AUTH=${TUNNEL_ALLOW_NO_AUTH:-}

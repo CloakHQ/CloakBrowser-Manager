@@ -1,16 +1,41 @@
 import { useState, useCallback, useEffect } from "react";
 import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
-import { api, setOnUnauthorized, type ProfileCreateData } from "./lib/api";
+import { useBinaryDownload } from "./hooks/useBinaryDownload";
+import { useResourceUsage } from "./hooks/useResourceUsage";
+import { useIdleCountdown, formatCountdown } from "./hooks/useIdleCountdown";
+import { api, setOnUnauthorized, type ProfileCreateData, type ProfileLifecycle } from "./lib/api";
+import { CookieWarmupPanel } from "./components/CookieWarmupPanel";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
 import { LaunchButton } from "./components/LaunchButton";
+import { RestartButton } from "./components/RestartButton";
 import { StatusIndicator } from "./components/StatusIndicator";
+import { SystemCheckPanel } from "./components/SystemCheckPanel";
+import { TabManagerPanel } from "./components/TabManagerPanel";
 import { LoginPage } from "./components/LoginPage";
+import { BinaryDownloadBanner } from "./components/BinaryDownloadBanner";
 
 type AuthState = "checking" | "required" | "ok" | "error";
 type View = "empty" | "create" | "edit" | "view";
+
+/**
+ * Which pane selecting a profile opens. A Record over the whole lifecycle union
+ * rather than a `!== "stopped"` test, so a new backend state has to be routed
+ * deliberately instead of defaulting into the viewer.
+ *   running/starting → the viewer: "starting" has a session on the way and the
+ *     reconnect machine waits it out rather than showing a form for it.
+ *   stopping → the FORM. The manager has already dropped the profile out of
+ *     `running`, so /viewer-token 404s: mounting the viewer would only render
+ *     "Browser session ended" a moment later.
+ */
+const VIEW_ON_SELECT: Record<ProfileLifecycle, View> = {
+  running: "view",
+  starting: "view",
+  stopping: "edit",
+  stopped: "edit",
+};
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -89,17 +114,32 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, launch, stop } = useProfiles();
+  const { profiles, loading, error, create, update, duplicate, remove, launch, stop } = useProfiles();
+  const binaryDownload = useBinaryDownload();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  /** bumped on relaunch to remount the viewer with a fresh session. */
+  const [viewerEpoch, setViewerEpoch] = useState(0);
+  /** True for the whole stop-then-launch sequence a Restart click runs —
+   *  drives the top bar to show ONE "Restarting..." button instead of
+   *  LaunchButton flashing Stop -> Launch -> Stop as the 3s poll catches up
+   *  with each half of the sequence. */
+  const [restarting, setRestarting] = useState(false);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
+  const resourceUsage = useResourceUsage(selected?.id ?? null, selected?.status === "running");
+  const idleRemaining = useIdleCountdown(resourceUsage?.idle_remaining_seconds ?? null);
 
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
     const profile = profiles.find((p) => p.id === id);
-    setView(profile?.status === "running" ? "view" : "edit");
+    if (!profile) return setView("edit");
+    // Headless first, before lifecycle: such a profile allocates no display
+    // and no Xvnc, so /viewer-token answers 409 and the viewer could only ever
+    // render its "Connection failed" overlay for a browser that is running
+    // perfectly well. CDP is the handle on a headless profile, not the viewer.
+    setView(profile.headless ? "edit" : VIEW_ON_SELECT[profile.status]);
   }, [profiles]);
 
   const handleNew = useCallback(() => {
@@ -120,6 +160,15 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     await update(selectedId, data);
   }, [selectedId, update]);
 
+  const handleDuplicate = useCallback(async () => {
+    if (!selectedId) return;
+    const copy = await duplicate(selectedId);
+    if (copy) {
+      setSelectedId(copy.id);
+      setView("edit");
+    }
+  }, [selectedId, duplicate]);
+
   const handleDelete = useCallback(async () => {
     if (!selectedId) return;
     await remove(selectedId);
@@ -130,16 +179,56 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const handleLaunch = useCallback(async () => {
     if (!selectedId) return;
     const result = await launch(selectedId);
-    if (result) setView("view");
-  }, [selectedId, launch]);
+    if (result && selected?.headless) {
+      // Launched, but there is nothing to view — stay on the form.
+      setView("edit");
+      return;
+    }
+    if (result) {
+      // Force a fresh viewer. Dropping the status gate on the render below
+      // means the component is NOT remounted by a relaunch, so a viewer
+      // sitting on "Browser session ended" would keep showing that overlay
+      // over a dead token and the launch would read as a failure.
+      setViewerEpoch((n) => n + 1);
+      setView("view");
+    }
+  }, [selectedId, launch, selected?.headless]);
 
+  // Explicit Stop navigates away rather than letting the viewer reach its
+  // "Browser session ended" overlay: the user asked for this, so the overlay
+  // would be telling them something they just did. The overlay is for the
+  // cases they did NOT ask for — a crash, an external stop, a dead display.
   const handleStop = useCallback(async () => {
     if (!selectedId) return;
     await stop(selectedId);
     setView("edit");
   }, [selectedId, stop]);
 
-  const handleVncDisconnect = useCallback(() => {
+  // Same post-launch view logic as handleLaunch (headless stays on the form,
+  // a headed profile gets a fresh viewer) — duplicated rather than shared
+  // because handleLaunch's own success branch is entangled with `view`
+  // already being "edit" from the Launch button, which is not true here.
+  const handleRestart = useCallback(async () => {
+    if (!selectedId) return;
+    setRestarting(true);
+    try {
+      await stop(selectedId);
+      const result = await launch(selectedId);
+      if (!result) return;
+      if (selected?.headless) {
+        setView("edit");
+      } else {
+        setViewerEpoch((n) => n + 1);
+        setView("view");
+      }
+    } finally {
+      setRestarting(false);
+    }
+  }, [selectedId, stop, launch, selected?.headless]);
+
+  // Only terminal session end navigates away — transient network drops are
+  // handled by the viewer's own reconnect state machine while the view stays.
+  const handleSessionEnded = useCallback(() => {
     setView("edit");
   }, []);
 
@@ -182,17 +271,51 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 <StatusIndicator status={selected.status} size="md" />
                 <span className="text-sm font-medium">{selected.name}</span>
                 <span className="text-xs text-gray-500 capitalize">{selected.platform}</span>
+                {resourceUsage?.cpu_percent != null && resourceUsage.memory_mb != null && (
+                  <span
+                    className="text-xs text-gray-500"
+                    title={`Whole Chromium process tree: ${resourceUsage.process_count} process(es). CPU is per-core (top's convention) — over 100% means more than one core busy.`}
+                  >
+                    · {resourceUsage.cpu_percent.toFixed(1)}% CPU · {resourceUsage.memory_mb.toFixed(0)} MB
+                  </span>
+                )}
+                {idleRemaining !== null && (
+                  <span
+                    className={idleRemaining <= 60 ? "text-xs text-amber-400" : "text-xs text-gray-500"}
+                    title="Time until this profile auto-stops from inactivity (no VNC viewer or CDP traffic)"
+                  >
+                    · auto-stop in {formatCountdown(idleRemaining)}
+                  </span>
+                )}
               </div>
             )}
           </div>
           <div className="flex items-center gap-2">
-            {selected && (
-              <LaunchButton
-                status={selected.status}
-                onLaunch={handleLaunch}
-                onStop={handleStop}
-              />
+            {/* Cookie warmup only ever needs to appear here: selecting a
+                running profile opens the viewer, never the edit form (see
+                VIEW_ON_SELECT), so a Warm up cookies button living only in
+                ProfileForm would never be reachable while there is anything
+                for it to run against. */}
+            {selected && selected.status === "running" && (
+              <CookieWarmupPanel profileId={selected.id} isRunning compact />
             )}
+            {selected && restarting && <RestartButton busy onClick={() => {}} />}
+            {selected && !restarting && (
+              <>
+                {selected.status === "running" && (
+                  <RestartButton busy={false} onClick={handleRestart} />
+                )}
+                <LaunchButton
+                  status={selected.status}
+                  onLaunch={handleLaunch}
+                  onStop={handleStop}
+                />
+              </>
+            )}
+            {/* Container-level, not profile-scoped — always available,
+                unlike everything else in this cluster. */}
+            <TabManagerPanel profiles={profiles} />
+            <SystemCheckPanel />
             {authRequired && (
               <button
                 onClick={onLogout}
@@ -204,6 +327,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             )}
           </div>
         </div>
+
+        {/* Binary download banner */}
+        <BinaryDownloadBanner status={binaryDownload} />
 
         {/* Error banner */}
         {error && (
@@ -234,6 +360,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             <ProfileForm
               profile={selected}
               onSave={handleUpdate}
+              onDuplicate={handleDuplicate}
               onDelete={handleDelete}
               onCancel={() => {
                 setSelectedId(null);
@@ -242,13 +369,17 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             />
           )}
 
-          {view === "view" && selected && selected.status === "running" && (
+          {/* No status guard: the viewer owns its own terminal state. Gating on
+              the 3s profile poll would unmount it the instant the backend
+              reports "stopped", destroying the "Session ended" overlay (and the
+              only in-place way back) before the user ever sees it. */}
+          {view === "view" && selected && (
             <ProfileViewer
-              key={selected.id}
+              key={`${selected.id}:${viewerEpoch}`}
               profileId={selected.id}
               cdpUrl={selected.cdp_url}
               clipboardSync={selected.clipboard_sync}
-              onDisconnect={handleVncDisconnect}
+              onSessionEnded={handleSessionEnded}
             />
           )}
         </div>

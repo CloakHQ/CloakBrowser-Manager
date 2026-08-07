@@ -3,10 +3,19 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
 
 # Node
 node_modules/
 frontend/dist/
+frontend/coverage/
+frontend/.vite/
+npm-debug.log*
 
 # IDE
 .vscode/
@@ -17,6 +26,7 @@ frontend/dist/
 
 # Deploy
 deploy.sh
+.env
 
 # Claude Code
 .claude/
@@ -24,3 +34,8 @@ CLAUDE.md
 publish-docker.sh
 .beads
 debug
+
+# Agent scratch
+tmp/
+temp/
+trash/

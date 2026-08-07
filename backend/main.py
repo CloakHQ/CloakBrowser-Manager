@@ -7,36 +7,80 @@ for browser profile management with live VNC viewing.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hmac
+import io
+import json
 import logging
 import os
-import struct
+import re
 import shutil
+import time
+import zipfile
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
-from .browser_manager import BrowserManager
+from .binary_status import snapshot as binary_status_snapshot
+from .browser_manager import (
+    DEFAULT_IDLE_TIMEOUT_S,
+    KASM_VIEWER_PROBE_TIMEOUT_S,
+    LAUNCH_TIMEOUT_S,
+    BrowserManager,
+    ProfileAlreadyRunning,
+    RunningProfile,
+    _viewer_attached,
+)
+from . import cookie_warmup
+from .extensions import (
+    chrome_web_store_crx_url,
+    extract_extension_id,
+    install_extension_from_bytes,
+    list_available_extensions,
+    rescan_extensions,
+)
+from .vnc_manager import viewer_stream_mode_preference
 from .models import (
     ClipboardRequest,
+    CookieWarmupStatusResponse,
+    ExtensionInstallFromUrlRequest,
+    ExtensionResponse,
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
     ProfileResponse,
     ProfileStatusResponse,
+    ProfileTabsResponse,
     ProfileUpdate,
+    ResourceUsageResponse,
     StatusResponse,
+    SystemCheckResponse,
+    TabInfo,
     TagResponse,
+    ViewerTokenResponse,
 )
+from .resources import get_resource_usage
+from .system_check import get_system_check
+from .viewer_tokens import VIEWER_TOKEN_TTL, viewer_tokens
 
 logger = logging.getLogger("cloakbrowser.manager")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -50,32 +94,81 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 # (except /api/auth/* and /api/status) require Bearer token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
+# One string for one state. launch, stop and delete used to answer a wedged
+# teardown with three different messages (and two different status codes), so
+# an operator could not tell they were looking at the same thing.
+_SHUTTING_DOWN_DETAIL = "Browser is still shutting down; try again"
+
 # Paths that bypass authentication even when AUTH_TOKEN is set
-_AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
+# (/api/viewer-auth is exempt: the viewer token in X-Original-URI is the credential)
+_AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status", "/api/viewer-auth"})
+
+# Per-profile routes are a CAPABILITY URL: the profile's own id is the
+# credential, exactly as it is for a cloud provider's presigned URL. This is
+# what keeps the CDP endpoint usable by every CDP client there is — Playwright,
+# Puppeteer, chrome-remote-interface, agent-browser — none of which can attach
+# an Authorization header to a WebSocket handshake, so requiring a bearer token
+# there means requiring a patched client.
+#
+# The id is uuid4 (database.py), so 122 random bits: not enumerable, and the
+# collection routes that WOULD enumerate it — GET/POST /api/profiles — are
+# deliberately NOT matched here and still demand the token. That asymmetry is
+# the entire security model, so the pattern is anchored at both ends and
+# insists on the canonical 8-4-4-4-12 form. A looser match ("starts with
+# /api/profiles/") would exempt /api/profiles/ itself on some routers, and with
+# it the listing this is supposed to protect.
+#
+# Consequences worth stating plainly: the id grants FULL control of that one
+# profile (CDP is arbitrary code execution in the browser, plus its cookies and
+# storage), it does not expire, and it cannot be revoked short of deleting the
+# profile. Treat the URL as the secret it is — nginx.conf redacts it from the
+# access log for the same reason it redacts viewer tokens.
+_PROFILE_CAPABILITY_PATH = re.compile(
+    r"^/api/profiles/"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"(/.*)?$"
+)
 
 
 def _check_auth(scope: Scope) -> bool:
-    """Check if the request has a valid auth token (header or cookie)."""
-    # Check Authorization: Bearer <token> header
-    for key, val in scope.get("headers", []):
-        if key == b"authorization":
-            auth_value = val.decode()
-            if auth_value.startswith("Bearer "):
-                token = auth_value[7:]
-                if token and hmac.compare_digest(token, AUTH_TOKEN):
-                    return True
-            break
+    """Check if the request has a valid auth token (header or cookie).
 
-    # Check auth_token cookie
-    for key, val in scope.get("headers", []):
-        if key == b"cookie":
-            cookies = SimpleCookie()
-            cookies.load(val.decode())
-            if "auth_token" in cookies:
-                cookie_val = cookies["auth_token"].value
-                if cookie_val and hmac.compare_digest(cookie_val, AUTH_TOKEN):
-                    return True
-            break
+    A malformed credential can only ever mean "unauthenticated". It used to
+    mean HTTP 500 plus a traceback: `Authorization: Bearer <0xe9>` raised
+    UnicodeDecodeError from the utf-8 decode, and a well-formed non-ASCII
+    token raised TypeError out of hmac.compare_digest, both before any
+    authentication decision. Comparing the raw ASGI bytes avoids the decode
+    entirely, and the blanket except makes the failure mode a 401 rather than
+    an unauthenticated error-rate amplifier.
+    """
+    try:
+        expected = AUTH_TOKEN.encode()
+        # Check Authorization: Bearer <token> header
+        for key, val in scope.get("headers", []):
+            if key == b"authorization":
+                if val.startswith(b"Bearer "):
+                    token = val[7:]
+                    if token and hmac.compare_digest(token, expected):
+                        return True
+                break
+
+        # Check auth_token cookie
+        for key, val in scope.get("headers", []):
+            if key == b"cookie":
+                cookies = SimpleCookie()
+                # latin-1 is the ASGI header encoding and is byte-preserving,
+                # so it cannot raise on any header a client can send.
+                cookies.load(val.decode("latin-1"))
+                if "auth_token" in cookies:
+                    cookie_val = cookies["auth_token"].value
+                    if cookie_val and hmac.compare_digest(
+                        cookie_val.encode("latin-1"), expected,
+                    ):
+                        return True
+                break
+    except Exception as exc:
+        logger.warning("Rejecting a malformed credential: %s", type(exc).__name__)
+        return False
 
     return False
 
@@ -159,6 +252,12 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # A per-profile path carries its own credential in the id — see
+        # _PROFILE_CAPABILITY_PATH. Enumeration is what the token still guards.
+        if _PROFILE_CAPABILITY_PATH.match(path):
+            await self.app(scope, receive, send)
+            return
+
         if _check_auth(scope):
             await self.app(scope, receive, send)
             return
@@ -176,213 +275,64 @@ class AuthMiddleware:
 # Singleton browser manager
 browser_mgr = BrowserManager()
 
+# Cookie warmup is a fire-and-forget asyncio.Task per profile, tracked
+# separately from RunningProfile since it outlives no single request and
+# should not survive a stop/relaunch of the profile it was running against.
+# See cookie_warmup.py and the /cookie-warmup/* routes below.
+_warmup_status: dict[str, cookie_warmup.WarmupStatus] = {}
+_warmup_tasks: dict[str, asyncio.Task] = {}
+
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 
-# ---------------------------------------------------------------------------
-# RFB server message translator — KasmVNC BinaryClipboard → standard RFB
-# ---------------------------------------------------------------------------
+def _demote_abandoned_driver_errors(loop, context: dict) -> None:
+    """Keep a correctly-handled wedged teardown out of the ERROR log.
 
-
-def _parse_kasmvnc_clipboard(data: bytes) -> str | None:
-    """Extract text/plain from KasmVNC BinaryClipboard (type 180).
-
-    Format: type(1) + action(1) + flags(4) + entries...
-    Each entry: mime_len(u8) + mime(N) + data_len(u32 BE) + data(M)
+    _close_context_bounded deliberately abandons a close that outran its bound;
+    when the driver connection later drops, that future's exception is never
+    retrieved and asyncio reports it at ERROR with a stack trace, no profile id
+    and no context. Operators (and log alerts) read that as a crash in a path
+    that in fact worked exactly as designed. Anything else is left alone.
     """
-    if len(data) < 7:
-        return None
-    offset = 6  # skip type(1) + action(1) + flags(4)
-    while offset < len(data):
-        if offset + 1 > len(data):
-            break
-        mime_len = data[offset]
-        offset += 1
-        if offset + mime_len > len(data):
-            break
-        mime_type = data[offset:offset + mime_len]
-        offset += mime_len
-        if offset + 4 > len(data):
-            break
-        data_len = struct.unpack_from(">I", data, offset)[0]
-        offset += 4
-        if mime_type == b"text/plain":
-            end = min(offset + data_len, len(data))
-            return data[offset:end].decode("utf-8", errors="replace")
-        offset += data_len
-    return None
-
-
-def _build_server_cut_text(text: str) -> bytes:
-    """Build standard RFB ServerCutText (type 3) message.
-
-    RFB spec mandates Latin-1 encoding for ServerCutText.
-    Characters outside Latin-1 (CJK, emoji, etc.) are replaced with '?'.
-    """
-    text_bytes = text.encode("latin-1", errors="replace")
-    return struct.pack(">BxxxI", 3, len(text_bytes)) + text_bytes
-
-
-# ---------------------------------------------------------------------------
-# RFB client message filter — strip extension types KasmVNC doesn't support
-# ---------------------------------------------------------------------------
-# noVNC v1.4 batches multiple RFB messages into one WebSocket frame.
-# KasmVNC 1.3.3 crashes on unsupported types (150, 248, etc.).
-# We parse message boundaries using known sizes and keep only standard types.
-
-# Client→server message sizes (fixed, except 2 and 6 which encode length)
-_RFB_MSG_SIZE: dict[int, int | None] = {
-    0: 20,    # SetPixelFormat
-    2: None,  # SetEncodings — 4 + numEncodings*4 (rewritten to strip bad pseudo-encodings)
-    3: 10,    # FramebufferUpdateRequest
-    4: 8,     # KeyEvent
-    5: 6,     # PointerEvent
-    6: None,  # ClientCutText — 8 + length
-}
-
-# Extension types that noVNC sends — known sizes so we can skip past them
-# instead of breaking and dropping all trailing data in the frame.
-_RFB_EXTENSION_SIZE: dict[int, int] = {
-    150: 10,  # EnableContinuousUpdates (1+1+2+2+2+2)
-    248: 10,  # QEMU-like key event (observed from noVNC 1.4.0)
-    252: 4,   # xvp (1+1+1+1)
-    255: 4,   # QEMU audio control (1+1+2) — noVNC QEMUExtendedKeyEvent is actually 12
-}
-
-# Whitelist of encodings safe to send to KasmVNC.
-# Instead of trying to blocklist problematic pseudo-encodings (error-prone —
-# we had wrong numbers), we ONLY keep known-good encodings.
-# Anything not on this list is stripped from SetEncodings.
-_ALLOWED_ENCODINGS: set[int] = {
-    # Framebuffer encodings (standard RFB)
-    0,    # Raw
-    1,    # CopyRect
-    2,    # RRE
-    5,    # Hextile
-    7,    # Tight
-    16,   # ZRLE
-    # Safe pseudo-encodings
-    -239,  # Cursor (0xFFFFFF11) — cursor shape
-    -224,  # LastRect (0xFFFFFF20) — performance optimization
-    # Tight quality/compress levels (these are just hints)
-    *range(-32, -22),   # quality levels 0-9
-    *range(-256, -246),  # compress levels 0-9
-}
-
-
-def _rfb_msg_length(data: bytes, offset: int) -> int | None:
-    """Return total length of the RFB message at offset, or None if unrecognized."""
-    if offset >= len(data):
-        return None
-    msg_type = data[offset]
-    fixed = _RFB_MSG_SIZE.get(msg_type)
-    if fixed is not None:
-        return fixed
-    remaining = len(data) - offset
-    if msg_type == 2 and remaining >= 4:  # SetEncodings
-        num_enc = struct.unpack_from(">H", data, offset + 2)[0]
-        return 4 + num_enc * 4
-    if msg_type == 6 and remaining >= 8:  # ClientCutText
-        length = struct.unpack_from(">I", data, offset + 4)[0]
-        return 8 + length
-    # Known extension types — skip past them instead of giving up
-    ext_size = _RFB_EXTENSION_SIZE.get(msg_type)
-    if ext_size is not None:
-        return ext_size
-    return None  # truly unknown type
-
-
-def _rewrite_set_encodings(data: bytes, offset: int, msg_len: int) -> bytes:
-    """Keep only whitelisted encodings in a SetEncodings message."""
-    _log = logging.getLogger("cloakbrowser.manager")
-    num_enc = struct.unpack_from(">H", data, offset + 2)[0]
-    kept = []
-    stripped = []
-    for i in range(num_enc):
-        enc = struct.unpack_from(">i", data, offset + 4 + i * 4)[0]  # signed
-        if enc in _ALLOWED_ENCODINGS:
-            kept.append(enc)
-        else:
-            stripped.append(enc)
-    if not stripped:
-        return data[offset:offset + msg_len]
-    _log.info("RFB filter: SetEncodings keeping %d: %s, stripped %d: %s", len(kept), kept, len(stripped), stripped)
-    result = struct.pack(">BxH", 2, len(kept))
-    for enc in kept:
-        result += struct.pack(">i", enc)
-    return result
-
-
-def _rewrite_pointer_event(data: bytes, offset: int) -> bytes:
-    """Convert standard 6-byte PointerEvent to KasmVNC's 11-byte format.
-
-    Standard RFB:  [5:u8][mask:u8][x:u16][y:u16]          = 6 bytes
-    KasmVNC:       [5:u8][mask:u16][x:u16][y:u16][sx:s16][sy:s16] = 11 bytes
-    """
-    mask = data[offset + 1]
-    x = struct.unpack_from(">H", data, offset + 2)[0]
-    y = struct.unpack_from(">H", data, offset + 4)[0]
-    # Expand mask from u8 to u16.  Scroll deltas (sx, sy) are zero because
-    # noVNC encodes scroll as button-mask bits (3=up, 4=down, 5=left, 6=right)
-    # which pass through in the mask.  KasmVNC accepts mask-bit scroll on its
-    # extended 11-byte format, so explicit deltas are unnecessary.
-    return struct.pack(">BHHHhh", 5, mask, x, y, 0, 0)
-
-
-def _filter_rfb_client_messages(data: bytes) -> bytes:
-    """Parse concatenated RFB messages, keep only standard types (0-6).
-
-    Rewrites PointerEvents from 6-byte standard to 11-byte KasmVNC format
-    and strips unsupported pseudo-encodings from SetEncodings.
-    """
-    _log = logging.getLogger("cloakbrowser.manager")
-    result = bytearray()
-    offset = 0
-    msg_idx = 0
-    while offset < len(data):
-        msg_type = data[offset]
-        msg_len = _rfb_msg_length(data, offset)
-        if msg_len is None:
-            _log.info("RFB filter: DROPPING unknown type=%d at offset=%d/%d, skipping %d trailing bytes, hex=%s",
-                       msg_type, offset, len(data), len(data) - offset, data[offset:offset+20].hex())
-            break
-        if offset + msg_len > len(data):
-            # Incomplete message — DO NOT forward partial data, it desynchronizes
-            # the RFB stream (KasmVNC buffers partial reads across frames).
-            _log.warning("RFB filter: DROPPING incomplete type=%d need=%d have=%d — would desync stream",
-                         msg_type, msg_len, len(data) - offset)
-            break
-        msg_idx += 1
-        if msg_type in _RFB_MSG_SIZE:
-            # Standard RFB type — keep (with rewrites for KasmVNC compatibility)
-            _log.debug("RFB filter: KEEP type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
-            if msg_type == 2:  # SetEncodings — whitelist safe encodings
-                result.extend(_rewrite_set_encodings(data, offset, msg_len))
-            elif msg_type == 5:  # PointerEvent — expand to KasmVNC's 11-byte format
-                result.extend(_rewrite_pointer_event(data, offset))
-            else:
-                result.extend(data[offset:offset + msg_len])
-        else:
-            # Extension type (150, 248, etc.) — skip but continue parsing
-            _log.debug("RFB filter: SKIP extension type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
-        offset += msg_len
-    if len(result) != len(data):
-        _log.info("RFB filter: input=%d output=%d (delta %+d bytes)", len(data), len(result), len(result) - len(data))
-    return bytes(result)
+    exc = context.get("exception")
+    message = context.get("message", "")
+    if "never retrieved" in message and isinstance(exc, Exception) and (
+        "Connection closed while reading from the driver" in str(exc)
+        or "Target page, context or browser has been closed" in str(exc)
+    ):
+        logger.warning(
+            "Abandoned Playwright close finally failed (expected after a wedged "
+            "teardown): %s", exc,
+        )
+        return
+    loop.default_exception_handler(context)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Scanned here, eagerly, rather than lazily on first request — see
+    # extensions.py's module docstring for why this only ever happens once
+    # per process (i.e. per container start/restart).
+    list_available_extensions()
+    asyncio.get_running_loop().set_exception_handler(_demote_abandoned_driver_errors)
+    browser_mgr.add_display_released_hook(_reap_xclip_for_display)
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
+    # Nothing else re-examines a teardown claim: the status path is a pure peek
+    # by design, so without this loop a profile whose browser exited quietly
+    # stays "stopping" with launch/stop/delete all refusing, forever. It also
+    # reaps browsers whose Playwright driver died without emitting a close.
+    browser_mgr._sweep_task = asyncio.create_task(browser_mgr.run_maintenance())
     logger.info("CloakBrowser Manager started")
     yield
     logger.info("Shutting down — stopping all browsers...")
-    if browser_mgr._auto_launch_task and not browser_mgr._auto_launch_task.done():
-        browser_mgr._auto_launch_task.cancel()
-        await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
+    background = [browser_mgr._auto_launch_task, browser_mgr._sweep_task]
+    for task in background:
+        if task and not task.done():
+            task.cancel()
+    await asyncio.gather(*[t for t in background if t], return_exceptions=True)
     await browser_mgr.cleanup_all()
 
 
@@ -435,18 +385,37 @@ async def auth_logout(request: Request, response: Response):
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 
+def _profile_response(profile: dict) -> ProfileResponse:
+    """Attach the cheap lifecycle fields to a DB row.
+
+    One helper rather than four inlined copies: the copies drifted apart the
+    moment a fourth lifecycle value existed, and three of the four read paths
+    would have kept reporting "stopped" for a profile mid-teardown while the
+    fourth told the truth. get_status() is a pure peek, so this is safe on the
+    3s poll.
+    """
+    status = browser_mgr.get_status(profile["id"])
+    # Only meaningful when auto_restart is on — no budget to exhaust
+    # otherwise, and auto_restart_budget_state's own history is per-profile-id
+    # regardless, so skipping the (still pure, no-I/O) call when it cannot
+    # answer True just avoids the wasted list comprehension on every poll.
+    exhausted = (
+        browser_mgr.auto_restart_budget_state(profile["id"])["exhausted"]
+        if profile.get("auto_restart") else False
+    )
+    return ProfileResponse(**{
+        **profile,
+        "status": status["status"],
+        "vnc_ws_port": status["vnc_ws_port"],
+        "cdp_url": status["cdp_url"],
+        "tags": [TagResponse(**t) for t in profile.get("tags", [])],
+        "auto_restart_exhausted": exhausted,
+    })
+
+
 @app.get("/api/profiles", response_model=list[ProfileResponse])
 async def list_profiles():
-    profiles = db.list_profiles()
-    result = []
-    for p in profiles:
-        status = browser_mgr.get_status(p["id"])
-        p["status"] = status["status"]
-        p["vnc_ws_port"] = status["vnc_ws_port"]
-        p["cdp_url"] = status["cdp_url"]
-        p["tags"] = [TagResponse(**t) for t in p.get("tags", [])]
-        result.append(ProfileResponse(**p))
-    return result
+    return [_profile_response(p) for p in db.list_profiles()]
 
 
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
@@ -457,13 +426,12 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
-    profile = db.create_profile(**data)
-    status = browser_mgr.get_status(profile["id"])
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    # Unspecified (None, not an explicit []) defaults to every extension
+    # available right now, not none — a new profile starts with everything
+    # the operator has staged already enabled rather than opted out.
+    if data.get("enabled_extensions") is None:
+        data["enabled_extensions"] = [e["id"] for e in list_available_extensions()]
+    return _profile_response(db.create_profile(**data))
 
 
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -471,12 +439,179 @@ async def get_profile(profile_id: str):
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
+
+
+# Settings only — never cookies, cache, or any other on-disk profile data,
+# and never fingerprint_seed: the whole point of duplicating a profile is
+# usually a second, independently-fingerprinted variant, not an identical
+# twin that would look like the same machine to a detection service.
+_DUPLICATE_FIELDS = (
+    "proxy", "timezone", "locale", "platform", "user_agent",
+    "screen_width", "screen_height", "gpu_vendor", "gpu_renderer",
+    "hardware_concurrency", "humanize", "human_preset", "headless",
+    "geoip", "clipboard_sync", "auto_launch", "auto_restart", "color_scheme",
+    "license_key", "enabled_extensions", "idle_timeout_seconds",
+    "launch_args", "notes",
+)
+
+
+def _dedupe_profile_name(base_name: str) -> str:
+    """"X" -> "X (copy)" -> "X (copy 2)" -> ... — duplicating a duplicate
+    must not collide with (or overwrite the intent of) the one before it.
+    name has no uniqueness constraint in the schema, so this is purely for
+    a sidebar that would otherwise show several indistinguishable entries.
+    """
+    existing = {p["name"] for p in db.list_profiles()}
+    candidate = f"{base_name} (copy)"
+    if candidate not in existing:
+        return candidate
+    n = 2
+    while f"{base_name} (copy {n})" in existing:
+        n += 1
+    return f"{base_name} (copy {n})"
+
+
+@app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
+async def duplicate_profile(profile_id: str):
+    source = db.get_profile(profile_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    fields = {key: source.get(key) for key in _DUPLICATE_FIELDS}
+    fields["tags"] = [
+        {"tag": t["tag"], "color": t.get("color")} for t in source.get("tags", [])
+    ]
+    new_profile = db.create_profile(name=_dedupe_profile_name(source["name"]), **fields)
+    return _profile_response(new_profile)
+
+
+# ── Profile Downloads ─────────────────────────────────────────────────────────
+# browser_manager.py's download handler (see _finalize_download) is what
+# populates this directory with real filenames in the first place. These
+# routes are a plain, flat file browser over it — no folder navigation, since
+# nothing this Manager writes here ever creates a subdirectory.
+
+
+def _profile_downloads_dir(profile_id: str) -> Path | None:
+    """<user_data_dir>/Downloads for an existing profile, or None if the
+    profile id itself doesn't exist. Distinct from the directory not existing
+    yet (a profile that has never launched) — callers treat that as empty,
+    not missing.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        return None
+    return Path(profile["user_data_dir"]) / "Downloads"
+
+
+def _resolve_download_path(downloads_dir: Path, rel_path: str) -> Path | None:
+    """Containment-checked path under a profile's Downloads dir, or None.
+
+    Same approach as _resolve_spa_file below: Path.__truediv__ discards the
+    left side when the right is absolute, so an absolute rel_path must be
+    rejected explicitly rather than relying on resolve() containment alone.
+    """
+    if not rel_path:
+        return None
+    candidate = Path(rel_path.lstrip("/"))
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        resolved = (downloads_dir / candidate).resolve()
+        root = downloads_dir.resolve()
+    except OSError:
+        return None
+    if resolved != root and root not in resolved.parents:
+        return None
+    return resolved
+
+
+@app.get("/api/profiles/{profile_id}/downloads")
+async def list_profile_downloads(profile_id: str):
+    """Flat file listing in the shape @cubone/react-file-manager's `files`
+    prop expects — see frontend/src/components/DownloadsBrowser.tsx.
+    """
+    downloads_dir = _profile_downloads_dir(profile_id)
+    if downloads_dir is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not downloads_dir.is_dir():
+        return []
+
+    entries = []
+    for entry in sorted(downloads_dir.iterdir()):
+        try:
+            info = entry.stat()
+        except OSError as exc:
+            # A file mid-write, or removed between iterdir() and stat() —
+            # skip it rather than fail the whole listing over one entry.
+            logger.debug("Skipping %s in downloads listing: %s", entry, exc)
+            continue
+        entries.append({
+            "name": entry.name,
+            "isDirectory": entry.is_dir(),
+            "path": f"/{entry.name}",
+            "size": info.st_size if entry.is_file() else None,
+            "updatedAt": datetime.datetime.fromtimestamp(
+                info.st_mtime, tz=datetime.timezone.utc,
+            ).isoformat(),
+        })
+    return entries
+
+
+@app.get("/api/profiles/{profile_id}/downloads/{file_path:path}")
+async def download_profile_file(profile_id: str, file_path: str):
+    downloads_dir = _profile_downloads_dir(profile_id)
+    if downloads_dir is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    resolved = _resolve_download_path(downloads_dir, file_path)
+    if resolved is None or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(resolved, filename=resolved.name)
+
+
+@app.delete("/api/profiles/{profile_id}/downloads/{file_path:path}")
+async def delete_profile_download(profile_id: str, file_path: str):
+    downloads_dir = _profile_downloads_dir(profile_id)
+    if downloads_dir is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    resolved = _resolve_download_path(downloads_dir, file_path)
+    if resolved is None or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    resolved.unlink()
+    return {"ok": True}
+
+
+# Hyphenated, not nested under /downloads/ — {file_path:path} above is a
+# catch-all for that prefix, and a literal "zip" segment would otherwise be
+# indistinguishable from a request for a file actually named "zip".
+@app.get("/api/profiles/{profile_id}/downloads-zip")
+async def download_profile_files_as_zip(profile_id: str):
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    downloads_dir = Path(profile["user_data_dir"]) / "Downloads"
+    files = [p for p in downloads_dir.iterdir() if p.is_file()] if downloads_dir.is_dir() else []
+    if not files:
+        raise HTTPException(status_code=404, detail="No downloads to zip")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in files:
+            try:
+                zf.write(path, arcname=path.name)
+            except OSError as exc:
+                # Same tolerance as the plain listing: a file mid-write or
+                # removed mid-zip should shrink the archive, not fail it.
+                logger.debug("Skipping %s in downloads zip: %s", path, exc)
+    buffer.seek(0)
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", profile["name"]).strip("_") or profile_id
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}-downloads.zip"'},
+    )
 
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -489,19 +624,55 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.delete("/api/profiles/{profile_id}")
 async def delete_profile(profile_id: str):
+    # A launch in flight owns the user_data_dir: deleting now would rmtree it
+    # under a Chromium that is still starting, and the launch would then
+    # register a RunningProfile for a profile that no longer exists.
+    if browser_mgr.is_starting(profile_id):
+        raise HTTPException(status_code=409, detail="Profile is starting; try again")
+
+    # Hold the id for the whole delete: the re-check after stop() narrows the
+    # launch race but cannot close it, because a launch can still claim the
+    # profile between that check and the rmtree.
+    if not browser_mgr.claim_for_delete(profile_id):
+        raise HTTPException(status_code=409, detail="Profile is already being deleted")
+    try:
+        return await _delete_profile_locked(profile_id)
+    finally:
+        browser_mgr.release_delete_claim(profile_id)
+
+
+async def _delete_profile_locked(profile_id: str):
+    # A previous /stop may have left Chromium alive (bounded close timed out).
+    # It is out of `running`, so the stop below would be skipped and the rmtree
+    # would run under a live browser.
+    if await browser_mgr.check_wedged(profile_id):
+        raise HTTPException(
+            status_code=409, detail=_SHUTTING_DOWN_DETAIL,
+        )
+
     # Stop browser if running
     if profile_id in browser_mgr.running:
-        await browser_mgr.stop(profile_id)
+        closed = await browser_mgr.stop(profile_id)
+        # stop() awaits a context close, and a launch can claim the profile
+        # during that window. Deleting now would rmtree user_data_dir under a
+        # Chromium that is starting on it. Re-check rather than race.
+        if browser_mgr.is_starting(profile_id) or profile_id in browser_mgr.running:
+            raise HTTPException(status_code=409, detail="Profile restarted; try again")
+        if not closed:
+            # The teardown outlived its bound, so Chromium may still be alive
+            # and writing to user_data_dir. Deleting it now corrupts a live
+            # profile; refuse rather than race a wedged browser.
+            raise HTTPException(
+                status_code=409, detail=_SHUTTING_DOWN_DETAIL,
+            )
+
+    # Revoke viewer tokens even if the profile wasn't running
+    viewer_tokens.revoke_profile(profile_id)
 
     profile = db.get_profile(profile_id)
     if not profile:
@@ -512,9 +683,14 @@ async def delete_profile(profile_id: str):
     # DB first — if this fails, filesystem is untouched
     db.delete_profile(profile_id)
 
-    # Then clean up disk
+    # Then clean up disk. Off the event loop: a Chromium profile directory can
+    # be hundreds of MB, and rmtree here would block every other request for
+    # its duration — including the nginx auth_request subrequests that gate the
+    # viewer, stalling live sessions on an unrelated delete.
     if user_data_dir.exists():
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: shutil.rmtree(user_data_dir, ignore_errors=True),
+        )
 
     return {"ok": True}
 
@@ -529,9 +705,27 @@ async def launch_profile(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not found")
     if profile_id in browser_mgr.running:
         raise HTTPException(status_code=409, detail="Profile is already running")
+    if browser_mgr.is_starting(profile_id):
+        raise HTTPException(status_code=409, detail="Profile is already starting")
+    # Say what is actually true. A teardown in flight used to surface here as
+    # "Profile is already running" — flatly contradicting the status the same
+    # API reported a poll earlier, and contradicting DELETE, which reported the
+    # shutdown correctly. One state, one message.
+    if await browser_mgr.check_wedged(profile_id):
+        raise HTTPException(status_code=409, detail=_SHUTTING_DOWN_DETAIL)
 
     try:
-        running = await browser_mgr.launch(profile)
+        # Same ceiling auto-launch uses: without it a wedged Playwright call
+        # hangs the request and strands the id in `_launching` forever.
+        running = await asyncio.wait_for(
+            browser_mgr.launch(profile), timeout=LAUNCH_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Launch timed out for profile %s", profile_id)
+        raise HTTPException(status_code=504, detail="Launch timed out")
+    except ProfileAlreadyRunning:
+        # Lost a race with another launch (or a delete) after the checks above.
+        raise HTTPException(status_code=409, detail="Profile is already running")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -542,7 +736,7 @@ async def launch_profile(profile_id: str):
         profile_id=profile_id,
         status="running",
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}",
+        display=f":{running.display}" if running.display is not None else None,
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -550,9 +744,21 @@ async def launch_profile(profile_id: str):
 @app.post("/api/profiles/{profile_id}/stop")
 async def stop_profile(profile_id: str):
     if profile_id not in browser_mgr.running:
+        # Mid-launch is not "not running" — stopping now would race the launch
+        # into registering the instance we just tore down.
+        if browser_mgr.is_starting(profile_id):
+            raise HTTPException(status_code=409, detail="Profile is starting; try again")
+        # Neither is mid-teardown. 404 "Profile is not running" was the third
+        # of three contradictory answers for one state (list said "stopped",
+        # launch said "already running", delete said "shutting down"), and it
+        # is the one that tells the operator to stop trying.
+        if await browser_mgr.check_wedged(profile_id):
+            raise HTTPException(status_code=409, detail=_SHUTTING_DOWN_DETAIL)
         raise HTTPException(status_code=404, detail="Profile is not running")
-    await browser_mgr.stop(profile_id)
-    return {"ok": True}
+    closed = await browser_mgr.stop(profile_id)
+    # Report honestly: the display is reclaimed either way, but a wedged
+    # Chromium means the profile is not cleanly down.
+    return {"ok": True, "browser_closed": closed}
 
 
 @app.get("/api/profiles/{profile_id}/status", response_model=ProfileStatusResponse)
@@ -560,8 +766,423 @@ async def get_profile_status(profile_id: str):
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
+    status = await browser_mgr.get_liveness_async(profile_id)
     return ProfileStatusResponse(**status)
+
+
+@app.get("/api/profiles/{profile_id}/resources", response_model=ResourceUsageResponse)
+async def get_profile_resources(profile_id: str):
+    """CPU/memory for a profile's whole Chromium process tree (root browser
+    process plus every renderer/GPU/utility subprocess), not just the root.
+
+    Takes ~CPU_SAMPLE_INTERVAL_S (200ms) to answer — see resources.py for
+    why that is the deliberately simple alternative to caching psutil
+    Process objects across polls.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if not running or running.proc is None:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    usage = await get_resource_usage(running.proc)
+    idle_remaining = None
+    if running.idle_timeout_seconds > 0:
+        elapsed = time.monotonic() - running.last_active
+        idle_remaining = max(0, round(running.idle_timeout_seconds - elapsed))
+    return ResourceUsageResponse(**usage, idle_remaining_seconds=idle_remaining)
+
+
+# ── Tab manager ──────────────────────────────────────────────────────────────
+# Lets an operator see and close a profile's open tabs without opening its VNC
+# viewer. Each page's title/favicon read is individually bounded so one
+# wedged tab cannot block the whole listing — same pattern as
+# _read_clipboard_from_pages above.
+_TAB_PAGE_TIMEOUT_S = 2.0
+_TAB_MAX_PAGES = 50  # sane upper bound on one listing/close request
+
+_FAVICON_JS = "() => document.querySelector(\"link[rel~='icon']\")?.href || null"
+
+
+async def _tab_info(page: Any, index: int) -> TabInfo:
+    try:
+        title = await asyncio.wait_for(page.title(), timeout=_TAB_PAGE_TIMEOUT_S)
+    except Exception:
+        title = ""
+    url = page.url
+    try:
+        favicon = await asyncio.wait_for(
+            page.evaluate(_FAVICON_JS), timeout=_TAB_PAGE_TIMEOUT_S,
+        )
+    except Exception:
+        favicon = None
+    return TabInfo(index=index, title=title or url, url=url, favicon=favicon)
+
+
+@app.get("/api/profiles/{profile_id}/tabs", response_model=ProfileTabsResponse)
+async def list_profile_tabs(profile_id: str):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    pages = list(running.context.pages)[:_TAB_MAX_PAGES]
+    tabs = await asyncio.gather(*(_tab_info(page, i) for i, page in enumerate(pages)))
+    return ProfileTabsResponse(tabs=list(tabs))
+
+
+@app.delete("/api/profiles/{profile_id}/tabs/{index}")
+async def close_profile_tab(profile_id: str, index: int):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    pages = list(running.context.pages)
+    if index < 0 or index >= len(pages):
+        raise HTTPException(status_code=404, detail="Tab not found")
+    try:
+        await asyncio.wait_for(pages[index].close(), timeout=_TAB_PAGE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Timed out closing tab")
+    except Exception as exc:
+        logger.warning("Failed to close tab %d for profile %s: %s", index, profile_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to close tab")
+    return {"ok": True}
+
+
+# ── Cookie Warmup ─────────────────────────────────────────────────────────────
+# A profile stopping mid-warmup is not specially handled here: the running
+# asyncio.Task notices via is_still_running() at the next per-site boundary
+# (at most one dwell interval, ~30s) and ends itself in the "cancelled" state
+# on its own — see cookie_warmup.run()'s docstring.
+
+
+def _cookie_warmup_response(status: cookie_warmup.WarmupStatus) -> CookieWarmupStatusResponse:
+    elapsed = None
+    remaining = None
+    if status.started_at is not None:
+        end = status.finished_at if status.finished_at is not None else time.monotonic()
+        elapsed = end - status.started_at
+        remaining = max(0.0, cookie_warmup.WARMUP_DURATION_SECONDS - elapsed)
+    return CookieWarmupStatusResponse(
+        state=status.state,
+        sites_total=status.sites_total,
+        sites_visited=status.sites_visited,
+        current_site=status.current_site,
+        elapsed_seconds=elapsed,
+        remaining_seconds=remaining,
+        error=status.error,
+    )
+
+
+@app.post(
+    "/api/profiles/{profile_id}/cookie-warmup/start",
+    response_model=CookieWarmupStatusResponse,
+    status_code=202,
+)
+async def start_cookie_warmup(profile_id: str):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    existing_task = _warmup_tasks.get(profile_id)
+    if existing_task is not None and not existing_task.done():
+        raise HTTPException(status_code=409, detail="Cookie warmup already running for this profile")
+
+    context = running.context
+    status = cookie_warmup.new_status()
+    _warmup_status[profile_id] = status
+
+    def is_still_running() -> bool:
+        current = browser_mgr.running.get(profile_id)
+        return current is not None and current.context is context
+
+    _warmup_tasks[profile_id] = asyncio.create_task(cookie_warmup.run(context, status, is_still_running))
+    return _cookie_warmup_response(status)
+
+
+@app.get("/api/profiles/{profile_id}/cookie-warmup/status", response_model=CookieWarmupStatusResponse)
+async def get_cookie_warmup_status(profile_id: str):
+    if not db.get_profile(profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    status = _warmup_status.get(profile_id)
+    if status is None:
+        return CookieWarmupStatusResponse()
+    return _cookie_warmup_response(status)
+
+
+@app.post("/api/profiles/{profile_id}/cookie-warmup/stop", response_model=CookieWarmupStatusResponse)
+async def stop_cookie_warmup(profile_id: str):
+    task = _warmup_tasks.get(profile_id)
+    status = _warmup_status.get(profile_id)
+    if task is None or status is None or task.done():
+        raise HTTPException(status_code=404, detail="No cookie warmup running for this profile")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return _cookie_warmup_response(status)
+
+
+# ── Viewer Sessions (KasmVNC native client) ──────────────────────────────────
+# FastAPI is the control plane only: it issues short-lived viewer tokens and
+# authorizes viewer requests for nginx (auth_request). nginx proxies the
+# actual page assets and WebSocket straight to KasmVNC's own HTTP server.
+
+
+def _extract_viewer_token(uri: str) -> str | None:
+    """Extract the viewer token from an X-Original-URI like /viewer/<token>/..."""
+    path = uri.split("?", 1)[0]
+    parts = path.split("/")
+    # expect ["", "viewer", "<token>", ...]
+    if len(parts) >= 3 and parts[1] == "viewer" and parts[2]:
+        return parts[2]
+    return None
+
+
+@app.post("/api/profiles/{profile_id}/viewer-token", response_model=ViewerTokenResponse)
+async def create_viewer_token(profile_id: str):
+    """Issue a fresh short-lived viewer token for a running profile.
+
+    Each page load calls this once; the token then authorizes both the viewer
+    page assets and the WebSocket (via /api/viewer-auth) until expiry.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        # A profile mid-launch (container restart, auto-launch queue) is not
+        # gone — 404 is terminal to the viewer, 503 tells it to keep retrying.
+        if browser_mgr.is_starting(profile_id):
+            raise HTTPException(status_code=503, detail="Profile is starting")
+        raise HTTPException(status_code=404, detail="Profile not running")
+    if running.ws_port is None:
+        # Headless: no Xvnc was ever started, so there is nothing to view.
+        # 409 rather than 404 — the profile IS running, it just has no
+        # display; 404 would send the viewer to a "session ended" overlay
+        # implying the browser died.
+        raise HTTPException(
+            status_code=409, detail="Profile is headless and has no viewer",
+        )
+    token = viewer_tokens.issue(
+        profile_id, running.ws_port, ttl=VIEWER_TOKEN_TTL,
+        session_epoch=running.session_epoch,
+    )
+    logger.info("Issued viewer token for profile %s (ttl=%ds)", profile_id, VIEWER_TOKEN_TTL)
+    return ViewerTokenResponse(
+        token=token,
+        viewer_url=f"/viewer/{token}/",
+        expires_in=VIEWER_TOKEN_TTL,
+        stream_mode=viewer_stream_mode_preference(),
+    )
+
+
+@app.get("/api/viewer-auth")
+async def viewer_auth(request: Request):
+    """Authorize a viewer request for nginx auth_request.
+
+    Exempt from app auth — the viewer token itself is the credential.
+    On success returns 200 with X-Viewer-Upstream so nginx can proxy to the
+    right KasmVNC instance. Never logs the token value.
+    """
+    token = _extract_viewer_token(request.headers.get("x-original-uri", ""))
+    if not token:
+        raise HTTPException(status_code=403, detail="Missing viewer token")
+
+    session = viewer_tokens.validate(token)
+    if not session:
+        raise HTTPException(status_code=403, detail="Invalid or expired viewer token")
+
+    running = browser_mgr.running.get(session.profile_id)
+    if not running:
+        # 403, not 404: nginx auth_request only understands 2xx (allow) and
+        # 401/403 (deny). Anything else is "auth request unexpected status"
+        # and the viewer gets a bare 500 instead of a clean denial.
+        raise HTTPException(status_code=403, detail="Profile not running")
+
+    # Upstream and credentials must come from the same source of truth. The
+    # token names the session it was minted for; the credentials come from the
+    # live display. If a token ever outlives a relaunch, mixing the two would
+    # point nginx at a stale port while handing it valid-looking auth for a
+    # different display.
+    #
+    # Be clear about what this is: NEITHER comparison can fire today. Every
+    # path that clears `running` — stop(), _on_browser_closed() and DELETE —
+    # revokes the profile's tokens first, so a token that reaches here always
+    # belongs to the session currently in `running` and validate() has already
+    # rejected the rest. That ordering is the real defence, and it is pinned by
+    # test_teardown_revokes_before_the_profile_can_be_relaunched.
+    #
+    # It is kept because it is the only thing standing between a future reorder
+    # of that ordering and cross-session authorization: a surviving token would
+    # otherwise be handed the NEW session's upstream and the NEW display's
+    # credentials. This turns that into a clean 403 instead.
+    #
+    # The epoch is what does the work; the port is a free second assertion that
+    # cannot fire on its own, because allocate() gap-fills from BASE_DISPLAY up
+    # and a stop+relaunch of the same profile deterministically returns the
+    # identical display and ws_port.
+    if session.session_epoch != running.session_epoch or session.ws_port != running.ws_port:
+        logger.info("Viewer token for profile %s predates a relaunch", session.profile_id)
+        raise HTTPException(status_code=403, detail="Viewer token is stale")
+
+    headers = {"X-Viewer-Upstream": f"127.0.0.1:{running.ws_port}"}
+    # Kasm's HTTP layer requires Basic auth; nginx injects this on the
+    # origin request so the browser never handles the credentials.
+    creds = browser_mgr.vnc.get_api_credentials(running.display)
+    if creds:
+        import base64
+
+        raw = f"{creds[0]}:{creds[1]}".encode()
+        headers["X-Viewer-Authorization"] = "Basic " + base64.b64encode(raw).decode()
+
+    return Response(status_code=200, headers=headers)
+
+
+# An idle profile never produces the encoded frame get_frame_stats waits for,
+# so this request is expected to time out; keep it well under the client-wide
+# timeout so a stats poll stays cheap.
+KASM_FRAME_STATS_TIMEOUT_S = 1.5
+# KASM_VIEWER_PROBE_TIMEOUT_S and _viewer_attached live in browser_manager.py
+# (imported above) — reap_idle_profiles needs the exact same "is a viewer
+# attached" definition this endpoint uses, and a second copy would eventually
+# disagree with the first.
+
+
+def _viewer_client_count(bottleneck) -> int | None:
+    """Number of attached viewer endpoints, or None if indeterminate.
+
+    The payload is {username: {peerEndpoint: [...]}} — one inner key per live
+    socket, so -AlwaysShared multi-viewer sessions are counted, not collapsed.
+    """
+    if not isinstance(bottleneck, dict):
+        return None
+    return sum(len(v) for v in bottleneck.values() if isinstance(v, dict))
+
+
+@app.get("/api/profiles/{profile_id}/viewer-attached")
+async def viewer_attached(profile_id: str):
+    """Whether a viewer WebSocket is currently attached to this profile.
+
+    The frontend's connected-heartbeat can only prove the *processes* are alive
+    via /status, so a half-open viewer socket leaves a green dot over a frozen
+    frame until TCP RTO fires. This is the missing signal, and it is cheap:
+    one bounded localhost GET, no frame-clock dependency.
+
+    Always 200 for a running profile — `viewer_attached: null` means the probe
+    could not answer, which is deliberately distinct from `false` so a caller
+    cannot mistake a stats-endpoint hiccup for a dead viewer.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+
+    bottleneck = None
+    try:
+        auth = browser_mgr.vnc.get_api_credentials(running.display)
+        async with httpx.AsyncClient(
+            timeout=KASM_VIEWER_PROBE_TIMEOUT_S, auth=auth,
+        ) as client:
+            resp = await client.get(
+                f"http://127.0.0.1:{running.ws_port}/api/get_bottleneck_stats"
+            )
+        if resp.status_code >= 400:
+            # Not a 502: an unauthenticated or broken stats endpoint says
+            # nothing about the viewer socket, and the heartbeat that consumes
+            # this must be able to shrug it off rather than error out.
+            logger.warning(
+                "Viewer probe: bottleneck stats returned HTTP %d for %s",
+                resp.status_code, profile_id,
+            )
+        else:
+            bottleneck = _json_or_raw(resp)
+    except Exception as exc:
+        logger.debug("Viewer probe unavailable for %s: %s", profile_id, exc)
+
+    return {
+        "viewer_attached": _viewer_attached(bottleneck),
+        "clients": _viewer_client_count(bottleneck),
+    }
+
+
+@app.get("/api/profiles/{profile_id}/kasm-stats")
+async def kasm_stats(profile_id: str):
+    """Fetch KasmVNC's bottleneck/frame stats for a running profile."""
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+
+    try:
+        # Kasm's management API always requires owner Basic auth (random
+        # per-display credentials generated at Xvnc launch).
+        auth = browser_mgr.vnc.get_api_credentials(running.display)
+        async with httpx.AsyncClient(timeout=5, auth=auth) as client:
+            bottleneck_resp, sessions_resp = await asyncio.gather(
+                client.get(f"http://127.0.0.1:{running.ws_port}/api/get_bottleneck_stats"),
+                client.get(f"http://127.0.0.1:{running.ws_port}/api/get_sessions"),
+            )
+            # Kasm answers 401 (bad/missing owner creds) or 5xx with an HTML
+            # body. _json_or_raw would happily hand that back as the payload,
+            # so the caller would see 200 with an error page where the stats
+            # should be — indistinguishable from real data.
+            for label, resp in (("bottleneck", bottleneck_resp), ("sessions", sessions_resp)):
+                if resp.status_code >= 400:
+                    logger.error(
+                        "Kasm stats: %s returned HTTP %d for %s",
+                        label, resp.status_code, profile_id,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"KasmVNC stats endpoint returned {resp.status_code}",
+                    )
+            # With no viewer connected these can be empty/non-JSON.
+            bottleneck = _json_or_raw(bottleneck_resp)
+            sessions = _json_or_raw(sessions_resp)
+
+            # /api/get_frame_stats blocks until Kasm produces an encoded frame
+            # with non-zero encoding time (websocket.c:1600-1612 polls
+            # netServerFrameStatsReady 500x20ms), then answers 503. It has
+            # nothing to do with the client's enable_perf_stats, which drives a
+            # separate non-fatal 2s wait — a live client on a static screen
+            # still eats the full 10s. So it must be both gated and bounded.
+            #
+            # Gate on bottleneck, never on sessions: get_sessions is provably
+            # stale. VNCServerST::updateSessionUsersList only republishes when
+            # the list is NON-empty, and the disconnect path marks the client
+            # CLOSING (so it stops counting as authenticated) before calling it
+            # — the last viewer's departure computes an empty list and throws it
+            # away, leaving sessionsInfo populated forever. Gating on it made
+            # this call fire on every /kasm-stats after the first viewer ever
+            # attached, costing the client's whole 5s read timeout each time.
+            frame = None
+            if _viewer_attached(bottleneck):
+                try:
+                    frame_resp = await client.get(
+                        f"http://127.0.0.1:{running.ws_port}/api/get_frame_stats",
+                        params={"client": "all"},
+                        # Own timeout: an idle profile draws no frames, so this
+                        # request is expected to hang. 1.5s bounds the common
+                        # case instead of paying the client-wide 5s.
+                        timeout=KASM_FRAME_STATS_TIMEOUT_S,
+                    )
+                    frame = _json_or_raw(frame_resp)
+                except Exception as exc:
+                    logger.debug("Kasm frame stats unavailable for %s: %s", profile_id, exc)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Kasm stats: failed to reach KasmVNC for %s: %s", profile_id, exc)
+        raise HTTPException(status_code=502, detail="KasmVNC stats endpoint unreachable")
+
+    return {"bottleneck": bottleneck, "sessions": sessions, "frame": frame}
+
+
+def _json_or_raw(resp: httpx.Response):
+    """Parse a Kasm API response as JSON, falling back to raw text/None.
+
+    Kasm emits `-nan` for not-yet-measured stats, which is not valid JSON —
+    normalize it to null before parsing.
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        pass
+    try:
+        return json.loads(re.sub(r"-?nan\b", "null", resp.text))
+    except ValueError:
+        return resp.text or None
 
 
 # ── System Status ─────────────────────────────────────────────────────────────
@@ -572,19 +1193,148 @@ async def get_system_status():
     from cloakbrowser.config import CHROMIUM_VERSION
 
     profiles = db.list_profiles()
+    binary = binary_status_snapshot()
     return StatusResponse(
         running_count=len(browser_mgr.running),
         binary_version=CHROMIUM_VERSION,
         profiles_total=len(profiles),
+        binary_downloading=binary["downloading"],
+        binary_download_percent=binary["percent"],
+        binary_download_state=binary["state"],
+        default_idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_S,
     )
+
+
+@app.get("/api/system-check", response_model=SystemCheckResponse)
+async def system_check():
+    """Container-level diagnostics snapshot for the UI's self-check panel —
+    see system_check.py for exactly what each field means and does not mean.
+    """
+    return SystemCheckResponse(**get_system_check(db.DATA_DIR))
+
+
+# ── Extensions ────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/extensions", response_model=list[ExtensionResponse])
+async def get_extensions():
+    # list_available_extensions() is cached from the scan lifespan already
+    # did at startup — this is a plain in-memory read, not a filesystem scan.
+    return [ExtensionResponse(**e) for e in list_available_extensions()]
+
+
+@app.post("/api/extensions/rescan", response_model=list[ExtensionResponse])
+async def rescan_extensions_endpoint():
+    """Re-scan EXTENSIONS_DIR right now, replacing the cached list.
+
+    An explicit operator action (the UI's "Rescan" button, or right after an
+    upload) — not a substitute for the normal once-per-start cache. See
+    extensions.py's rescan_extensions() for why that distinction matters.
+    """
+    return [ExtensionResponse(**e) for e in rescan_extensions()]
+
+
+@app.post("/api/extensions/upload", response_model=list[ExtensionResponse])
+async def upload_extension(file: UploadFile = File(...)):
+    """Install an uploaded .zip or .crx extension archive and rescan.
+
+    install_extension_from_bytes() is synchronous file/zip I/O — off the
+    event loop the same way ensure_binary() and profile deletion's rmtree
+    already are, so one large upload can't stall every other request.
+    """
+    data = await file.read()
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, install_extension_from_bytes, data, file.filename or "extension",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return [ExtensionResponse(**e) for e in list_available_extensions()]
+
+
+@app.post("/api/extensions/install-from-url", response_model=list[ExtensionResponse])
+async def install_extension_from_url(req: ExtensionInstallFromUrlRequest):
+    """Install an extension straight from a Chrome Web Store URL (or a bare
+    extension id) — no manual crx fetch/unzip needed.
+
+    Never forwards the caller's URL to httpx directly: only a 32-character
+    id is ever extracted from it, and the actual download always targets a
+    URL this function builds itself against Google's own component-update
+    server, the same one Chrome uses. That is what keeps a user-supplied
+    "url" field from being an SSRF vector into the container's network.
+    """
+    extension_id = extract_extension_id(req.url)
+    if not extension_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not find a Chrome extension id in that URL. Paste the "
+                "chromewebstore.google.com/detail/... URL, or the bare id."
+            ),
+        )
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(chrome_web_store_crx_url(extension_id))
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as exc:
+        logger.error("Extension fetch failed for id %s: %s", extension_id, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to download extension: {exc}")
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, install_extension_from_bytes, data, extension_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return [ExtensionResponse(**e) for e in list_available_extensions()]
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────
 
 _CLIPBOARD_MAX_READ = 1_048_576  # 1MB cap on GET response
+# Playwright 1.60 has no timeout parameter on page.evaluate and the call is
+# unbounded all the way down (_inner_send waits on FIRST_COMPLETED with no
+# deadline), so a page running `while(true){}` made GET /clipboard hang
+# forever — permanently, because the loop never reached the next page or the
+# xclip fallback, and uvicorn does not cancel a handler when the client goes
+# away. Both a per-page and a whole-loop bound are needed: without the second,
+# N wedged tabs sum to N * the first.
+_CLIPBOARD_PAGE_TIMEOUT_S = 2.0
+_CLIPBOARD_READ_TIMEOUT_S = 5.0
+_CLIPBOARD_MAX_PAGES = 20
 
 # Track xclip processes per display so we can kill the old one before spawning new
 _xclip_procs: dict[int, asyncio.subprocess.Process] = {}
+# One lock per display. The pop/spawn/store sequence below contains two awaits,
+# so three concurrent pastes on one display each popped the same entry and only
+# the last was tracked — the other two owned the X11 CLIPBOARD selection,
+# were never killed, and outlived the request.
+_xclip_locks: dict[int, asyncio.Lock] = {}
+
+
+def _xclip_lock(display: int) -> asyncio.Lock:
+    lock = _xclip_locks.get(display)
+    if lock is None:
+        lock = _xclip_locks[display] = asyncio.Lock()
+    return lock
+
+
+def _reap_xclip_for_display(display: int) -> None:
+    """Kill the xclip bound to a display once its Xvnc is gone.
+
+    Registered on BrowserManager at startup. Nothing used to remove entries
+    from _xclip_procs on stop, delete or crash, so every xclip ever spawned
+    survived for the container's lifetime holding a selection on a dead X
+    server.
+    """
+    proc = _xclip_procs.pop(display, None)
+    _xclip_locks.pop(display, None)
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError) as exc:
+            logger.debug("xclip for :%d already gone: %s", display, exc)
 
 
 @app.post("/api/profiles/{profile_id}/clipboard")
@@ -596,26 +1346,76 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
 
     import os
 
-    # Kill previous xclip for this display (it stays alive to serve paste)
-    old = _xclip_procs.pop(running.display, None)
-    if old and old.returncode is None:
-        old.kill()
-        await old.wait()
+    display = running.display
+    if display is None:
+        # Headless: no X server, so there is no X clipboard to push into.
+        # Without this the DISPLAY below becomes the literal ":None" and
+        # xclip fails with an error the caller cannot act on.
+        raise HTTPException(
+            status_code=409, detail="Profile is headless and has no X clipboard",
+        )
+    async with _xclip_lock(display):
+        # Kill previous xclip for this display (it stays alive to serve paste)
+        old = _xclip_procs.pop(display, None)
+        if old and old.returncode is None:
+            old.kill()
+            await old.wait()
 
-    env = {**os.environ, "DISPLAY": f":{running.display}"}
-    proc = await asyncio.create_subprocess_exec(
-        "xclip", "-selection", "clipboard",
-        stdin=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    # xclip reads stdin then stays alive to serve paste requests.
-    proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
-    await proc.stdin.drain()  # type: ignore[union-attr]
-    proc.stdin.close()  # type: ignore[union-attr]
+        env = {**os.environ, "DISPLAY": f":{display}"}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xclip", "-selection", "clipboard",
+                stdin=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            # No xclip (local dev per the README) used to escape the handler as
+            # an unhandled FileNotFoundError and 500 with a traceback.
+            logger.warning("Clipboard relay unavailable for :%d: %s", display, exc)
+            raise HTTPException(status_code=503, detail="Clipboard relay unavailable")
 
-    _xclip_procs[running.display] = proc
+        try:
+            # xclip reads stdin then stays alive to serve paste requests.
+            proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
+            await proc.stdin.drain()  # type: ignore[union-attr]
+            proc.stdin.close()  # type: ignore[union-attr]
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            # xclip exits immediately when DISPLAY is unreachable (a dead
+            # Xvnc). Reap it here rather than leaving it untracked.
+            logger.warning("Clipboard write failed on :%d: %s", display, exc)
+            if proc.returncode is None:
+                proc.kill()
+            raise HTTPException(status_code=503, detail="Clipboard relay unavailable")
+
+        _xclip_procs[display] = proc
 
     return {"ok": True}
+
+
+async def _read_clipboard_from_pages(context) -> str:
+    """First non-empty captured selection across a context's pages.
+
+    Each evaluate is individually bounded so ONE wedged tab is skipped rather
+    than fatal — previously it blocked the loop before page[1] and before the
+    xclip fallback, killing the endpoint for that profile permanently. The page
+    count is capped so the caller's own bound is not the only thing standing
+    between a tab explosion and a slow request.
+    """
+    for page in list(context.pages)[:_CLIPBOARD_MAX_PAGES]:
+        try:
+            text = await asyncio.wait_for(
+                page.evaluate("window.__clipboardText || ''"),
+                timeout=_CLIPBOARD_PAGE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Clipboard read timed out on a wedged page; skipping")
+            continue
+        except Exception as exc:
+            logger.debug("Clipboard read failed on page: %s", exc)
+            continue
+        if text:
+            return text
+    return ""
 
 
 @app.get("/api/profiles/{profile_id}/clipboard")
@@ -636,27 +1436,37 @@ async def get_clipboard(profile_id: str):
     # The init script also captures copy events when they do fire.
     # Check all pages — user may have copied in any tab
     try:
-        for page in running.context.pages:
-            try:
-                text = await page.evaluate("window.__clipboardText || ''")
-                if text:
-                    return {"text": text[:_CLIPBOARD_MAX_READ]}
-            except Exception as exc:
-                logger.debug("Clipboard read failed on page: %s", exc)
-                continue
+        text = await asyncio.wait_for(
+            _read_clipboard_from_pages(running.context),
+            timeout=_CLIPBOARD_READ_TIMEOUT_S,
+        )
+        if text:
+            return {"text": text[:_CLIPBOARD_MAX_READ]}
     except Exception as exc:
+        # Includes the whole-loop TimeoutError: N wedged tabs must not sum to
+        # N * _CLIPBOARD_PAGE_TIMEOUT_S before the xclip fallback is tried.
         logger.debug("Playwright clipboard read failed: %s", exc)
 
-    # Fallback: xclip for non-Chrome clipboard owners
+    # Fallback: xclip for non-Chrome clipboard owners. The Playwright read
+    # above works for a headless profile; this leg cannot, because there is
+    # no X server behind it.
     import os
 
+    if running.display is None:
+        return {"text": ""}
+
     env = {**os.environ, "DISPLAY": f":{running.display}"}
-    proc = await asyncio.create_subprocess_exec(
-        "xclip", "-selection", "clipboard", "-o",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "xclip", "-selection", "clipboard", "-o",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        # Degrade to an empty clipboard rather than a 500 with a traceback.
+        logger.warning("Clipboard relay unavailable for :%d: %s", running.display, exc)
+        return {"text": ""}
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
     except asyncio.TimeoutError:
@@ -671,187 +1481,85 @@ async def get_clipboard(profile_id: str):
     return {"text": text}
 
 
-# ── VNC WebSocket Proxy ──────────────────────────────────────────────────────
+# ── CDP WebSocket Proxy ──────────────────────────────────────────────────────
+# Simple bidirectional passthrough — CDP is standard JSON over WebSocket.
 
 
-@app.websocket("/api/profiles/{profile_id}/vnc")
-async def vnc_proxy(websocket: WebSocket, profile_id: str):
-    """Proxy WebSocket frames between the frontend and a profile's KasmVNC."""
-    if not await _check_websocket_origin(websocket):
-        return
+async def _ensure_running_for_cdp(profile_id: str) -> tuple[RunningProfile | None, str]:
+    """Auto-launch a profile on its first CDP hit if it isn't already running.
 
+    A safeguard, not the primary flow: whoever holds a profile id is expected
+    to have launched it through the UI/API already, exactly like the idle
+    reaper expects them to have stopped watching it before it goes idle. But a
+    CDP client (Playwright, Puppeteer, chrome-remote-interface) that dials
+    straight into a stopped profile id should get a working session, not a
+    404 for a profile that plainly exists and could serve one — the same
+    capability-URL model that already lets that id skip the bearer token
+    (see _PROFILE_CAPABILITY_PATH above) covers launching it too.
+
+    Returns (running, "") on success, or (None, <reason>) — the reason is
+    "Profile not found" only when the id has no profile at all; every other
+    failure is a launch problem, not a 404.
+    """
     running = browser_mgr.running.get(profile_id)
-    if not running:
-        await websocket.close(code=4004, reason="Profile not running")
-        return
+    if running:
+        return running, ""
 
-    # Accept with client's requested subprotocol (if any) — RFC 6455 requires
-    # the server must not respond with a subprotocol the client didn't request.
-    requested = websocket.scope.get("subprotocols", [])
-    subprotocol = "binary" if "binary" in requested else None
-    await websocket.accept(subprotocol=subprotocol)
+    profile = db.get_profile(profile_id)
+    if not profile:
+        return None, "Profile not found"
 
-    import websockets
-
-    vnc_url = f"ws://127.0.0.1:{running.ws_port}/websockify"
+    if browser_mgr.is_starting(profile_id):
+        # Something else already kicked off a launch (e.g. a concurrent CDP
+        # hit, or the UI). Wait it out instead of racing a second launch.
+        deadline = time.monotonic() + LAUNCH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            running = browser_mgr.running.get(profile_id)
+            if running:
+                return running, ""
+            if not browser_mgr.is_starting(profile_id):
+                break
+        running = browser_mgr.running.get(profile_id)
+        return (running, "") if running else (None, "Launch timed out")
 
     try:
-        async with websockets.connect(
-            vnc_url,
-            subprotocols=["binary"],
-            origin=f"http://127.0.0.1:{running.ws_port}",
-            max_size=None,  # VNC frames can be large (1920x1080 framebuffer)
-            ping_interval=None,  # KasmVNC doesn't respond to WS pings
-            ping_timeout=None,
-            compression=None,  # KasmVNC can't handle permessage-deflate
-        ) as vnc_ws:
-            logger.info(
-                "VNC proxy: connected to KasmVNC for %s (subprotocol=%s)",
-                profile_id, vnc_ws.subprotocol,
-            )
-
-            # noVNC v1.4 sends extension message types (150=ContinuousUpdates,
-            # 248=QEMUKey, etc.) that KasmVNC 1.3.3 doesn't support, causing
-            # "unknown message type" → disconnect.
-            #
-            # noVNC batches multiple RFB messages into a single WebSocket frame,
-            # so we must parse the RFB stream to find message boundaries and strip
-            # unsupported types before forwarding. Standard client→server types
-            # have known fixed sizes (except SetEncodings and ClientCutText which
-            # encode their length).
-
-            async def client_to_vnc():
-                count = 0
-                handshake = 0  # first 3 messages are RFB handshake
-                dropped = 0
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        msg_type = msg.get("type", "")
-                        if msg_type == "websocket.disconnect":
-                            logger.info("VNC proxy [c->v]: client disconnect (code=%s) after %d msgs (%d dropped)", msg.get("code"), count, dropped)
-                            break
-                        if "bytes" in msg and msg["bytes"]:
-                            count += 1
-                            data = msg["bytes"]
-                            handshake += 1
-
-                            # First 3 messages are RFB handshake — forward as-is
-                            if handshake <= 3:
-                                logger.debug("VNC handshake #%d: %d bytes hex=%s", handshake, len(data), data[:20].hex())
-                                await vnc_ws.send(data)
-                                continue
-
-                            # Parse RFB messages and strip unsupported types
-                            filtered = _filter_rfb_client_messages(data)
-                            if filtered:
-                                # Safety: verify first byte is a valid RFB client type
-                                if filtered[0] not in _RFB_MSG_SIZE:
-                                    logger.error("RFB SAFETY: refusing to send data with invalid first byte=%d hex=%s",
-                                                 filtered[0], filtered[:20].hex())
-                                    dropped += 1
-                                    continue
-                                logger.debug("VNC send: %d bytes first_type=%d hex=%s", len(filtered), filtered[0], filtered[:100].hex())
-                                await vnc_ws.send(filtered)
-                            else:
-                                dropped += 1
-
-                        elif "text" in msg and msg["text"]:
-                            # noVNC only sends binary frames — text frames are unexpected
-                            # and would bypass the RFB filter, so drop them.
-                            count += 1
-                            logger.warning("VNC proxy [c->v]: DROPPING text frame len=%d (noVNC should only send binary)", len(msg["text"]))
-                            dropped += 1
-                        else:
-                            logger.warning("VNC proxy [c->v]: unhandled msg keys=%s type=%s", list(msg.keys()), msg_type)
-                except WebSocketDisconnect as exc:
-                    logger.info("VNC proxy [c->v]: WebSocketDisconnect code=%s after %d msgs (%d dropped)", exc.code, count, dropped)
-                except Exception as exc:
-                    logger.warning("VNC proxy [c->v]: %s: %s (after %d msgs)", type(exc).__name__, exc, count)
-
-            async def vnc_to_client():
-                count = 0
-                try:
-                    async for msg in vnc_ws:
-                        count += 1
-                        if isinstance(msg, bytes) and len(msg) > 0:
-                            msg_type = msg[0]
-                            if msg_type == 180:
-                                # KasmVNC BinaryClipboard → convert to standard
-                                # ServerCutText (type 3) so noVNC can handle it
-                                text = _parse_kasmvnc_clipboard(msg)
-                                if text:
-                                    logger.info("VNC proxy [v->c]: clipboard %d chars", len(text))
-                                    await websocket.send_bytes(_build_server_cut_text(text))
-                                else:
-                                    logger.info("VNC proxy [v->c]: dropped type 180 (no text/plain)")
-                                continue
-                            await websocket.send_bytes(msg)
-                        elif isinstance(msg, bytes):
-                            await websocket.send_bytes(msg)
-                        else:
-                            await websocket.send_text(msg)
-                    logger.info("VNC proxy [v->c]: KasmVNC stream ended after %d msgs (close_code=%s)", count, vnc_ws.close_code)
-                except WebSocketDisconnect as exc:
-                    logger.info("VNC proxy [v->c]: client disconnect code=%s after %d msgs", exc.code, count)
-                except Exception as exc:
-                    logger.warning("VNC proxy [v->c]: %s: %s (after %d msgs)", type(exc).__name__, exc, count)
-
-            c2v = asyncio.create_task(client_to_vnc(), name="c2v")
-            v2c = asyncio.create_task(vnc_to_client(), name="v2c")
-
-            done, pending = await asyncio.wait(
-                [c2v, v2c],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            finished = [t.get_name() for t in done]
-            still_running = [t.get_name() for t in pending]
-
-            # Check if Xvnc is still alive
-            vnc_instance = browser_mgr.vnc._allocated.get(running.display)
-            xvnc_alive = vnc_instance and vnc_instance.process and vnc_instance.process.poll() is None
-            logger.info(
-                "VNC proxy: finished=%s pending=%s xvnc_alive=%s display=:%d for %s",
-                finished, still_running, xvnc_alive, running.display, profile_id,
-            )
-
-            # Dump Xvnc log on disconnect
-            import os
-            xvnc_log = f"/tmp/xvnc-{running.display}.log"
-            if os.path.exists(xvnc_log):
-                with open(xvnc_log) as f:
-                    log_content = f.read()
-                if log_content.strip():
-                    for line in log_content.strip().split("\n")[-20:]:
-                        logger.info("Xvnc[:%d] %s", running.display, line)
-
-            for task in pending:
-                task.cancel()
-
+        running = await asyncio.wait_for(
+            browser_mgr.launch(profile), timeout=LAUNCH_TIMEOUT_S,
+        )
+        return running, ""
+    except asyncio.TimeoutError:
+        logger.error("CDP auto-launch timed out for %s", profile_id)
+        return None, "Launch timed out"
+    except ProfileAlreadyRunning:
+        # Lost a race with a concurrent launch; its result is what we want.
+        running = browser_mgr.running.get(profile_id)
+        return (running, "") if running else (None, "Launch failed")
     except Exception as exc:
-        logger.error("VNC proxy connect error for %s: %s: %s", profile_id, type(exc).__name__, exc)
-    finally:
-        try:
-            await websocket.close()
-        except Exception as exc:
-            logger.debug("VNC proxy: websocket.close() failed: %s", exc)
-
-
-# ── CDP WebSocket Proxy ──────────────────────────────────────────────────────
-# Simple bidirectional passthrough — CDP is standard JSON over WebSocket,
-# no protocol translation needed (unlike VNC which requires RFB filtering).
+        logger.error("CDP auto-launch failed for %s: %s", profile_id, exc)
+        return None, "Failed to launch browser"
 
 
 @app.get("/api/profiles/{profile_id}/cdp")
-async def cdp_info(profile_id: str):
+async def cdp_info(profile_id: str, request: Request):
     """Return CDP connection info. Prevents SPA catch-all from serving index.html."""
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+        raise HTTPException(
+            status_code=404 if error == "Profile not found" else 502, detail=error,
+        )
+    # Scheme and host from the ORIGINAL request, like the neighbouring
+    # /json/version endpoint. A hardcoded http://<host> behind a TLS terminator
+    # is a snippet that cannot work: an https-only ingress either refuses it or
+    # redirects, with nothing on screen explaining why.
+    scheme = "https" if _is_https(request) else "http"
+    host = request.headers.get("host", "localhost:8080")
     return {
         "cdp_url": f"/api/profiles/{profile_id}/cdp",
-        "usage": "playwright.chromium.connect_over_cdp('http://<host>/api/profiles/"
-        + profile_id + "/cdp')",
+        "usage": (
+            f"playwright.chromium.connect_over_cdp('{scheme}://{host}"
+            f"/api/profiles/{profile_id}/cdp')"
+        ),
     }
 
 
@@ -859,9 +1567,11 @@ async def cdp_info(profile_id: str):
 @app.get("/api/profiles/{profile_id}/cdp/json/version")
 async def cdp_json_version(profile_id: str, request: Request):
     """Proxy Chrome's /json/version, rewriting WS URLs to go through our proxy."""
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+        raise HTTPException(
+            status_code=404 if error == "Profile not found" else 502, detail=error,
+        )
 
     try:
         async with httpx.AsyncClient() as client:
@@ -886,9 +1596,11 @@ async def cdp_json_version(profile_id: str, request: Request):
 @app.get("/api/profiles/{profile_id}/cdp/json")
 async def cdp_json_list(profile_id: str, request: Request):
     """Proxy Chrome's /json/list, rewriting WS URLs."""
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+        raise HTTPException(
+            status_code=404 if error == "Profile not found" else 502, detail=error,
+        )
 
     try:
         async with httpx.AsyncClient() as client:
@@ -912,11 +1624,16 @@ async def cdp_json_list(profile_id: str, request: Request):
 
 
 async def _proxy_cdp_websocket(
-    websocket: WebSocket, target_url: str, label: str,
+    websocket: WebSocket, target_url: str, label: str, profile_id: str,
 ) -> None:
     """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
 
-    Used by both browser-level and page-level CDP proxy endpoints.
+    Used by both browser-level and page-level CDP proxy endpoints. Touches the
+    profile's idle clock on every forwarded message (either direction) — but
+    NOT on the protocol-level ping/pong uvicorn and this proxy exchange to
+    keep the socket open, which never reaches `receive()`/`async for` as an
+    app-level message. A CDP client attached but issuing no real commands is
+    exactly the case reap_idle_profiles is meant to catch.
     """
     import websockets
 
@@ -933,8 +1650,10 @@ async def _proxy_cdp_websocket(
                         if msg.get("type") == "websocket.disconnect":
                             break
                         if "text" in msg and msg["text"]:
+                            browser_mgr.touch_activity(profile_id)
                             await cdp_ws.send(msg["text"])
                         elif "bytes" in msg and msg["bytes"]:
+                            browser_mgr.touch_activity(profile_id)
                             await cdp_ws.send(msg["bytes"])
                 except WebSocketDisconnect:
                     pass
@@ -944,6 +1663,7 @@ async def _proxy_cdp_websocket(
             async def cdp_to_client():
                 try:
                     async for msg in cdp_ws:
+                        browser_mgr.touch_activity(profile_id)
                         if isinstance(msg, str):
                             await websocket.send_text(msg)
                         else:
@@ -977,9 +1697,11 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
     if not await _check_websocket_origin(websocket):
         return
 
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        await websocket.close(code=4004, reason="Profile not running")
+        await websocket.close(
+            code=4004 if error == "Profile not found" else 4005, reason=error,
+        )
         return
 
     await websocket.accept()
@@ -996,7 +1718,7 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4005, reason="CDP not available")
         return
 
-    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]")
+    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]", profile_id)
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
@@ -1005,18 +1727,57 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     if not await _check_websocket_origin(websocket):
         return
 
-    running = browser_mgr.running.get(profile_id)
+    running, error = await _ensure_running_for_cdp(profile_id)
     if not running:
-        await websocket.close(code=4004, reason="Profile not running")
+        await websocket.close(
+            code=4004 if error == "Profile not found" else 4005, reason=error,
+        )
         return
 
     await websocket.accept()
 
     target_url = f"ws://127.0.0.1:{running.cdp_port}/devtools/{path}"
-    await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
+    await _proxy_cdp_websocket(
+        websocket, target_url, f"CDP page proxy [{profile_id}]", profile_id,
+    )
 
 
 # ── Static Frontend ───────────────────────────────────────────────────────────
+
+
+def _resolve_spa_file(base: Path, full_path: str) -> Path | None:
+    """Path under `base` for a SPA request, or None to fall through to index.
+
+    Containment is the whole job. `base / full_path` is NOT safe on its own:
+    Path.__truediv__ DISCARDS the left side when the right side is absolute, so
+    `Path("/app/frontend/dist") / "/etc/passwd"` is `/etc/passwd`. The catch-all
+    route below is not behind the auth middleware (it gates only /api/*), and
+    nginx forwards a percent-encoded `%2f` verbatim without decoding it, so an
+    unauthenticated `GET /%2fdata/profiles.db` reached this function with
+    full_path="/data/profiles.db" and served the profile database.
+
+    A pure function so the containment rule is testable directly: the route is
+    only registered when the built frontend exists, which it does not in a
+    source checkout.
+    """
+    if not full_path:
+        return None
+    candidate = Path(full_path)
+    # Reject absolute paths outright rather than relying on the resolve()
+    # containment check alone — it is the specific case `/` silently swallows.
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    try:
+        resolved = (base / candidate).resolve()
+        root = base.resolve()
+    except OSError:
+        return None
+    # resolve() follows symlinks, so this also refuses a link inside the build
+    # directory that points outside it.
+    if resolved != root and root not in resolved.parents:
+        return None
+    return resolved if resolved.is_file() else None
+
 
 # Serve React build. Must be AFTER API routes so /api/* isn't caught by the SPA.
 if FRONTEND_DIR.exists():
@@ -1027,7 +1788,7 @@ if FRONTEND_DIR.exists():
         """Serve React SPA — all non-API routes return index.html."""
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found")
-        file_path = FRONTEND_DIR / full_path
-        if full_path and file_path.exists() and file_path.is_file():
+        file_path = _resolve_spa_file(FRONTEND_DIR, full_path)
+        if file_path is not None:
             return FileResponse(file_path)
         return FileResponse(FRONTEND_DIR / "index.html")
