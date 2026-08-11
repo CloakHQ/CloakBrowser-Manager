@@ -56,6 +56,9 @@ _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
 
 def _check_auth(scope: Scope) -> bool:
     """Check if the request has a valid auth token (header or cookie)."""
+    if AUTH_TOKEN is None:
+        return True
+
     # Check Authorization: Bearer <token> header
     for key, val in scope.get("headers", []):
         if key == b"authorization":
@@ -374,6 +377,7 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    browser_mgr.vnc.validate_available()
     db.init_db()
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
@@ -435,18 +439,15 @@ async def auth_logout(request: Request, response: Response):
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 
+def _profile_response(profile: dict) -> ProfileResponse:
+    payload = {**profile, **browser_mgr.get_status(profile["id"])}
+    payload["tags"] = [TagResponse(**tag) for tag in profile.get("tags", [])]
+    return ProfileResponse(**payload)
+
+
 @app.get("/api/profiles", response_model=list[ProfileResponse])
 async def list_profiles():
-    profiles = db.list_profiles()
-    result = []
-    for p in profiles:
-        status = browser_mgr.get_status(p["id"])
-        p["status"] = status["status"]
-        p["vnc_ws_port"] = status["vnc_ws_port"]
-        p["cdp_url"] = status["cdp_url"]
-        p["tags"] = [TagResponse(**t) for t in p.get("tags", [])]
-        result.append(ProfileResponse(**p))
-    return result
+    return [_profile_response(profile) for profile in db.list_profiles()]
 
 
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
@@ -457,13 +458,7 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
-    profile = db.create_profile(**data)
-    status = browser_mgr.get_status(profile["id"])
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(db.create_profile(**data))
 
 
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -471,12 +466,7 @@ async def get_profile(profile_id: str):
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -489,12 +479,7 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.delete("/api/profiles/{profile_id}")
@@ -541,8 +526,10 @@ async def launch_profile(profile_id: str):
     return LaunchResponse(
         profile_id=profile_id,
         status="running",
+        runtime_mode=browser_mgr.runtime.runtime_mode,
+        viewer_mode=browser_mgr.runtime.viewer_mode,
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}",
+        display=f":{running.display}" if running.display is not None else None,
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -569,13 +556,23 @@ async def get_profile_status(profile_id: str):
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    from cloakbrowser.config import CHROMIUM_VERSION
+    try:
+        from cloakbrowser.config import get_chromium_version
+
+        binary_version = get_chromium_version()
+    except ImportError:
+        from cloakbrowser.config import CHROMIUM_VERSION
+
+        binary_version = CHROMIUM_VERSION
 
     profiles = db.list_profiles()
     return StatusResponse(
         running_count=len(browser_mgr.running),
-        binary_version=CHROMIUM_VERSION,
+        binary_version=binary_version,
         profiles_total=len(profiles),
+        host_os=browser_mgr.runtime.host_os,
+        runtime_mode=browser_mgr.runtime.runtime_mode,
+        viewer_mode=browser_mgr.runtime.viewer_mode,
     )
 
 
@@ -593,6 +590,11 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+    if browser_mgr.runtime.viewer_mode != "vnc" or running.display is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Clipboard relay is available only in Docker/VNC mode",
+        )
 
     import os
 
@@ -629,6 +631,11 @@ async def get_clipboard(profile_id: str):
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+    if browser_mgr.runtime.viewer_mode != "vnc" or running.display is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Clipboard relay is available only in Docker/VNC mode",
+        )
 
     # Read Chrome's current text selection via Playwright.
     # Chrome's native copy (via VNC Ctrl+C) doesn't write to X11 clipboard
@@ -683,6 +690,13 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
+        return
+    if (
+        browser_mgr.runtime.viewer_mode != "vnc"
+        or running.display is None
+        or running.ws_port is None
+    ):
+        await websocket.close(code=4005, reason="VNC unavailable in native-window mode")
         return
 
     # Accept with client's requested subprotocol (if any) — RFC 6455 requires

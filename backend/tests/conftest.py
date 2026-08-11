@@ -27,6 +27,7 @@ sys.modules.setdefault("cloakbrowser.config", _mock_config)
 
 
 from backend import database as db  # noqa: E402
+from backend.runtime import RuntimeConfig  # noqa: E402
 
 
 @pytest.fixture()
@@ -50,7 +51,16 @@ def app_client(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
     """FastAPI TestClient with mocked DB and browser manager."""
     from backend import main
 
-    # Patch lifespan-called methods to avoid subprocess calls (pkill, Xvnc)
+    # API tests exercise the existing Linux Docker contract on every host OS.
+    monkeypatch.setattr(
+        main.browser_mgr,
+        "runtime",
+        RuntimeConfig("linux", "docker", "vnc", tmp_db),
+    )
+    monkeypatch.setattr(main.browser_mgr.vnc, "enabled", True)
+
+    # Patch lifespan-called methods to avoid host KasmVNC/process requirements.
+    monkeypatch.setattr(main.browser_mgr.vnc, "validate_available", MagicMock())
     monkeypatch.setattr(main.browser_mgr, "cleanup_stale", AsyncMock())
     monkeypatch.setattr(main.browser_mgr, "cleanup_all", AsyncMock())
     monkeypatch.setattr(main.browser_mgr.vnc, "cleanup_stale", AsyncMock())

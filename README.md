@@ -23,10 +23,23 @@ Free, self-hosted alternative to Multilogin, GoLogin, and AdsPower.
 <img src="https://i.imgur.com/XFYn1qY.png" width="800" alt="CloakBrowser Manager — Profile Settings">
 </p>
 
-Each profile is an isolated CloakBrowser instance with its own fingerprint, proxy, cookies, and session data. Profiles persist across restarts. Everything runs in one Docker container.
+Each profile is an isolated CloakBrowser instance with its own fingerprint, proxy, cookies, and session data. Profiles persist across restarts. Windows and macOS launch browsers directly in native desktop windows; Linux keeps the Docker/KasmVNC server experience.
+
+### Windows and macOS
+
+Clone the repository, then start the platform launcher:
+
+```text
+Windows: run-windows.bat
+macOS:   ./run-macos.sh
+```
+
+The first run creates a local Python environment, installs dependencies, builds the React UI, starts Manager on `127.0.0.1:8080`, and opens it in your default browser. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS.
+
+### Linux server
 
 ```bash
-docker run -p 8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
+docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
 ```
 
 Or build from source:
@@ -37,7 +50,7 @@ cd CloakBrowser-Manager
 docker compose up --build
 ```
 
-Open [http://localhost:8080](http://localhost:8080) in your browser. Create a profile. Click Launch. Done.
+Open [http://localhost:8080](http://localhost:8080), create a profile, and click Launch.
 
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues).
 
@@ -60,7 +73,8 @@ Each CloakBrowser profile generates a completely different device identity. To t
 - **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
-- **In-browser viewing** — interact with launched browsers via noVNC, directly in the web GUI
+- **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
+- **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
 - **Playwright/Puppeteer API** — connect to any running profile programmatically via CDP, while still watching it live in the browser
 - **Optional authentication** — protect the web UI and API with a single token, or run wide open locally
 - **Powered by CloakBrowser** — 32 source-level C++ patches, passes Cloudflare Turnstile, 0.9 reCAPTCHA v3 score
@@ -69,19 +83,18 @@ Each CloakBrowser profile generates a completely different device identity. To t
 
 - **Backend**: FastAPI (Python)
 - **Frontend**: React + Tailwind CSS
-- **Browser viewer**: noVNC (WebSocket-based VNC client)
+- **Browser viewer**: native windows on Windows/macOS; noVNC/KasmVNC on Linux Docker
 - **Database**: SQLite
 - **Browser engine**: [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) (stealth Chromium binary)
 
 ## Development
 
-### Backend
+### Native backend
 
 ```bash
-cd backend
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8080
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8080
 ```
 
 ### Frontend
@@ -100,8 +113,9 @@ docker compose up --build
 
 ## Requirements
 
-- Docker (20.10+)
-- ~2 GB disk (image + binary)
+- Windows or macOS native: Python 3.10+, Node.js 18+
+- Linux server: Docker 20.10+
+- ~2 GB disk (application + browser binary)
 - ~512 MB RAM per running profile
 
 ## Updating
@@ -141,7 +155,7 @@ const page = browser.contexts()[0].pages()[0];
 await page.goto("https://example.com");
 ```
 
-The CDP URL is available in the toolbar (code icon) when a profile is running. The same browser session is accessible both visually through VNC and programmatically through the API.
+The CDP URL is available from the running-profile view. The same browser session is accessible through its native window on Windows/macOS or through VNC on Linux Docker, and programmatically through the API on every platform.
 
 ## Remote Access
 
@@ -187,6 +201,11 @@ The GUI application requires the CloakBrowser Chromium binary to function. The b
 ## Contributing
 
 Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues) first to discuss what you'd like to change.
+
+### Contributors
+
+- [lhq1363511234-arch](https://github.com/lhq1363511234-arch) — native Windows support foundation
+- [quorentindupres-dev](https://github.com/quorentindupres-dev) — native macOS workflow and Manager integration concepts
 
 ## Links
 

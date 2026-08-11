@@ -8,12 +8,14 @@ import logging
 import os
 import socket
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
 
+from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
@@ -142,30 +144,31 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
         logger.info("Set DuckDuckGo as default search for %s", user_data_dir.name)
 
 
-BASE_CDP_PORT = 5100
-CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
+CDP_START_ATTEMPTS = 3
+CDP_READY_TIMEOUT = 10.0
 
 
 @dataclass
 class RunningProfile:
     profile_id: str
     context: Any  # Playwright BrowserContext
-    display: int
-    ws_port: int
     cdp_port: int
+    display: int | None = None
+    ws_port: int | None = None
 
 
 class BrowserManager:
-    def __init__(self):
+    def __init__(self, runtime_config: RuntimeConfig | None = None):
+        self.runtime = runtime_config or resolve_runtime()
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
-        self.vnc = VNCManager()
+        self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
-        self._next_cdp_port = BASE_CDP_PORT
+        self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
-        """Launch a browser instance for the given profile."""
+        """Launch a browser instance using the configured host runtime."""
         profile_id = profile["id"]
 
         async with self._lock:
@@ -173,69 +176,114 @@ class BrowserManager:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
 
-        display, ws_port = await self.vnc.allocate()
-
+        display: int | None = None
+        ws_port: int | None = None
+        cdp_port: int | None = None
+        context: Any | None = None
         try:
-            cdp_port = self._allocate_cdp_port()
-        except ValueError:
-            async with self._lock:
-                self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
-            raise
+            if self.runtime.viewer_mode == "vnc":
+                display, ws_port = await self.vnc.allocate()
 
-        # Clean stale Chromium lock files (left by previous container crashes)
-        user_data_dir = Path(profile["user_data_dir"])
-        for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            lock_path = user_data_dir / lock_file
-            lock_path.unlink(missing_ok=True)
+            user_data_dir = Path(profile["user_data_dir"])
 
-        # Set up bookmarks and search engine on first launch
-        _init_profile_defaults(user_data_dir)
+            # Docker can leave stale locks after an unclean container exit. Native
+            # mode must let Chromium arbitrate profile ownership itself.
+            if self.runtime.runtime_mode == "docker":
+                for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                    (user_data_dir / lock_file).unlink(missing_ok=True)
 
-        try:
-            # Start KasmVNC on the allocated display
-            await self.vnc.start_vnc(
-                display,
-                ws_port,
-                width=profile.get("screen_width", 1920),
-                height=profile.get("screen_height", 1080),
-            )
+            _init_profile_defaults(user_data_dir)
 
-            # Build fingerprint args from profile settings
+            if display is not None and ws_port is not None:
+                await self.vnc.start_vnc(
+                    display,
+                    ws_port,
+                    width=profile.get("screen_width", 1920),
+                    height=profile.get("screen_height", 1080),
+                )
+
+            user_launch_args = profile.get("launch_args") or []
+            conflicting_debug_args = [
+                arg for arg in user_launch_args
+                if arg.startswith(("--remote-debugging-port", "--remote-debugging-address"))
+            ]
+            if conflicting_debug_args:
+                raise ValueError(
+                    "Manager owns remote debugging configuration; remove: "
+                    + ", ".join(conflicting_debug_args)
+                )
+
             extra_args = self._build_fingerprint_args(profile)
-            extra_args += profile.get("launch_args") or []
-            extra_args.append(f"--remote-debugging-port={cdp_port}")
+            extra_args += user_launch_args
+            extra_args.append("--remote-debugging-address=127.0.0.1")
 
-            # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
                 _validate_proxy(proxy)
 
-            # Launch CloakBrowser on that display
-            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation
-            context = await launch_persistent_context_async(
-                user_data_dir=profile["user_data_dir"],
-                headless=bool(profile.get("headless", False)),
-                proxy=proxy,
-                args=extra_args,
-                timezone=profile.get("timezone") or None,
-                locale=profile.get("locale") or None,
-                humanize=bool(profile.get("humanize", False)),
-                human_preset=profile.get("human_preset", "default"),
-                geoip=bool(profile.get("geoip", False)),
-                color_scheme=profile.get("color_scheme") or None,
-                user_agent=profile.get("user_agent") or None,
-                viewport={
+            launch_options: dict[str, Any] = {
+                "user_data_dir": profile["user_data_dir"],
+                "headless": bool(profile.get("headless", False)),
+                "proxy": proxy,
+                "args": extra_args,
+                "timezone": profile.get("timezone") or None,
+                "locale": profile.get("locale") or None,
+                "humanize": bool(profile.get("humanize", False)),
+                "human_preset": profile.get("human_preset", "default"),
+                "geoip": bool(profile.get("geoip", False)),
+                "color_scheme": profile.get("color_scheme") or None,
+                "user_agent": profile.get("user_agent") or None,
+            }
+            if display is not None:
+                launch_options["viewport"] = {
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
-                },
-                env={**os.environ, "DISPLAY": f":{display}"},
-            )
+                }
+                launch_options["env"] = {**os.environ, "DISPLAY": f":{display}"}
 
-            # Inject clipboard listener: captures copied text on every page
-            # so the GET /clipboard endpoint can read it via page.evaluate()
-            _clipboard_init_js = """
+            last_cdp_error: Exception | None = None
+            for attempt in range(1, CDP_START_ATTEMPTS + 1):
+                cdp_port = self._reserve_cdp_port()
+                launch_options["args"] = [
+                    *extra_args,
+                    f"--remote-debugging-port={cdp_port}",
+                ]
+                try:
+                    context = await launch_persistent_context_async(**launch_options)
+                    await self._wait_for_cdp(cdp_port)
+                    break
+                except asyncio.CancelledError:
+                    if context is not None:
+                        await self._close_context(context, profile_id)
+                    self._release_cdp_port(cdp_port)
+                    context = None
+                    cdp_port = None
+                    raise
+                except Exception as exc:
+                    last_cdp_error = exc
+                    if context is not None:
+                        await self._close_context(context, profile_id)
+                    self._release_cdp_port(cdp_port)
+                    context = None
+                    cdp_port = None
+                    logger.warning(
+                        "Browser/CDP startup attempt %d/%d failed for %s: %s",
+                        attempt,
+                        CDP_START_ATTEMPTS,
+                        profile_id,
+                        exc,
+                    )
+            else:
+                raise RuntimeError(
+                    f"Unable to start verified CDP for profile {profile_id}"
+                ) from last_cdp_error
+
+            if context is None or cdp_port is None:
+                raise RuntimeError(f"Browser startup did not complete for profile {profile_id}")
+
+            # Capture copied text so the Manager clipboard endpoint can read it.
+            clipboard_init_js = """
                 window.__clipboardText = '';
                 document.addEventListener('copy', () => {
                     const sel = window.getSelection();
@@ -248,56 +296,80 @@ class BrowserManager:
                     }
                 });
             """
-            await context.add_init_script(_clipboard_init_js)
-            # Also inject into already-open pages (about:blank created before init_script)
-            for p in context.pages:
+            await context.add_init_script(clipboard_init_js)
+            for page in context.pages:
                 try:
-                    await p.evaluate(_clipboard_init_js)
+                    await page.evaluate(clipboard_init_js)
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
 
             running = RunningProfile(
                 profile_id=profile_id,
                 context=context,
+                cdp_port=cdp_port,
                 display=display,
                 ws_port=ws_port,
-                cdp_port=cdp_port,
             )
-
-            # Auto-cleanup if browser crashes or user closes Chrome via VNC
-            context.on("close", lambda: asyncio.ensure_future(
-                self._on_browser_closed(profile_id)
-            ))
+            context.on(
+                "close",
+                lambda *_: asyncio.ensure_future(self._on_browser_closed(profile_id)),
+            )
 
             async with self._lock:
                 self.running[profile_id] = running
                 self._launching.discard(profile_id)
 
             logger.info(
-                "Launched profile %s on display :%d (ws_port=%d, cdp_port=%d)",
-                profile_id, display, ws_port, cdp_port,
+                "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
+                profile_id,
+                self.runtime.runtime_mode,
+                f":{display}" if display is not None else "native",
+                ws_port,
+                cdp_port,
             )
-
             return running
 
         except BaseException:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
+            if context is not None:
+                await self._close_context(context, profile_id)
+            if cdp_port is not None:
+                self._release_cdp_port(cdp_port)
+            if display is not None:
+                await self.vnc.stop_vnc(display)
             raise
 
+    async def _close_context(self, context: Any, profile_id: str) -> None:
+        try:
+            await context.close()
+        except Exception as exc:
+            logger.warning("Error closing context for %s: %s", profile_id, exc)
+
+    async def _dispose_running(
+        self,
+        running: RunningProfile,
+        *,
+        close_context: bool,
+    ) -> None:
+        if close_context:
+            await self._close_context(running.context, running.profile_id)
+        if running.display is not None:
+            await self.vnc.stop_vnc(running.display)
+        self._release_cdp_port(running.cdp_port)
+
     async def _on_browser_closed(self, profile_id: str):
-        """Called when browser exits (crash, user closed via VNC, or stop())."""
+        """Release resources after a browser crash or user-initiated close."""
         async with self._lock:
             running = self.running.pop(profile_id, None)
 
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            await self.vnc.stop_vnc(running.display)
+            await self._dispose_running(running, close_context=False)
 
     async def stop(self, profile_id: str):
-        """Stop a running browser instance."""
-        # Pop before close so _on_browser_closed() finds nothing to clean up
+        """Stop a running browser instance and release all owned resources."""
+        # Pop before close so the close event observes an already-clean state.
         async with self._lock:
             running = self.running.pop(profile_id, None)
 
@@ -305,25 +377,24 @@ class BrowserManager:
             return
 
         logger.info("Stopping profile %s", profile_id)
-
-        try:
-            await running.context.close()
-        except Exception as exc:
-            logger.warning("Error closing context for %s: %s", profile_id, exc)
-
-        await self.vnc.stop_vnc(running.display)
+        await self._dispose_running(running, close_context=True)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
-        """Get running status for a profile."""
+        """Get running status and viewer capabilities for a profile."""
         running = self.running.get(profile_id)
-        if running:
-            return {
-                "status": "running",
-                "vnc_ws_port": running.ws_port,
-                "display": f":{running.display}",
-                "cdp_url": f"/api/profiles/{profile_id}/cdp",
-            }
-        return {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
+        status = {
+            "status": "running" if running else "stopped",
+            "runtime_mode": self.runtime.runtime_mode,
+            "viewer_mode": self.runtime.viewer_mode,
+            "vnc_ws_port": running.ws_port if running else None,
+            "display": (
+                f":{running.display}"
+                if running and running.display is not None
+                else None
+            ),
+            "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+        }
+        return status
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown."""
@@ -333,11 +404,13 @@ class BrowserManager:
         for pid in profile_ids:
             await self.stop(pid)
 
-        await self.vnc.cleanup_all()
+        if self.runtime.viewer_mode == "vnc":
+            await self.vnc.cleanup_all()
 
     async def cleanup_stale(self):
-        """Kill orphan processes from previous container runs."""
-        await self.vnc.cleanup_stale()
+        """Kill orphan display processes in the Docker runtime only."""
+        if self.runtime.viewer_mode == "vnc":
+            await self.vnc.cleanup_stale()
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
@@ -361,28 +434,64 @@ class BrowserManager:
                 )
         logger.info("Auto-launch complete: %d running", len(self.running))
 
-    def _allocate_cdp_port(self) -> int:
-        """Find a free CDP port using a rotating counter to avoid TIME_WAIT collisions."""
-        for _ in range(CDP_PORT_RANGE):
-            port = self._next_cdp_port
-            self._next_cdp_port = BASE_CDP_PORT + (
-                (self._next_cdp_port + 1 - BASE_CDP_PORT) % CDP_PORT_RANGE
-            )
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    s.bind(("127.0.0.1", port))
-                    return port
-                except OSError:
-                    continue
-        raise ValueError("No free CDP ports available in range %d-%d" % (BASE_CDP_PORT, BASE_CDP_PORT + CDP_PORT_RANGE - 1))
+    def _reserve_cdp_port(self) -> int:
+        """Reserve an OS-selected loopback port for one managed browser."""
+        for _ in range(20):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = int(sock.getsockname()[1])
+            if port not in self._cdp_ports:
+                self._cdp_ports.add(port)
+                return port
+        raise RuntimeError("Unable to reserve a unique CDP port")
+
+    def _release_cdp_port(self, port: int) -> None:
+        self._cdp_ports.discard(port)
+
+    @staticmethod
+    async def _fetch_cdp_version(port: int) -> dict[str, Any]:
+        def fetch() -> dict[str, Any]:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version",
+                timeout=1,
+            ) as response:
+                payload = json.load(response)
+            if not isinstance(payload, dict):
+                raise RuntimeError("CDP version response is not an object")
+            return payload
+
+        return await asyncio.to_thread(fetch)
+
+    async def _wait_for_cdp(
+        self,
+        port: int,
+        timeout: float = CDP_READY_TIMEOUT,
+    ) -> None:
+        """Wait for and verify Chromium's debugger endpoint on the reserved port."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                version = await self._fetch_cdp_version(port)
+                websocket_url = str(version.get("webSocketDebuggerUrl") or "")
+                if f":{port}/" not in websocket_url:
+                    raise RuntimeError(
+                        f"CDP endpoint returned an unexpected debugger URL: {websocket_url!r}"
+                    )
+                return
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.1)
+        raise TimeoutError(f"CDP endpoint on 127.0.0.1:{port} was not ready") from last_error
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:
         """Build extra Chromium args from profile fingerprint settings."""
         args: list[str] = [
             "--disable-infobars",
             "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
-            "--use-angle=swiftshader",  # software GL for VNC (no GPU in container)
         ]
+        if self.runtime.viewer_mode == "vnc":
+            args.append("--use-angle=swiftshader")
 
         seed = profile.get("fingerprint_seed")
         if seed is not None:

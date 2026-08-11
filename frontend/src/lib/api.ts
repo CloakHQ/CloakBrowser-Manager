@@ -2,6 +2,10 @@
  * API client for CloakBrowser Manager backend.
  */
 
+export type HostOS = "windows" | "macos" | "linux";
+export type RuntimeMode = "native" | "docker";
+export type ViewerMode = "native-window" | "vnc";
+
 export interface Profile {
   id: string;
   name: string;
@@ -30,6 +34,8 @@ export interface Profile {
   updated_at: string;
   tags: { tag: string; color: string | null }[];
   status: "running" | "stopped";
+  runtime_mode: RuntimeMode;
+  viewer_mode: ViewerMode;
   vnc_ws_port: number | null;
   cdp_url: string | null;
 }
@@ -62,8 +68,10 @@ export interface ProfileCreateData {
 export interface LaunchResult {
   profile_id: string;
   status: string;
-  vnc_ws_port: number;
-  display: string;
+  runtime_mode: RuntimeMode;
+  viewer_mode: ViewerMode;
+  vnc_ws_port: number | null;
+  display: string | null;
   cdp_url: string | null;
 }
 
@@ -71,6 +79,9 @@ export interface SystemStatus {
   running_count: number;
   binary_version: string;
   profiles_total: number;
+  host_os: HostOS;
+  runtime_mode: RuntimeMode;
+  viewer_mode: ViewerMode;
 }
 
 class ApiError extends Error {

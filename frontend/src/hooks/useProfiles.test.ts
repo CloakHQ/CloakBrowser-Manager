@@ -51,6 +51,8 @@ const fakeProfile = {
   updated_at: "2026-01-01T00:00:00Z",
   tags: [],
   status: "stopped" as const,
+  runtime_mode: "docker" as const,
+  viewer_mode: "vnc" as const,
   vnc_ws_port: null,
   cdp_url: null,
 };

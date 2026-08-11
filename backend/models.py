@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .runtime import HostOS, RuntimeMode, ViewerMode
+
 
 class ProfileCreate(BaseModel):
     name: str
@@ -91,7 +93,7 @@ class ProfileResponse(BaseModel):
     @field_validator("clipboard_sync", mode="before")
     @classmethod
     def coerce_clipboard_sync(cls, v: object) -> bool:
-        return v if v is not None else True
+        return True if v is None else bool(v)
 
     color_scheme: str | None = None
     launch_args: list[str] = []
@@ -101,6 +103,8 @@ class ProfileResponse(BaseModel):
     updated_at: str
     tags: list[TagResponse] = []
     status: str = "stopped"  # "running" | "stopped"
+    runtime_mode: RuntimeMode = "docker"
+    viewer_mode: ViewerMode = "vnc"
     vnc_ws_port: int | None = None
     cdp_url: str | None = None
 
@@ -108,8 +112,10 @@ class ProfileResponse(BaseModel):
 class LaunchResponse(BaseModel):
     profile_id: str
     status: str = "running"
-    vnc_ws_port: int
-    display: str
+    runtime_mode: RuntimeMode
+    viewer_mode: ViewerMode
+    vnc_ws_port: int | None = None
+    display: str | None = None
     cdp_url: str | None = None
 
 
@@ -117,10 +123,15 @@ class StatusResponse(BaseModel):
     running_count: int
     binary_version: str
     profiles_total: int
+    host_os: HostOS
+    runtime_mode: RuntimeMode
+    viewer_mode: ViewerMode
 
 
 class ProfileStatusResponse(BaseModel):
     status: str  # "running" | "stopped"
+    runtime_mode: RuntimeMode
+    viewer_mode: ViewerMode
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None

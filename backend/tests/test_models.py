@@ -148,14 +148,18 @@ def test_clipboard_request_at_limit():
 
 def test_launch_response_with_cdp_url():
     r = LaunchResponse(
-        profile_id="abc", vnc_ws_port=6100, display=":100",
+        profile_id="abc", runtime_mode="docker", viewer_mode="vnc",
+        vnc_ws_port=6100, display=":100",
         cdp_url="/api/profiles/abc/cdp",
     )
     assert r.cdp_url == "/api/profiles/abc/cdp"
 
 
 def test_launch_response_cdp_url_default_none():
-    r = LaunchResponse(profile_id="abc", vnc_ws_port=6100, display=":100")
+    r = LaunchResponse(
+        profile_id="abc", runtime_mode="docker", viewer_mode="vnc",
+        vnc_ws_port=6100, display=":100",
+    )
     assert r.cdp_url is None
 
 
@@ -164,14 +168,17 @@ def test_launch_response_cdp_url_default_none():
 
 def test_profile_status_response_cdp_url():
     r = ProfileStatusResponse(
-        status="running", vnc_ws_port=6100, display=":100",
+        status="running", runtime_mode="docker", viewer_mode="vnc",
+        vnc_ws_port=6100, display=":100",
         cdp_url="/api/profiles/abc/cdp",
     )
     assert r.cdp_url == "/api/profiles/abc/cdp"
 
 
 def test_profile_status_response_cdp_url_stopped():
-    r = ProfileStatusResponse(status="stopped")
+    r = ProfileStatusResponse(
+        status="stopped", runtime_mode="docker", viewer_mode="vnc"
+    )
     assert r.cdp_url is None
 
 

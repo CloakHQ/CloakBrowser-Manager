@@ -33,6 +33,15 @@ def test_init_db_idempotent(tmp_db: Path):
     assert len(tables) >= 2
 
 
+def test_init_db_preserves_existing_profile_directory(tmp_db: Path):
+    profile = db.create_profile("Existing")
+    original_path = profile["user_data_dir"]
+
+    db.init_db()
+
+    assert db.get_profile(profile["id"])["user_data_dir"] == original_path
+
+
 # ── create_profile ───────────────────────────────────────────────────────────
 
 

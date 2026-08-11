@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ from starlette.testclient import TestClient
 
 from backend import main
 from backend.browser_manager import RunningProfile
+from backend.runtime import RuntimeConfig
 
 
 # ── Profile CRUD ─────────────────────────────────────────────────────────────
@@ -130,6 +132,13 @@ def test_get_profile_status_not_found(app_client: TestClient):
     assert resp.status_code == 404
 
 
+def test_profile_response_reports_viewer_capability(app_client: TestClient):
+    response = app_client.post("/api/profiles", json={"name": "Runtime"})
+    assert response.status_code == 201
+    assert response.json()["runtime_mode"] == "docker"
+    assert response.json()["viewer_mode"] == "vnc"
+
+
 # ── Launch / Stop ────────────────────────────────────────────────────────────
 
 
@@ -167,6 +176,28 @@ def test_launch_failure_500(app_client: TestClient):
     resp = app_client.post(f"/api/profiles/{pid}/launch")
     assert resp.status_code == 500
     assert resp.json()["detail"] == "Failed to launch browser"
+
+
+def test_native_launch_has_no_vnc_display(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    create = app_client.post("/api/profiles", json={"name": "Native"})
+    pid = create.json()["id"]
+    monkeypatch.setattr(
+        main.browser_mgr,
+        "runtime",
+        RuntimeConfig("windows", "native", "native-window", Path("C:/data")),
+    )
+    running = RunningProfile(pid, MagicMock(), 53123)
+    monkeypatch.setattr(main.browser_mgr, "launch", AsyncMock(return_value=running))
+
+    response = app_client.post(f"/api/profiles/{pid}/launch")
+
+    assert response.status_code == 200
+    assert response.json()["viewer_mode"] == "native-window"
+    assert response.json()["vnc_ws_port"] is None
+    assert response.json()["display"] is None
 
 
 def test_stop_not_running(app_client: TestClient):

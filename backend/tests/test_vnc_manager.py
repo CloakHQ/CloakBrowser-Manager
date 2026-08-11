@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from backend.runtime import RuntimeConfig
 from backend.vnc_manager import VNCInstance, VNCManager
+
+DOCKER_RUNTIME = RuntimeConfig("linux", "docker", "vnc", Path("/data"))
 
 
 @pytest.fixture()
@@ -13,6 +18,24 @@ def vnc() -> VNCManager:
 
 
 # ── allocate ─────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_allocate_rejects_native_runtime():
+    manager = VNCManager(enabled=False)
+    with pytest.raises(RuntimeError, match="Linux Docker runtime"):
+        await manager.allocate()
+
+
+def test_docker_runtime_requires_kasmvnc(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("backend.vnc_manager.shutil.which", lambda _: None)
+    with pytest.raises(RuntimeError, match="Docker image with KasmVNC"):
+        VNCManager(enabled=True).validate_available()
+
+
+def test_native_runtime_does_not_require_kasmvnc(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("backend.vnc_manager.shutil.which", lambda _: None)
+    VNCManager(enabled=False).validate_available()
 
 
 @pytest.mark.asyncio
@@ -94,15 +117,22 @@ async def test_active_displays_after_allocate(vnc: VNCManager):
 
 def test_get_status_stopped():
     from backend.browser_manager import BrowserManager
-    mgr = BrowserManager()
+    mgr = BrowserManager(DOCKER_RUNTIME)
     status = mgr.get_status("nonexistent")
-    assert status == {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
+    assert status == {
+        "status": "stopped",
+        "runtime_mode": "docker",
+        "viewer_mode": "vnc",
+        "vnc_ws_port": None,
+        "display": None,
+        "cdp_url": None,
+    }
 
 
 def test_get_status_running():
     from backend.browser_manager import BrowserManager, RunningProfile
     from unittest.mock import MagicMock
-    mgr = BrowserManager()
+    mgr = BrowserManager(DOCKER_RUNTIME)
     mgr.running["abc"] = RunningProfile(
         profile_id="abc",
         context=MagicMock(),
@@ -113,6 +143,8 @@ def test_get_status_running():
     status = mgr.get_status("abc")
     assert status == {
         "status": "running",
+        "runtime_mode": "docker",
+        "viewer_mode": "vnc",
         "vnc_ws_port": 6100,
         "display": ":100",
         "cdp_url": "/api/profiles/abc/cdp",

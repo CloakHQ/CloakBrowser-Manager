@@ -4,18 +4,30 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import socket
-
 from backend.browser_manager import (
-    BASE_CDP_PORT,
-    CDP_PORT_RANGE,
     _init_profile_defaults,
     _normalize_proxy,
     _validate_proxy,
     BrowserManager,
+    RunningProfile,
+)
+from backend.runtime import RuntimeConfig
+
+DOCKER_RUNTIME = RuntimeConfig(
+    host_os="linux",
+    runtime_mode="docker",
+    viewer_mode="vnc",
+    data_dir=Path("/data"),
+)
+NATIVE_RUNTIME = RuntimeConfig(
+    host_os="windows",
+    runtime_mode="native",
+    viewer_mode="native-window",
+    data_dir=Path("C:/manager-data"),
 )
 
 
@@ -91,7 +103,7 @@ def test_validate_no_port():
 # ── _build_fingerprint_args ──────────────────────────────────────────────────
 
 # Use the BrowserManager instance to call the method
-_mgr = BrowserManager()
+_mgr = BrowserManager(DOCKER_RUNTIME)
 
 
 def test_build_args_always_includes_base():
@@ -138,8 +150,13 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Only the 3 base args
+    # Two shared flags plus Docker's software rendering flag.
     assert len(args) == 3
+
+
+def test_native_build_args_do_not_force_software_gl():
+    args = BrowserManager(NATIVE_RUNTIME)._build_fingerprint_args({})
+    assert "--use-angle=swiftshader" not in args
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────
@@ -176,56 +193,186 @@ def test_launch_args_none_no_effect():
     assert len(args) == base_count
 
 
-# ── _allocate_cdp_port ───────────────────────────────────────────────────────
+# ── runtime-specific launch behavior ─────────────────────────────────────────
 
 
-def test_allocate_cdp_port_returns_free_port():
-    mgr = BrowserManager()
-    port = mgr._allocate_cdp_port()
-    assert BASE_CDP_PORT <= port < BASE_CDP_PORT + CDP_PORT_RANGE
+def _launch_profile(tmp_path: Path) -> dict:
+    return {
+        "id": "profile-1",
+        "name": "Native",
+        "user_data_dir": str(tmp_path / "profile-1"),
+        "screen_width": 1920,
+        "screen_height": 1080,
+        "launch_args": [],
+    }
 
 
-def test_allocate_cdp_port_skips_occupied():
-    mgr = BrowserManager()
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
-        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        blocker.bind(("127.0.0.1", BASE_CDP_PORT))
-        blocker.listen(1)
-        port = mgr._allocate_cdp_port()
-        assert port == BASE_CDP_PORT + 1
+@pytest.mark.asyncio
+async def test_native_launch_skips_vnc_and_display(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock()
+    context.pages = []
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager.vnc.allocate = AsyncMock()
+    manager.vnc.start_vnc = AsyncMock()
+    manager._wait_for_cdp = AsyncMock()
+    launch = AsyncMock(return_value=context)
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    running = await manager.launch(_launch_profile(tmp_path))
+
+    assert running.display is None
+    assert running.ws_port is None
+    manager.vnc.allocate.assert_not_awaited()
+    manager.vnc.start_vnc.assert_not_awaited()
+    options = launch.await_args.kwargs
+    assert "env" not in options
+    assert "viewport" not in options
+    assert "--use-angle=swiftshader" not in options["args"]
+    assert "--remote-debugging-address=127.0.0.1" in options["args"]
 
 
-def test_allocate_cdp_port_advances_counter():
-    mgr = BrowserManager()
-    p1 = mgr._allocate_cdp_port()
-    p2 = mgr._allocate_cdp_port()
-    assert p2 == p1 + 1
+@pytest.mark.asyncio
+async def test_native_close_event_releases_session(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    monkeypatch.setattr(
+        module,
+        "launch_persistent_context_async",
+        AsyncMock(return_value=context),
+    )
+    running = await manager.launch(_launch_profile(tmp_path))
+    close_callback = context.on.call_args.args[1]
+
+    await close_callback(context)
+
+    assert "profile-1" not in manager.running
+    assert running.cdp_port not in manager._cdp_ports
 
 
-def test_allocate_cdp_port_wraps_around():
-    mgr = BrowserManager()
-    mgr._next_cdp_port = BASE_CDP_PORT + CDP_PORT_RANGE - 1
-    p1 = mgr._allocate_cdp_port()
-    assert p1 == BASE_CDP_PORT + CDP_PORT_RANGE - 1
-    p2 = mgr._allocate_cdp_port()
-    assert p2 == BASE_CDP_PORT
+@pytest.mark.asyncio
+async def test_launch_rejects_user_debugging_flags(tmp_path: Path):
+    manager = BrowserManager(NATIVE_RUNTIME)
+    profile = _launch_profile(tmp_path)
+    profile["launch_args"] = ["--remote-debugging-address=0.0.0.0"]
+
+    with pytest.raises(ValueError, match="Manager owns remote debugging"):
+        await manager.launch(profile)
+
+    assert "profile-1" not in manager._launching
+    assert manager._cdp_ports == set()
 
 
-def test_allocate_cdp_port_all_occupied_raises():
-    mgr = BrowserManager()
-    blockers = []
-    try:
-        for i in range(CDP_PORT_RANGE):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", BASE_CDP_PORT + i))
-            s.listen(1)
-            blockers.append(s)
-        with pytest.raises(ValueError, match="No free CDP ports"):
-            mgr._allocate_cdp_port()
-    finally:
-        for s in blockers:
-            s.close()
+@pytest.mark.asyncio
+async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock()
+    context.pages = []
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(DOCKER_RUNTIME)
+    manager.vnc.allocate = AsyncMock(return_value=(100, 6100))
+    manager.vnc.start_vnc = AsyncMock()
+    manager._wait_for_cdp = AsyncMock()
+    launch = AsyncMock(return_value=context)
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    running = await manager.launch(_launch_profile(tmp_path))
+
+    assert running.display == 100
+    assert running.ws_port == 6100
+    manager.vnc.start_vnc.assert_awaited_once()
+    options = launch.await_args.kwargs
+    assert options["env"]["DISPLAY"] == ":100"
+    assert options["viewport"] == {"width": 1920, "height": 947}
+    assert "--use-angle=swiftshader" in options["args"]
+
+
+@pytest.mark.asyncio
+async def test_launch_retries_failed_cdp_and_closes_first_context(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from backend import browser_manager as module
+
+    first_context = MagicMock(pages=[])
+    first_context.close = AsyncMock()
+    second_context = MagicMock(pages=[])
+    second_context.add_init_script = AsyncMock()
+    second_context.close = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock(side_effect=[TimeoutError("busy"), None])
+    launch = AsyncMock(side_effect=[first_context, second_context])
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    running = await manager.launch(_launch_profile(tmp_path))
+
+    assert launch.await_count == 2
+    first_context.close.assert_awaited_once()
+    assert running.cdp_port in manager._cdp_ports
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_native_cdp_port():
+    manager = BrowserManager(NATIVE_RUNTIME)
+    context = MagicMock()
+    context.close = AsyncMock()
+    port = manager._reserve_cdp_port()
+    manager.running["profile-1"] = module_running = RunningProfile(
+        "profile-1", context, port
+    )
+
+    await manager.stop("profile-1")
+
+    context.close.assert_awaited_once()
+    assert module_running.cdp_port not in manager._cdp_ports
+    assert "profile-1" not in manager.running
+
+
+# ── CDP reservation and verification ─────────────────────────────────────────
+
+
+def test_reserve_cdp_port_tracks_unique_ports():
+    manager = BrowserManager(NATIVE_RUNTIME)
+    first = manager._reserve_cdp_port()
+    second = manager._reserve_cdp_port()
+    assert first != second
+    assert manager._cdp_ports == {first, second}
+
+
+def test_release_cdp_port_is_idempotent():
+    manager = BrowserManager(NATIVE_RUNTIME)
+    port = manager._reserve_cdp_port()
+    manager._release_cdp_port(port)
+    manager._release_cdp_port(port)
+    assert port not in manager._cdp_ports
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cdp_verifies_debugger_port(monkeypatch):
+    manager = BrowserManager(NATIVE_RUNTIME)
+    fetch = AsyncMock(return_value={
+        "webSocketDebuggerUrl": "ws://127.0.0.1:53123/devtools/browser/test",
+    })
+    monkeypatch.setattr(manager, "_fetch_cdp_version", fetch)
+    await manager._wait_for_cdp(53123, timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cdp_rejects_wrong_debugger_port(monkeypatch):
+    manager = BrowserManager(NATIVE_RUNTIME)
+    fetch = AsyncMock(return_value={
+        "webSocketDebuggerUrl": "ws://127.0.0.1:53124/devtools/browser/test",
+    })
+    monkeypatch.setattr(manager, "_fetch_cdp_version", fetch)
+    with pytest.raises(TimeoutError, match="was not ready"):
+        await manager._wait_for_cdp(53123, timeout=0.01)
 
 
 # ── _init_profile_defaults ───────────────────────────────────────────────────

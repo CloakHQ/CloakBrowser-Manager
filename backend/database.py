@@ -11,7 +11,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("/data")
+from .runtime import resolve_runtime
+
+RUNTIME = resolve_runtime()
+DATA_DIR = RUNTIME.data_dir
 DB_PATH = DATA_DIR / "profiles.db"
 
 
