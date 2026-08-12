@@ -790,6 +790,19 @@ async def get_profile_resources(profile_id: str):
     return ResourceUsageResponse(**usage, idle_remaining_seconds=idle_remaining)
 
 
+@app.post("/api/profiles/{profile_id}/idle-timeout/extend", response_model=ResourceUsageResponse)
+async def extend_profile_idle_timeout(profile_id: str, seconds: int):
+    """Add a bounded, session-only extension to a running profile's timer."""
+    if seconds not in {15 * 60, 30 * 60, 60 * 60, 120 * 60}:
+        raise HTTPException(status_code=422, detail="Extension must be 15, 30, 60, or 120 minutes")
+    remaining = browser_mgr.extend_idle_timeout(profile_id, seconds)
+    if remaining is None:
+        raise HTTPException(status_code=409, detail="Profile is not running or has no idle timeout")
+    running = browser_mgr.running[profile_id]
+    usage = await get_resource_usage(running.proc)
+    return ResourceUsageResponse(**usage, idle_remaining_seconds=remaining)
+
+
 # ── Tab manager ──────────────────────────────────────────────────────────────
 # Lets an operator see and close a profile's open tabs without opening its VNC
 # viewer. Each page's title/favicon read is individually bounded so one

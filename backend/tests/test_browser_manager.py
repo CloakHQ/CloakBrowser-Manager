@@ -523,6 +523,14 @@ def test_init_creates_preferences(tmp_path: Path):
     assert "default_search_provider_data" in data
     assert "Google" in data["default_search_provider_data"]["template_url_data"]["short_name"]
     assert data["default_search_provider"]["enabled"] is True
+    assert data["download"] == {
+        "default_directory": str(tmp_path / "Downloads"),
+        "extensions_to_open": "",
+        "prompt_for_download": False,
+    }
+    assert data["selectfile"] == {"last_directory": str(tmp_path / "Downloads")}
+    assert data["bookmark_bar"]["show_on_all_tabs"] is False
+    assert data["net"]["network_prediction_options"] == 0
 
 
 def test_init_idempotent(tmp_path: Path):
@@ -536,6 +544,25 @@ def test_init_idempotent(tmp_path: Path):
     # Second call should NOT overwrite (file already exists)
     _init_profile_defaults(tmp_path)
     assert bookmarks_path.read_text() == "SENTINEL"
+
+
+def test_init_updates_existing_preferences_without_losing_other_settings(tmp_path: Path):
+    prefs_path = tmp_path / "Default" / "Preferences"
+    prefs_path.parent.mkdir(parents=True)
+    prefs_path.write_text(json.dumps({
+        "custom": {"keep": True},
+        "download": {"danger": False},
+        "selectfile": {"keep": True},
+    }))
+
+    _init_profile_defaults(tmp_path)
+
+    data = json.loads(prefs_path.read_text())
+    assert data["custom"] == {"keep": True}
+    assert data["download"]["danger"] is False
+    assert data["download"]["prompt_for_download"] is False
+    assert data["selectfile"]["keep"] is True
+    assert data["selectfile"]["last_directory"] == str(tmp_path / "Downloads")
 
 
 # ── /proc identity ───────────────────────────────────────────────────────────

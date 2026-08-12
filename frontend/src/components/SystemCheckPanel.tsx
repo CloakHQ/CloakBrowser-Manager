@@ -83,7 +83,6 @@ export function SystemCheckPanel() {
           {check && (
             <dl className="space-y-2 text-xs">
               <Row label="GPU acceleration" value={GPU_LABELS[check.gpu_mode] ?? check.gpu_mode} />
-              <Row label="Binary version" value={check.binary_version} />
               <Row
                 label="License"
                 value={check.license_configured ? "Configured" : "Not set (free tier)"}

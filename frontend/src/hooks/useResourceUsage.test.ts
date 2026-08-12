@@ -35,8 +35,8 @@ describe("useResourceUsage", () => {
 
   it("polls and returns usage for a running profile", async () => {
     const { result } = renderHook(() => useResourceUsage("p1", true));
-    await waitFor(() => expect(result.current).not.toBeNull());
-    expect(result.current).toEqual({
+    await waitFor(() => expect(result.current.usage).not.toBeNull());
+    expect(result.current.usage).toEqual({
       cpu_percent: 12.3, memory_mb: 256, process_count: 5, idle_remaining_seconds: null,
     });
     expect(mockApi.profileResources).toHaveBeenCalledWith("p1");
@@ -47,9 +47,9 @@ describe("useResourceUsage", () => {
       ({ id, running }: { id: string | null; running: boolean }) => useResourceUsage(id, running),
       { initialProps: { id: "p1", running: true } },
     );
-    await waitFor(() => expect(result.current).not.toBeNull());
+    await waitFor(() => expect(result.current.usage).not.toBeNull());
 
     rerender({ id: "p1", running: false });
-    expect(result.current).toBeNull();
+    expect(result.current.usage).toBeNull();
   });
 });

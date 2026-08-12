@@ -47,13 +47,6 @@ def test_reports_the_hardcoded_kasmvnc_version(monkeypatch: pytest.MonkeyPatch, 
     assert result["kasmvnc_version"] == "1.5.0"
 
 
-def test_reports_the_binary_version_from_cloakbrowser_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
-    result = system_check.get_system_check(tmp_path)
-    # conftest.py stubs cloakbrowser.config.CHROMIUM_VERSION = "0.0.0-test"
-    assert result["binary_version"] == "0.0.0-test"
-
-
 def test_disk_usage_fields_are_internally_consistent(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setenv("CHROME_GPU_ACCEL", "0")
     result = system_check.get_system_check(tmp_path)

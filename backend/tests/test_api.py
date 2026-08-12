@@ -491,6 +491,26 @@ def test_get_profile_resources_idle_remaining_seconds_clamps_at_zero(app_client:
         main.browser_mgr.running.pop(pid, None)
 
 
+def test_extend_profile_idle_timeout_adds_to_the_running_session(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ExtendTimer"})
+    pid = create.json()["id"]
+    running = _mock_running_for_resources(pid, idle_timeout_seconds=600, last_active=time.monotonic())
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/idle-timeout/extend?seconds=900")
+        assert resp.status_code == 200
+        assert 1490 <= resp.json()["idle_remaining_seconds"] <= 1500
+        assert running.last_active > time.monotonic()
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+
+
+def test_extend_profile_idle_timeout_rejects_an_invalid_duration(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "InvalidExtension"})
+    pid = create.json()["id"]
+    resp = app_client.post(f"/api/profiles/{pid}/idle-timeout/extend?seconds=1")
+    assert resp.status_code == 422
+
+
 # ── Extensions upload ────────────────────────────────────────────────────────
 
 
@@ -1311,7 +1331,7 @@ def test_system_check(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
     assert resp.status_code == 200
     data = resp.json()
     assert data["gpu_mode"] == "swiftshader"
-    assert data["binary_version"] == "0.0.0-test"
+    assert "binary_version" not in data
     assert data["license_configured"] is False
     assert data["kasmvnc_version"] == "1.5.0"
     assert data["disk_total_bytes"] > 0

@@ -191,7 +191,6 @@ export interface ResourceUsage {
 
 export interface SystemCheck {
   gpu_mode: "swiftshader" | "nvidia" | "igpu";
-  binary_version: string;
   /** Whether the CONTAINER has CLOAKBROWSER_LICENSE_KEY set — not whether it
    *  is valid (only checked for real at launch) and not whether any single
    *  profile has its own override, which this panel does not see. */
@@ -389,6 +388,11 @@ export const api = {
 
   profileResources: (id: string) =>
     request<ResourceUsage>(`/api/profiles/${id}/resources`),
+
+  extendIdleTimeout: (id: string, seconds: number) =>
+    request<ResourceUsage>(`/api/profiles/${id}/idle-timeout/extend?seconds=${seconds}`, {
+      method: "POST",
+    }),
 
   listDownloads: (id: string) =>
     request<DownloadFile[]>(`/api/profiles/${id}/downloads`),

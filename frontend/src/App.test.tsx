@@ -23,6 +23,7 @@ vi.mock("./lib/api", () => {
       launchProfile: vi.fn(),
       stopProfile: vi.fn(),
       profileResources: vi.fn(),
+      extendIdleTimeout: vi.fn(),
       logout: vi.fn(),
       // ProfileForm (rendered by the "edit"/"create" views) fetches these on
       // mount regardless of what a given test is exercising.
@@ -33,7 +34,7 @@ vi.mock("./lib/api", () => {
         binary_download_state: null, default_idle_timeout_seconds: 3600,
       }),
       systemCheck: vi.fn().mockResolvedValue({
-        gpu_mode: "swiftshader", binary_version: "0.0.0-test",
+        gpu_mode: "swiftshader",
         license_configured: false, kasmvnc_version: "1.5.0",
         disk_total_bytes: 1, disk_used_bytes: 0, disk_free_bytes: 1,
         disk_percent_used: 0,
@@ -209,7 +210,7 @@ describe("Container self-check panel", () => {
 
   it("fetches and shows the check when opened", async () => {
     mockApi.systemCheck.mockResolvedValue({
-      gpu_mode: "igpu", binary_version: "150.0.0", license_configured: true,
+      gpu_mode: "igpu", license_configured: true,
       kasmvnc_version: "1.5.0", disk_total_bytes: 100, disk_used_bytes: 10,
       disk_free_bytes: 90, disk_percent_used: 10,
     });
@@ -221,7 +222,7 @@ describe("Container self-check panel", () => {
     });
     await flush();
 
-    expect(screen.getByText("150.0.0")).toBeInTheDocument();
+    expect(screen.getByText("Integrated (Intel/AMD)")).toBeInTheDocument();
   });
 });
 
@@ -278,6 +279,25 @@ describe("Idle-timeout countdown", () => {
     });
     await flush();
     expect(screen.queryByText(/auto-stop in/)).not.toBeInTheDocument();
+  });
+
+  it("adds the chosen reset duration only to the active session timer", async () => {
+    mockApi.profileResources.mockResolvedValue({
+      cpu_percent: 1, memory_mb: 100, process_count: 2, idle_remaining_seconds: 125,
+    });
+    mockApi.extendIdleTimeout.mockResolvedValue({
+      cpu_percent: 1, memory_mb: 100, process_count: 2, idle_remaining_seconds: 1025,
+    });
+    await selectRunningProfile();
+
+    await act(async () => {
+      screen.getByRole("button", { name: /reset/i }).click();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: /add 15 minutes/i }).click();
+    });
+
+    expect(mockApi.extendIdleTimeout).toHaveBeenCalledWith("p1", 900);
   });
 });
 

@@ -245,7 +245,6 @@ class ResourceUsageResponse(BaseModel):
 
 class SystemCheckResponse(BaseModel):
     gpu_mode: Literal["swiftshader", "nvidia", "igpu"]
-    binary_version: str
     license_configured: bool
     kasmvnc_version: str
     disk_total_bytes: int

@@ -327,7 +327,7 @@ def _validate_proxy(url: str) -> None:
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
-    """Set up bookmarks and Google search (Chrome's own default) on first launch."""
+    """Set up browser defaults that apply before Chromium first reads its profile."""
     default_dir = user_data_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
 
@@ -394,25 +394,38 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
         bookmarks_path.write_text(json.dumps(bookmarks, indent=2))
         logger.info("Created default bookmarks for %s", user_data_dir.name)
 
-    # --- Google as default search engine, same as an out-of-the-box Chrome ---
+    # --- Chrome preferences ---
     prefs_path = default_dir / "Preferences"
-    if not prefs_path.exists():
-        prefs = {
-            "default_search_provider_data": {
-                "template_url_data": {
-                    "keyword": "google.com",
-                    "short_name": "Google",
-                    "url": "https://www.google.com/search?q={searchTerms}",
-                    "suggestions_url": "https://www.google.com/complete/search?output=chrome&q={searchTerms}",
-                    "favicon_url": "https://www.google.com/favicon.ico",
-                }
-            },
-            "default_search_provider": {
-                "enabled": True,
-            },
-        }
-        prefs_path.write_text(json.dumps(prefs, indent=2))
-        logger.info("Set Google as default search for %s", user_data_dir.name)
+    try:
+        prefs = json.loads(prefs_path.read_text()) if prefs_path.exists() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Cannot update Chrome preferences for %s: %s", user_data_dir.name, exc)
+        return
+
+    prefs.setdefault("default_search_provider_data", {
+        "template_url_data": {
+            "keyword": "google.com",
+            "short_name": "Google",
+            "url": "https://www.google.com/search?q={searchTerms}",
+            "suggestions_url": "https://www.google.com/complete/search?output=chrome&q={searchTerms}",
+            "favicon_url": "https://www.google.com/favicon.ico",
+        },
+    })
+    prefs.setdefault("default_search_provider", {"enabled": True})
+    prefs["download"] = {
+        **prefs.get("download", {}),
+        "default_directory": str(user_data_dir / "Downloads"),
+        "extensions_to_open": "",
+        "prompt_for_download": False,
+    }
+    prefs["selectfile"] = {
+        **prefs.get("selectfile", {}),
+        "last_directory": str(user_data_dir / "Downloads"),
+    }
+    prefs["bookmark_bar"] = {**prefs.get("bookmark_bar", {}), "show_on_all_tabs": False}
+    prefs["net"] = {**prefs.get("net", {}), "network_prediction_options": 0}
+    prefs_path.write_text(json.dumps(prefs, indent=2))
+    logger.info("Applied Chrome defaults for %s", user_data_dir.name)
 
 
 def _dedupe_download_path(downloads_dir: Path, filename: str) -> Path:
@@ -1921,7 +1934,26 @@ class BrowserManager:
         """
         running = self.running.get(profile_id)
         if running is not None:
-            running.last_active = time.monotonic()
+            # An operator can add a session-only extension through the UI by
+            # moving last_active into the future. Ordinary browser activity
+            # must never erase that extension by pulling the timestamp back.
+            last_active = getattr(running, "last_active", None)
+            if isinstance(last_active, (int, float)):
+                running.last_active = max(last_active, time.monotonic())
+
+    def extend_idle_timeout(self, profile_id: str, seconds: int) -> int | None:
+        """Add `seconds` to a running profile's current session timer.
+
+        The extension is deliberately represented only by the in-memory
+        activity timestamp. It is therefore lost with the RunningProfile when
+        the browser stops, rather than being saved to the profile's persistent
+        idle_timeout_seconds setting.
+        """
+        running = self.running.get(profile_id)
+        if running is None or running.idle_timeout_seconds <= 0:
+            return None
+        running.last_active = max(running.last_active, time.monotonic()) + seconds
+        return max(0, round(running.idle_timeout_seconds - (time.monotonic() - running.last_active)))
 
     async def _probe_viewer_activity(self, running: RunningProfile) -> None:
         """Touch activity for `running` if a VNC viewer is attached right now.

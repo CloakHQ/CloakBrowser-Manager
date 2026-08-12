@@ -16,7 +16,6 @@ const mockApi = api as unknown as { systemCheck: ReturnType<typeof vi.fn> };
 function check(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     gpu_mode: "swiftshader",
-    binary_version: "150.0.0",
     license_configured: true,
     kasmvnc_version: "1.5.0",
     disk_total_bytes: 100_000_000_000,
@@ -46,7 +45,6 @@ describe("SystemCheckPanel", () => {
     });
 
     expect(mockApi.systemCheck).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("150.0.0")).toBeInTheDocument();
     expect(screen.getByText("Configured")).toBeInTheDocument();
     expect(screen.getByText("1.5.0")).toBeInTheDocument();
   });

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
+import { Clock3, Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { useBinaryDownload } from "./hooks/useBinaryDownload";
 import { useResourceUsage } from "./hooks/useResourceUsage";
@@ -126,10 +126,27 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
    *  LaunchButton flashing Stop -> Launch -> Stop as the 3s poll catches up
    *  with each half of the sequence. */
   const [restarting, setRestarting] = useState(false);
+  const [timerMenuOpen, setTimerMenuOpen] = useState(false);
+  const [extendingTimer, setExtendingTimer] = useState(false);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
-  const resourceUsage = useResourceUsage(selected?.id ?? null, selected?.status === "running");
+  const { usage: resourceUsage, refresh: refreshResourceUsage } = useResourceUsage(
+    selected?.id ?? null,
+    selected?.status === "running",
+  );
   const idleRemaining = useIdleCountdown(resourceUsage?.idle_remaining_seconds ?? null);
+
+  const extendIdleTimeout = useCallback(async (seconds: number) => {
+    if (!selectedId) return;
+    setExtendingTimer(true);
+    try {
+      await api.extendIdleTimeout(selectedId, seconds);
+      await refreshResourceUsage();
+      setTimerMenuOpen(false);
+    } finally {
+      setExtendingTimer(false);
+    }
+  }, [selectedId, refreshResourceUsage]);
 
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
@@ -280,12 +297,39 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                   </span>
                 )}
                 {idleRemaining !== null && (
-                  <span
-                    className={idleRemaining <= 60 ? "text-xs text-amber-400" : "text-xs text-gray-500"}
-                    title="Time until this profile auto-stops from inactivity (no VNC viewer or CDP traffic)"
-                  >
-                    · auto-stop in {formatCountdown(idleRemaining)}
-                  </span>
+                  <div className="relative flex items-center gap-1">
+                    <span
+                      className={idleRemaining <= 60 ? "text-xs text-amber-400" : "text-xs text-gray-500"}
+                      title="Time until this profile auto-stops from inactivity (no VNC viewer or CDP traffic)"
+                    >
+                      · auto-stop in {formatCountdown(idleRemaining)}
+                    </span>
+                    <button
+                      type="button"
+                      className="text-xs text-accent hover:text-accent/80 disabled:text-gray-500"
+                      title="Extend this browser session's timer"
+                      aria-expanded={timerMenuOpen}
+                      onClick={() => setTimerMenuOpen((open) => !open)}
+                      disabled={extendingTimer}
+                    >
+                      <Clock3 className="inline h-3 w-3" /> Reset
+                    </button>
+                    {timerMenuOpen && (
+                      <div className="absolute left-0 top-full z-50 mt-2 flex w-44 flex-col rounded-lg border border-border bg-surface-2 p-1 shadow-lg">
+                        {[15, 30, 60, 120].map((minutes) => (
+                          <button
+                            key={minutes}
+                            type="button"
+                            className="rounded px-2 py-1 text-left text-xs text-gray-300 hover:bg-surface-1 disabled:text-gray-500"
+                            onClick={() => void extendIdleTimeout(minutes * 60)}
+                            disabled={extendingTimer}
+                          >
+                            Add {minutes} minutes
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             )}

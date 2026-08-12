@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, type ResourceUsage } from "../lib/api";
 
 /**
@@ -11,8 +11,17 @@ import { api, type ResourceUsage } from "../lib/api";
 export function useResourceUsage(
   profileId: string | null,
   isRunning: boolean,
-): ResourceUsage | null {
+): { usage: ResourceUsage | null; refresh: () => Promise<void> } {
   const [usage, setUsage] = useState<ResourceUsage | null>(null);
+  const refresh = useCallback(async () => {
+    if (!profileId || !isRunning) return;
+    try {
+      setUsage(await api.profileResources(profileId));
+    } catch {
+      // A 404 during a stop or transient network error should preserve the
+      // last useful measurement until the profile poll resolves its state.
+    }
+  }, [profileId, isRunning]);
 
   useEffect(() => {
     if (!profileId || !isRunning) {
@@ -40,5 +49,5 @@ export function useResourceUsage(
     };
   }, [profileId, isRunning]);
 
-  return usage;
+  return { usage, refresh };
 }
