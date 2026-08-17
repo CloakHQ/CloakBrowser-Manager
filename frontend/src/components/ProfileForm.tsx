@@ -1,10 +1,11 @@
 import { Save, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { HostOS, Profile, ProfileCreateData } from "../lib/api";
+import type { HostOS, Profile, ProfileCreateData, ViewerMode } from "../lib/api";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
   hostOs: HostOS | null;
+  viewerMode: ViewerMode | null;
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
   onCancel: () => void;
@@ -30,7 +31,7 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, onSave, onDelete, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -394,15 +395,17 @@ export function ProfileForm({ profile, hostOs, onSave, onDelete, onCancel }: Pro
                 </select>
               </div>
             )}
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={form.clipboard_sync ?? true}
-                onChange={(e) => set("clipboard_sync", e.target.checked)}
-                className="rounded border-border bg-surface-2"
-              />
-              Enable clipboard sync by default in VNC viewer
-            </label>
+            {viewerMode === "vnc" && (
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.clipboard_sync ?? true}
+                  onChange={(e) => set("clipboard_sync", e.target.checked)}
+                  className="rounded border-border bg-surface-2"
+                />
+                Enable clipboard sync by default in VNC viewer
+              </label>
+            )}
             <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
               <input
                 type="checkbox"

@@ -232,6 +232,7 @@ async def test_native_launch_skips_vnc_and_display(monkeypatch, tmp_path: Path):
     assert running.ws_port is None
     manager.vnc.allocate.assert_not_awaited()
     manager.vnc.start_vnc.assert_not_awaited()
+    context.add_init_script.assert_not_awaited()
     options = launch.await_args.kwargs
     assert "env" not in options
     assert "viewport" not in options
@@ -295,6 +296,7 @@ async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
     assert running.display == 100
     assert running.ws_port == 6100
     manager.vnc.start_vnc.assert_awaited_once()
+    context.add_init_script.assert_awaited_once()
     options = launch.await_args.kwargs
     assert options["env"]["DISPLAY"] == ":100"
     assert options["viewport"] == {"width": 1920, "height": 947}

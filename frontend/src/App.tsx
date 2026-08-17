@@ -239,6 +239,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             <ProfileForm
               profile={null}
               hostOs={systemStatus?.host_os ?? null}
+              viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleCreate}
               onCancel={() => setView("empty")}
             />
@@ -248,6 +249,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             <ProfileForm
               profile={selected}
               hostOs={systemStatus?.host_os ?? null}
+              viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleUpdate}
               onDelete={handleDelete}
               onCancel={() => {

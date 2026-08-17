@@ -347,26 +347,27 @@ class BrowserManager:
             if context is None or cdp_port is None:
                 raise RuntimeError(f"Browser startup did not complete for profile {profile_id}")
 
-            # Capture copied text so the Manager clipboard endpoint can read it.
-            clipboard_init_js = """
-                window.__clipboardText = '';
-                document.addEventListener('copy', () => {
-                    const sel = window.getSelection();
-                    if (sel) window.__clipboardText = sel.toString();
-                });
-                document.addEventListener('keydown', (e) => {
-                    if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.altKey && !e.shiftKey) {
+            if self.runtime.viewer_mode == "vnc":
+                # Capture copied text so the Manager clipboard endpoint can read it.
+                clipboard_init_js = """
+                    window.__clipboardText = '';
+                    document.addEventListener('copy', () => {
                         const sel = window.getSelection();
-                        if (sel && sel.toString()) window.__clipboardText = sel.toString();
-                    }
-                });
-            """
-            await context.add_init_script(clipboard_init_js)
-            for page in context.pages:
-                try:
-                    await page.evaluate(clipboard_init_js)
-                except Exception as exc:
-                    logger.debug("Clipboard init failed on existing page: %s", exc)
+                        if (sel) window.__clipboardText = sel.toString();
+                    });
+                    document.addEventListener('keydown', (e) => {
+                        if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.altKey && !e.shiftKey) {
+                            const sel = window.getSelection();
+                            if (sel && sel.toString()) window.__clipboardText = sel.toString();
+                        }
+                    });
+                """
+                await context.add_init_script(clipboard_init_js)
+                for page in context.pages:
+                    try:
+                        await page.evaluate(clipboard_init_js)
+                    except Exception as exc:
+                        logger.debug("Clipboard init failed on existing page: %s", exc)
 
             running = RunningProfile(
                 profile_id=profile_id,

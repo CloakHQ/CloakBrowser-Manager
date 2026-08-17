@@ -108,7 +108,7 @@ CloakBrowser Manager gives every profile a persistent, seeded browser identity a
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families
 - **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
 - **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
-- **Clipboard sync** — copy and paste between the Manager and individual browser profiles
+- **Clipboard sync** — copy and paste between the Manager and Linux VNC browser profiles
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
 - **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
 - **Playwright/Puppeteer API** — connect to any running profile through CDP while watching the same session live
