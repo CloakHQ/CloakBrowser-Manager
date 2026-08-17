@@ -15,6 +15,9 @@ frontend/dist/
 # OS
 .DS_Store
 
+# Secrets (license key, auth token) — keep .env.example, never .env
+.env
+
 # Deploy
 deploy.sh
 

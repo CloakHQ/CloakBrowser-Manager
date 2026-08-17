@@ -295,6 +295,26 @@ async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(
+        NATIVE_RUNTIME, license_key="cb_test", release_channel="preview"
+    )
+    manager._wait_for_cdp = AsyncMock()
+    launch = AsyncMock(return_value=context)
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    await manager.launch(_launch_profile(tmp_path))
+
+    options = launch.await_args.kwargs
+    assert options["license_key"] == "cb_test"
+    assert options["release_channel"] == "preview"
+
+
+@pytest.mark.asyncio
 async def test_launch_retries_failed_cdp_and_closes_first_context(
     monkeypatch,
     tmp_path: Path,

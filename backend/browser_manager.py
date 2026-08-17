@@ -158,14 +158,77 @@ class RunningProfile:
 
 
 class BrowserManager:
-    def __init__(self, runtime_config: RuntimeConfig | None = None):
+    def __init__(
+        self,
+        runtime_config: RuntimeConfig | None = None,
+        license_key: str | None = None,
+        release_channel: str | None = None,
+    ):
         self.runtime = runtime_config or resolve_runtime()
+        # App-wide license: passed to every launch so the wrapper downloads the
+        # Pro build and injects the key the Pro binary needs to boot + take a seat.
+        self.license_key = license_key
+        self.release_channel = release_channel
+        # Resolved at startup by resolve_binary_status(); read by GET /api/status.
+        self.license_tier = "keyless"
+        self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
         self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
+
+    def resolve_binary_status(self) -> None:
+        """Resolve the license tier + binary version and pre-download the binary.
+
+        Blocking — called once at startup (via a thread) so the multi-hundred-MB
+        Pro download stays out of the launch path and auto-launch's 60s timeout.
+        Never raises: on any failure the keyless baked-in binary remains usable.
+        """
+        from cloakbrowser.config import CHROMIUM_VERSION, get_chromium_version
+        from cloakbrowser.download import ensure_binary
+        from cloakbrowser.license import (
+            get_pro_latest_version,
+            resolve_license_key,
+            validate_license,
+        )
+
+        try:
+            keyless_version = get_chromium_version()
+        except Exception:
+            keyless_version = CHROMIUM_VERSION
+
+        tier = "keyless"
+        version = keyless_version
+
+        key = resolve_license_key(self.license_key)
+        if key:
+            try:
+                info = validate_license(key)
+            except Exception as exc:
+                info = None
+                logger.warning("License validation failed: %s", exc)
+            if info and info.valid:
+                tier = "free" if info.plan == "free" else "pro"
+                try:
+                    version = get_pro_latest_version(self.release_channel) or keyless_version
+                except Exception as exc:
+                    logger.warning("Could not resolve Pro version: %s", exc)
+
+        self.license_tier = tier
+        self.binary_version = version
+
+        try:
+            ensure_binary(
+                license_key=self.license_key,
+                release_channel=self.release_channel,
+            )
+            logger.info("Binary ready: tier=%s version=%s", tier, version)
+        except Exception as exc:
+            logger.error(
+                "Binary pre-download failed (keyless fallback remains): %s", exc
+            )
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
@@ -234,6 +297,8 @@ class BrowserManager:
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
                 "user_agent": profile.get("user_agent") or None,
+                "license_key": self.license_key,
+                "release_channel": self.release_channel,
             }
             if display is not None:
                 launch_options["viewport"] = {

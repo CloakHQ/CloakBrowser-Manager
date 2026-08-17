@@ -8,6 +8,7 @@ import { ProfileViewer } from "./components/ProfileViewer";
 import { NativeWindowStatus } from "./components/NativeWindowStatus";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
+import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
@@ -186,7 +187,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               </div>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
+            <SystemStatusBadge />
             {selected && (
               <LaunchButton
                 status={selected.status}

@@ -191,6 +191,26 @@ When `AUTH_TOKEN` is set:
 
 > **Note**: The auth token is transmitted in cleartext over HTTP. If you expose the Manager to the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, Traefik).
 
+## Pro license key
+
+Without a key, the Manager runs the free keyless build. Add your CloakBrowser key once and every profile launches on the latest Pro build instead. The key is set per Manager instance, not per profile.
+
+After cloning, copy the example env file and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+```bash
+# .env
+CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
+CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
+```
+
+The file is loaded automatically at startup on both native and Docker. It is read once, so you set it and forget it (restart the Manager after changing it). With Docker you can also pass the same values with `-e CLOAKBROWSER_LICENSE_KEY=...`. The badge in the top bar shows which tier and binary version are active.
+
+A **free key allows one concurrent session**, so only one profile can run at a time. Paid plans raise that limit. Get a key (free or paid) at [cloakbrowser.dev](https://cloakbrowser.dev).
+
 ## License
 
 - **This application** (GUI source code) — MIT. See [LICENSE](LICENSE).

@@ -24,6 +24,12 @@ from fastapi.staticfiles import StaticFiles
 import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .env_file import load_env_file
+
+# Populate os.environ from the manager-root .env before anything reads it
+# (database.resolve_runtime, AUTH_TOKEN, the license config below).
+load_env_file()
+
 from . import database as db
 from .browser_manager import BrowserManager
 from .models import (
@@ -49,6 +55,12 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 # If not set, all routes are open (local dev). If set, all /api/* routes
 # (except /api/auth/* and /api/status) require Bearer token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
+
+# App-wide CloakBrowser Pro license (set once in the manager-root .env). One key
+# per Manager instance — the concurrency-seat pool is per-license, so every
+# launched profile shares it. Release channel picks Stable vs Preview builds.
+LICENSE_KEY: str | None = os.environ.get("CLOAKBROWSER_LICENSE_KEY") or None
+RELEASE_CHANNEL: str | None = os.environ.get("CLOAKBROWSER_RELEASE_CHANNEL") or None
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
@@ -177,7 +189,7 @@ class AuthMiddleware:
 
 
 # Singleton browser manager
-browser_mgr = BrowserManager()
+browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CHANNEL)
 
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
@@ -380,6 +392,9 @@ async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
     await browser_mgr.cleanup_stale()
+    # Resolve tier + pre-download the (Pro) binary before serving launches, so the
+    # download never blocks a launch or auto-launch's 60s timeout.
+    await asyncio.to_thread(browser_mgr.resolve_binary_status)
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
     logger.info("CloakBrowser Manager started")
     yield
@@ -556,19 +571,24 @@ async def get_profile_status(profile_id: str):
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    try:
-        from cloakbrowser.config import get_chromium_version
+    # Prefer the version/tier resolved at startup (reflects the actual Pro build
+    # in use). Fall back to the keyless constant before startup resolution runs.
+    binary_version = browser_mgr.binary_version
+    if not binary_version:
+        try:
+            from cloakbrowser.config import get_chromium_version
 
-        binary_version = get_chromium_version()
-    except ImportError:
-        from cloakbrowser.config import CHROMIUM_VERSION
+            binary_version = get_chromium_version()
+        except ImportError:
+            from cloakbrowser.config import CHROMIUM_VERSION
 
-        binary_version = CHROMIUM_VERSION
+            binary_version = CHROMIUM_VERSION
 
     profiles = db.list_profiles()
     return StatusResponse(
         running_count=len(browser_mgr.running),
         binary_version=binary_version,
+        license_tier=browser_mgr.license_tier,
         profiles_total=len(profiles),
         host_os=browser_mgr.runtime.host_os,
         runtime_mode=browser_mgr.runtime.runtime_mode,

@@ -122,6 +122,7 @@ class LaunchResponse(BaseModel):
 class StatusResponse(BaseModel):
     running_count: int
     binary_version: str
+    license_tier: str = "keyless"  # "pro" | "free" | "keyless"
     profiles_total: int
     host_os: HostOS
     runtime_mode: RuntimeMode

@@ -78,6 +78,7 @@ export interface LaunchResult {
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
+  license_tier: string; // "pro" | "free" | "keyless"
   profiles_total: number;
   host_os: HostOS;
   runtime_mode: RuntimeMode;
