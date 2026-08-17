@@ -105,7 +105,7 @@ def _ensure_server_port_available() -> None:
 def _open_when_ready() -> None:
     for _ in range(100):
         try:
-            with urllib.request.urlopen(f"{SERVER_URL}/api/status", timeout=0.5):
+            with urllib.request.urlopen(f"{SERVER_URL}/api/health", timeout=0.5):
                 webbrowser.open(SERVER_URL)
                 return
         except OSError:
