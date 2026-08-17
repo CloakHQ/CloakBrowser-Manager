@@ -23,13 +23,14 @@ def test_profile_create_minimal():
     p = ProfileCreate(name="Test")
     assert p.name == "Test"
     assert p.fingerprint_seed is None
-    assert p.platform == "windows"
     assert p.screen_width == 1920
     assert p.screen_height == 1080
+    assert p.gpu_family == "auto"
     assert p.humanize is False
-    assert p.headless is False
-    assert p.geoip is False
+    assert p.geoip is True
     assert p.human_preset == "default"
+    assert p.extension_paths == []
+    assert p.allow_3p_cookies is False
 
 
 def test_profile_create_all_fields():
@@ -39,22 +40,19 @@ def test_profile_create_all_fields():
         proxy="http://host:8080",
         timezone="America/New_York",
         locale="en-US",
-        platform="macos",
-        user_agent="Mozilla/5.0",
         screen_width=2560,
         screen_height=1440,
-        gpu_vendor="NVIDIA",
-        gpu_renderer="RTX 3070",
-        hardware_concurrency=16,
+        gpu_family="nvidia",
         humanize=True,
         human_preset="careful",
-        headless=True,
         geoip=True,
         color_scheme="dark",
+        extension_paths=["/tmp/extension"],
+        allow_3p_cookies=True,
         notes="test note",
         tags=[TagCreate(tag="work", color="#ff0000")],
     )
-    assert p.platform == "macos"
+    assert p.gpu_family == "nvidia"
     assert p.human_preset == "careful"
     assert p.color_scheme == "dark"
     assert len(p.tags) == 1
@@ -76,9 +74,9 @@ def test_profile_update_launch_args():
     assert dumped == {"launch_args": ["--flag"]}
 
 
-def test_profile_create_invalid_platform():
+def test_profile_create_invalid_gpu_family():
     with pytest.raises(ValidationError):
-        ProfileCreate(name="Bad", platform="android")
+        ProfileCreate(name="Bad", gpu_family="amd")
 
 
 def test_profile_create_invalid_human_preset():
@@ -97,7 +95,7 @@ def test_profile_create_invalid_color_scheme():
 def test_profile_update_all_optional():
     p = ProfileUpdate()
     assert p.name is None
-    assert p.platform is None
+    assert p.gpu_family is None
 
 
 def test_profile_update_exclude_unset():
@@ -106,9 +104,16 @@ def test_profile_update_exclude_unset():
     assert dumped == {"name": "New Name"}
 
 
-def test_profile_update_invalid_platform():
+def test_profile_update_invalid_gpu_family():
     with pytest.raises(ValidationError):
-        ProfileUpdate(platform="android")
+        ProfileUpdate(gpu_family="amd")
+    with pytest.raises(ValidationError):
+        ProfileUpdate(gpu_family=None)
+
+
+def test_removed_profile_fields_are_rejected():
+    with pytest.raises(ValidationError):
+        ProfileCreate(name="Legacy", user_agent="Legacy UA")
 
 
 # ── TagCreate ────────────────────────────────────────────────────────────────

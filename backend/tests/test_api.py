@@ -38,7 +38,7 @@ def test_create_profile_with_all_fields(app_client: TestClient):
         "name": "Full",
         "fingerprint_seed": 42,
         "proxy": "http://host:8080",
-        "platform": "macos",
+        "gpu_family": "nvidia",
         "screen_width": 2560,
         "screen_height": 1440,
         "humanize": True,
@@ -48,13 +48,25 @@ def test_create_profile_with_all_fields(app_client: TestClient):
     assert resp.status_code == 201
     data = resp.json()
     assert data["fingerprint_seed"] == 42
-    assert data["platform"] == "macos"
+    assert data["gpu_family"] == "nvidia"
     assert len(data["tags"]) == 1
 
 
-def test_create_profile_invalid_platform(app_client: TestClient):
-    resp = app_client.post("/api/profiles", json={"name": "Bad", "platform": "android"})
+def test_create_profile_invalid_gpu_family(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={"name": "Bad", "gpu_family": "amd"})
     assert resp.status_code == 422
+
+
+def test_removed_profile_fields_and_null_gpu_family_are_rejected(app_client: TestClient):
+    legacy = app_client.post("/api/profiles", json={"name": "Legacy", "headless": True})
+    assert legacy.status_code == 422
+
+    created = app_client.post("/api/profiles", json={"name": "GPU"})
+    response = app_client.put(
+        f"/api/profiles/{created.json()['id']}",
+        json={"gpu_family": None},
+    )
+    assert response.status_code == 422
 
 
 def test_get_profile(app_client: TestClient):
@@ -256,6 +268,17 @@ def test_profile_launch_args_get(app_client: TestClient):
     pid = resp.json()["id"]
     resp = app_client.get(f"/api/profiles/{pid}")
     assert resp.json()["launch_args"] == ["--flag"]
+
+
+def test_profile_extensions_and_3p_cookie_setting(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={
+        "name": "Compatibility",
+        "extension_paths": ["/data/extensions/one"],
+        "allow_3p_cookies": True,
+    })
+    assert resp.status_code == 201
+    assert resp.json()["extension_paths"] == ["/data/extensions/one"]
+    assert resp.json()["allow_3p_cookies"] is True
 
 
 # ── Clipboard Sync Setting ──────────────────────────────────────────────────

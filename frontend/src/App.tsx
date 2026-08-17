@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
-import { api, setOnUnauthorized, type ProfileCreateData } from "./lib/api";
+import { api, setOnUnauthorized, type ProfileCreateData, type SystemStatus } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -95,6 +95,11 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+
+  useEffect(() => {
+    api.getStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
+  }, []);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
 
@@ -141,6 +146,12 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     setView("edit");
   }, [selectedId, stop]);
 
+  const handleClipboardSyncChange = useCallback(async (enabled: boolean) => {
+    if (!selectedId) throw new Error("No profile selected");
+    const updated = await update(selectedId, { clipboard_sync: enabled });
+    if (!updated) throw new Error("Failed to save clipboard preference");
+  }, [selectedId, update]);
+
   const handleVncDisconnect = useCallback(() => {
     setView("edit");
   }, []);
@@ -183,12 +194,11 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               <div className="flex items-center gap-2">
                 <StatusIndicator status={selected.status} size="md" />
                 <span className="text-sm font-medium">{selected.name}</span>
-                <span className="text-xs text-gray-500 capitalize">{selected.platform}</span>
               </div>
             )}
           </div>
           <div className="flex items-center gap-3">
-            <SystemStatusBadge />
+            <SystemStatusBadge status={systemStatus} />
             {selected && (
               <LaunchButton
                 status={selected.status}
@@ -228,6 +238,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           {view === "create" && (
             <ProfileForm
               profile={null}
+              hostOs={systemStatus?.host_os ?? null}
               onSave={handleCreate}
               onCancel={() => setView("empty")}
             />
@@ -236,6 +247,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           {view === "edit" && selected && (
             <ProfileForm
               profile={selected}
+              hostOs={systemStatus?.host_os ?? null}
               onSave={handleUpdate}
               onDelete={handleDelete}
               onCancel={() => {
@@ -252,6 +264,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 profileId={selected.id}
                 cdpUrl={selected.cdp_url}
                 clipboardSync={selected.clipboard_sync}
+                onClipboardSyncChange={handleClipboardSyncChange}
                 onDisconnect={handleVncDisconnect}
               />
             ) : (

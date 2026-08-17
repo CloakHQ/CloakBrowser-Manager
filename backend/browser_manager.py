@@ -287,7 +287,7 @@ class BrowserManager:
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
-                "headless": bool(profile.get("headless", False)),
+                "headless": False,
                 "proxy": proxy,
                 "args": extra_args,
                 "timezone": profile.get("timezone") or None,
@@ -296,7 +296,7 @@ class BrowserManager:
                 "human_preset": profile.get("human_preset", "default"),
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
-                "user_agent": profile.get("user_agent") or None,
+                "extension_paths": profile.get("extension_paths") or [],
                 "license_key": self.license_key,
                 "release_channel": self.release_channel,
             }
@@ -551,10 +551,9 @@ class BrowserManager:
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:
         """Build extra Chromium args from profile fingerprint settings."""
-        args: list[str] = [
-            "--disable-infobars",
-            "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
-        ]
+        # Keep --test-type until the Linux Docker/VNC no-sandbox warning path
+        # is verified without it. Playwright already supplies --disable-infobars.
+        args: list[str] = ["--test-type"]
         if self.runtime.viewer_mode == "vnc":
             args.append("--use-angle=swiftshader")
 
@@ -562,22 +561,21 @@ class BrowserManager:
         if seed is not None:
             args.append(f"--fingerprint={seed}")
 
-        p = profile.get("platform")
-        if p:
-            # Map our "macos" to binary's "macos"
-            args.append(f"--fingerprint-platform={p}")
+        # Persona is always determined by the runtime, not editable profile data.
+        platform = "macos" if self.runtime.host_os == "macos" else "windows"
+        args.append(f"--fingerprint-platform={platform}")
 
-        vendor = profile.get("gpu_vendor")
-        if vendor:
-            args.append(f"--fingerprint-gpu-vendor={vendor}")
+        # Apple GPU models are selected automatically by the seeded macOS
+        # persona. Windows vendor-family overrides are incoherent on macOS.
+        gpu_family = profile.get("gpu_family", "auto")
+        if self.runtime.host_os != "macos":
+            if gpu_family == "nvidia":
+                args.append("--fingerprint-gpu-vendor=NVIDIA")
+            elif gpu_family == "intel":
+                args.append("--fingerprint-gpu-vendor=Intel")
 
-        renderer = profile.get("gpu_renderer")
-        if renderer:
-            args.append(f"--fingerprint-gpu-renderer={renderer}")
-
-        hw = profile.get("hardware_concurrency")
-        if hw is not None:
-            args.append(f"--fingerprint-hardware-concurrency={hw}")
+        if profile.get("allow_3p_cookies", False):
+            args.append("--fingerprint-allow-3p-cookies")
 
         sw = profile.get("screen_width")
         sh = profile.get("screen_height")

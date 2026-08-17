@@ -13,21 +13,18 @@ export interface Profile {
   proxy: string | null;
   timezone: string | null;
   locale: string | null;
-  platform: string;
-  user_agent: string | null;
   screen_width: number;
   screen_height: number;
-  gpu_vendor: string | null;
-  gpu_renderer: string | null;
-  hardware_concurrency: number | null;
+  gpu_family: "auto" | "nvidia" | "intel";
   humanize: boolean;
   human_preset: string;
-  headless: boolean;
   geoip: boolean;
   clipboard_sync: boolean;
   auto_launch: boolean;
   color_scheme: string | null;
   launch_args: string[];
+  extension_paths: string[];
+  allow_3p_cookies: boolean;
   notes: string | null;
   user_data_dir: string;
   created_at: string;
@@ -46,21 +43,18 @@ export interface ProfileCreateData {
   proxy?: string | null;
   timezone?: string | null;
   locale?: string | null;
-  platform?: string;
-  user_agent?: string | null;
   screen_width?: number;
   screen_height?: number;
-  gpu_vendor?: string | null;
-  gpu_renderer?: string | null;
-  hardware_concurrency?: number | null;
+  gpu_family?: "auto" | "nvidia" | "intel";
   humanize?: boolean;
   human_preset?: string;
-  headless?: boolean;
   geoip?: boolean;
   clipboard_sync?: boolean;
   auto_launch?: boolean;
   color_scheme?: string | null;
   launch_args?: string[];
+  extension_paths?: string[];
+  allow_3p_cookies?: boolean;
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }
@@ -83,6 +77,9 @@ export interface SystemStatus {
   host_os: HostOS;
   runtime_mode: RuntimeMode;
   viewer_mode: ViewerMode;
+  windows_fonts_present: number | null;
+  windows_fonts_required: number | null;
+  windows_fonts_complete: boolean | null;
 }
 
 class ApiError extends Error {

@@ -67,13 +67,7 @@ export function ProfileList({ profiles, selectedId, onSelect, onNew }: ProfileLi
               <span className="text-sm font-medium truncate">{profile.name}</span>
             </div>
             <div className="flex items-center gap-2 mt-1 ml-4">
-              <span className="text-xs text-gray-500 capitalize">{profile.platform}</span>
-              {profile.proxy && (
-                <>
-                  <span className="text-xs text-gray-600">·</span>
-                  <span className="text-xs text-gray-500">Proxy</span>
-                </>
-              )}
+              {profile.proxy && <span className="text-xs text-gray-500">Proxy</span>}
             </div>
             {profile.tags.length > 0 && (
               <div className="flex gap-1 mt-1.5 ml-4 flex-wrap">

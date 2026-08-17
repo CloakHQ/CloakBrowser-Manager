@@ -106,9 +106,9 @@ def test_validate_no_port():
 _mgr = BrowserManager(DOCKER_RUNTIME)
 
 
-def test_build_args_always_includes_base():
+def test_build_args_uses_only_current_managed_flags():
     args = _mgr._build_fingerprint_args({})
-    assert "--disable-infobars" in args
+    assert "--disable-infobars" not in args
     assert "--test-type" in args
     assert "--use-angle=swiftshader" in args
 
@@ -123,23 +123,29 @@ def test_build_args_no_seed():
     assert not any(a.startswith("--fingerprint=") for a in args)
 
 
-def test_build_args_platform():
-    args = _mgr._build_fingerprint_args({"platform": "macos"})
-    assert "--fingerprint-platform=macos" in args
+def test_build_args_platform_comes_from_runtime():
+    assert "--fingerprint-platform=windows" in _mgr._build_fingerprint_args({})
+    mac_runtime = RuntimeConfig(
+        host_os="macos",
+        runtime_mode="native",
+        viewer_mode="native-window",
+        data_dir=Path("/tmp/manager-data"),
+    )
+    mac_manager = BrowserManager(mac_runtime)
+    assert "--fingerprint-platform=macos" in mac_manager._build_fingerprint_args({})
+    assert not any(
+        "gpu-vendor" in arg
+        for arg in mac_manager._build_fingerprint_args({"gpu_family": "nvidia"})
+    )
 
 
-def test_build_args_gpu():
-    args = _mgr._build_fingerprint_args({
-        "gpu_vendor": "NVIDIA Corporation",
-        "gpu_renderer": "NVIDIA GeForce RTX 3070",
-    })
-    assert "--fingerprint-gpu-vendor=NVIDIA Corporation" in args
-    assert "--fingerprint-gpu-renderer=NVIDIA GeForce RTX 3070" in args
-
-
-def test_build_args_hardware_concurrency():
-    args = _mgr._build_fingerprint_args({"hardware_concurrency": 8})
-    assert "--fingerprint-hardware-concurrency=8" in args
+def test_build_args_gpu_family_and_cookie_compatibility():
+    nvidia = _mgr._build_fingerprint_args({"gpu_family": "nvidia", "allow_3p_cookies": True})
+    assert "--fingerprint-gpu-vendor=NVIDIA" in nvidia
+    assert "--fingerprint-allow-3p-cookies" in nvidia
+    intel = _mgr._build_fingerprint_args({"gpu_family": "intel"})
+    assert "--fingerprint-gpu-vendor=Intel" in intel
+    assert not any("gpu-vendor" in arg for arg in _mgr._build_fingerprint_args({"gpu_family": "auto"}))
 
 
 def test_build_args_screen():
@@ -150,7 +156,7 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Two shared flags plus Docker's software rendering flag.
+    # Linux warning suppression, Docker software rendering, and runtime platform.
     assert len(args) == 3
 
 
@@ -166,7 +172,6 @@ def test_launch_args_appended_to_fingerprint_args():
     """launch_args from profile should appear in the args list after fingerprint args."""
     profile = {
         "fingerprint_seed": 42,
-        "platform": "windows",
         "launch_args": ["--load-extension=/tmp/ext", "--disable-features=Foo"],
     }
     args = _mgr._build_fingerprint_args(profile)
@@ -232,6 +237,8 @@ async def test_native_launch_skips_vnc_and_display(monkeypatch, tmp_path: Path):
     assert "viewport" not in options
     assert "--use-angle=swiftshader" not in options["args"]
     assert "--remote-debugging-address=127.0.0.1" in options["args"]
+    assert options["headless"] is False
+    assert options["extension_paths"] == []
 
 
 @pytest.mark.asyncio
@@ -307,11 +314,16 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
     launch = AsyncMock(return_value=context)
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
 
-    await manager.launch(_launch_profile(tmp_path))
+    profile = _launch_profile(tmp_path)
+    profile["extension_paths"] = ["/tmp/extension"]
+    profile["launch_args"] = ["--raw-flag"]
+    await manager.launch(profile)
 
     options = launch.await_args.kwargs
     assert options["license_key"] == "cb_test"
     assert options["release_channel"] == "preview"
+    assert options["extension_paths"] == ["/tmp/extension"]
+    assert options["args"].index("--raw-flag") > options["args"].index("--fingerprint-platform=windows")
 
 
 @pytest.mark.asyncio

@@ -27,11 +27,24 @@ Each profile is an isolated CloakBrowser instance with its own fingerprint, prox
 
 ### Windows and macOS
 
-Clone the repository, then start the platform launcher:
+Clone the repository:
 
-```text
-Windows: run-windows.bat
-macOS:   ./run-macos.sh
+```bash
+git clone https://github.com/CloakHQ/CloakBrowser-Manager.git
+cd CloakBrowser-Manager
+```
+
+On Windows, run:
+
+```bat
+run-windows.bat
+```
+
+On macOS, run:
+
+```bash
+chmod +x run-macos.sh
+./run-macos.sh
 ```
 
 The first run creates a local Python environment, installs dependencies, builds the React UI, starts Manager on `127.0.0.1:8080`, and opens it in your default browser. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS.
@@ -70,7 +83,7 @@ Each CloakBrowser profile generates a completely different device identity. To t
 ## Features
 
 - **Profile management** — create, edit, delete browser profiles with unique fingerprints
-- **Per-profile settings** — fingerprint seed, proxy, timezone, locale, user agent, screen size, platform
+- **Per-profile settings** — fingerprint seed, proxy, GeoIP, timezone, locale, GPU family, screen size, extensions, and login compatibility
 - **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
 - **Session persistence** — cookies, localStorage, and cache survive browser restarts
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows

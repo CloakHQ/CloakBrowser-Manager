@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { api, type SystemStatus } from "../lib/api";
+import { AlertTriangle } from "lucide-react";
+import type { SystemStatus } from "../lib/api";
 
 const TIER_LABEL: Record<string, string> = {
   pro: "Pro",
@@ -14,14 +14,7 @@ const TIER_COLOR: Record<string, string> = {
 };
 
 /** Small always-visible badge showing which binary/tier the Manager is running. */
-export function SystemStatusBadge() {
-  const [status, setStatus] = useState<SystemStatus | null>(null);
-
-  // Tier/version is fixed per instance — fetch once on mount.
-  useEffect(() => {
-    api.getStatus().then(setStatus).catch(() => setStatus(null));
-  }, []);
-
+export function SystemStatusBadge({ status }: { status: SystemStatus | null }) {
   if (!status) return null;
 
   const tier = status.license_tier || "keyless";
@@ -40,6 +33,11 @@ export function SystemStatusBadge() {
       </span>
       <span className="text-gray-600">·</span>
       <span className="font-mono">{status.binary_version}</span>
+      {status.windows_fonts_complete === false && (
+        <span className="flex items-center gap-1 text-amber-400" title={`Windows persona fonts incomplete: ${status.windows_fonts_present ?? 0}/${status.windows_fonts_required ?? 0} found`}>
+          <AlertTriangle className="h-3.5 w-3.5" /> Fonts incomplete
+        </span>
+      )}
     </span>
   );
 }

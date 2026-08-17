@@ -580,6 +580,25 @@ async def health_check():
     return {"status": "ok"}
 
 
+def _windows_font_health() -> tuple[int | None, int | None, bool | None]:
+    """Report Windows persona font coverage only where that persona is emulated."""
+    if not (
+        browser_mgr.runtime.runtime_mode == "docker"
+        and browser_mgr.runtime.host_os == "linux"
+    ):
+        return None, None, None
+    try:
+        # Delayed import keeps API tests usable when cloakbrowser is mocked.
+        from cloakbrowser.browser import _WINDOWS_FONT_TELLS, _count_fonts_present
+
+        present = _count_fonts_present(_WINDOWS_FONT_TELLS)
+        required = len(_WINDOWS_FONT_TELLS)
+        return present, required, None if present is None else present == required
+    except Exception as exc:
+        logger.warning("Could not inspect Windows font health: %s", exc)
+        return None, None, None
+
+
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
     # Prefer the version/tier resolved at startup (reflects the actual Pro build
@@ -596,6 +615,9 @@ async def get_system_status():
             binary_version = CHROMIUM_VERSION
 
     profiles = db.list_profiles()
+    fonts_present, fonts_required, fonts_complete = await asyncio.to_thread(
+        _windows_font_health
+    )
     return StatusResponse(
         running_count=len(browser_mgr.running),
         binary_version=binary_version,
@@ -604,6 +626,9 @@ async def get_system_status():
         host_os=browser_mgr.runtime.host_os,
         runtime_mode=browser_mgr.runtime.runtime_mode,
         viewer_mode=browser_mgr.runtime.viewer_mode,
+        windows_fonts_present=fonts_present,
+        windows_fonts_required=fonts_required,
+        windows_fonts_complete=fonts_complete,
     )
 
 

@@ -36,10 +36,34 @@ def test_init_db_idempotent(tmp_db: Path):
 def test_init_db_preserves_existing_profile_directory(tmp_db: Path):
     profile = db.create_profile("Existing")
     original_path = profile["user_data_dir"]
-
     db.init_db()
-
     assert db.get_profile(profile["id"])["user_data_dir"] == original_path
+
+
+def test_init_db_rebuilds_old_schema_preserving_profile_and_tags(tmp_db: Path):
+    with db.get_db() as conn:
+        conn.executescript("""
+            DROP TABLE profile_tags; DROP TABLE profiles;
+            CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint_seed INTEGER NOT NULL, proxy TEXT, platform TEXT, user_agent TEXT, gpu_vendor TEXT, gpu_renderer TEXT, hardware_concurrency INTEGER, headless BOOLEAN, user_data_dir TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE profile_tags (profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE, tag TEXT NOT NULL, color TEXT, PRIMARY KEY(profile_id, tag));
+            INSERT INTO profiles VALUES ('old', 'Retained', 42, 'http://proxy:1', 'macos', 'Legacy UA', 'NVIDIA', 'Legacy GPU', 16, 1, '/data/old', 'created', 'updated');
+            INSERT INTO profile_tags VALUES ('old', 'keep', '#abc');
+        """)
+        conn.commit()
+    db.init_db()
+    profile = db.get_profile("old")
+    assert profile["name"] == "Retained"
+    assert profile["proxy"] == "http://proxy:1"
+    assert profile["tags"] == [{"tag": "keep", "color": "#abc"}]
+    assert profile["gpu_family"] == "nvidia"
+    assert profile["geoip"] == 1
+    with db.get_db() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)")}
+    assert {
+        "platform", "user_agent", "gpu_vendor", "gpu_renderer",
+        "hardware_concurrency", "headless",
+    }.isdisjoint(columns)
+    assert {"launch_args", "extension_paths", "allow_3p_cookies"}.issubset(columns)
 
 
 # ── create_profile ───────────────────────────────────────────────────────────
@@ -51,7 +75,7 @@ def test_create_profile_minimal(tmp_db: Path):
     assert isinstance(p["id"], str) and len(p["id"]) == 36  # UUID
     assert 10000 <= p["fingerprint_seed"] <= 99999  # random default
     assert p["user_data_dir"].startswith(str(tmp_db))
-    assert p["platform"] == "windows"
+    assert p["gpu_family"] == "auto"
     assert p["created_at"] is not None
     assert p["updated_at"] is not None
 
@@ -68,24 +92,17 @@ def test_create_profile_all_fields(tmp_db: Path):
         proxy="http://host:8080",
         timezone="America/New_York",
         locale="en-US",
-        platform="macos",
-        user_agent="Test UA",
         screen_width=2560,
         screen_height=1440,
-        gpu_vendor="NVIDIA",
-        gpu_renderer="RTX 3070",
-        hardware_concurrency=16,
+        gpu_family="nvidia",
         humanize=True,
         human_preset="careful",
-        headless=True,
         geoip=True,
         color_scheme="dark",
         notes="test note",
     )
     assert p["proxy"] == "http://host:8080"
-    assert p["platform"] == "macos"
-    assert p["gpu_vendor"] == "NVIDIA"
-    assert p["hardware_concurrency"] == 16
+    assert p["gpu_family"] == "nvidia"
     assert p["humanize"] == 1  # SQLite stores bool as int
     assert p["human_preset"] == "careful"
     assert p["color_scheme"] == "dark"
@@ -106,12 +123,13 @@ def test_create_profile_with_tags(tmp_db: Path):
 
 def test_create_profile_defaults(tmp_db: Path):
     p = db.create_profile("Defaults")
-    assert p["platform"] == "windows"
+    assert p["gpu_family"] == "auto"
     assert p["screen_width"] == 1920
     assert p["screen_height"] == 1080
     assert p["humanize"] == 0
-    assert p["headless"] == 0
-    assert p["geoip"] == 0
+    assert p["geoip"] == 1
+    assert p["extension_paths"] == []
+    assert p["allow_3p_cookies"] == 0
     assert p["human_preset"] == "default"
     assert p["launch_args"] == []
 
@@ -125,6 +143,19 @@ def test_get_profile_launch_args_roundtrip(tmp_db: Path):
     p = db.create_profile("Args", launch_args=["--flag1", "--flag2"])
     fetched = db.get_profile(p["id"])
     assert fetched["launch_args"] == ["--flag1", "--flag2"]
+
+
+def test_profile_extension_paths_and_cookie_setting_roundtrip(tmp_db: Path):
+    profile = db.create_profile(
+        "Compatibility",
+        extension_paths=["/tmp/one", "/tmp/two"],
+        allow_3p_cookies=True,
+    )
+    assert profile["extension_paths"] == ["/tmp/one", "/tmp/two"]
+    assert profile["allow_3p_cookies"] == 1
+
+    updated = db.update_profile(profile["id"], extension_paths=["/tmp/three"])
+    assert updated["extension_paths"] == ["/tmp/three"]
 
 
 def test_update_profile_launch_args(tmp_db: Path):
