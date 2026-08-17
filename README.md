@@ -67,30 +67,54 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues).
 
+## CloakBrowser license key
+
+[Get a free key with GitHub](https://cloakbrowser.dev/free) to use the current CloakBrowser build with one concurrent browser session. Paid plans at [cloakbrowser.dev](https://cloakbrowser.dev) let you run more profiles at once.
+
+Without a key, the Manager uses the older keyless build. Add your key once and every profile will use it. The key is set per Manager instance, not per profile.
+
+After cloning, copy the example env file and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+```bash
+# .env
+CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
+CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
+```
+
+The file is loaded automatically at startup on both native and Docker. Restart the Manager after changing it. With Docker, you can also pass the key with `-e CLOAKBROWSER_LICENSE_KEY=...`. The badge in the top bar shows which tier and binary version are active.
+
 ## Why Not Just Use a VPN?
 
-A VPN only changes your IP. Incognito only clears cookies. Chrome profiles share the same hardware fingerprint underneath. Platforms use 50+ signals to link your accounts — canvas, WebGL, audio, GPU, fonts, screen size, timezone.
+A VPN changes your IP, while Incognito and standard Chrome profiles mainly separate local browsing data. They still expose the same underlying browser and hardware signals.
 
-Each CloakBrowser profile generates a completely different device identity. To the website, each profile looks like a different computer.
+CloakBrowser Manager gives every profile a persistent, seeded browser identity alongside its own proxy, cookies, storage, and history.
 
-| Solution | What it changes | Accounts linked? |
-|----------|----------------|-----------------|
-| VPN | IP address only | Yes — same fingerprint |
-| Incognito | Clears cookies | Yes — same fingerprint |
-| Chrome profiles | Separate bookmarks/cookies | Yes — same hardware fingerprint |
-| **CloakBrowser** | **Everything — full device identity per profile** | **No** |
+| Solution | What it isolates | Browser fingerprint isolation |
+|---|---|---|
+| VPN | IP address | No |
+| Incognito | Temporary cookies and storage | No |
+| Chrome profiles | Cookies, history, and bookmarks | No |
+| **CloakBrowser Manager** | **Profile data, network settings, and browser identity** | **Yes — per-profile identity** |
 
 ## Features
 
-- **Profile management** — create, edit, delete browser profiles with unique fingerprints
-- **Per-profile settings** — fingerprint seed, proxy, GeoIP, timezone, locale, GPU family, screen size, extensions, and login compatibility
-- **One-click launch/stop** — each profile runs as an isolated CloakBrowser instance
-- **Session persistence** — cookies, localStorage, and cache survive browser restarts
+- **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
+- **Persistent identities** — each profile keeps its fingerprint seed, cookies, localStorage, cache, and browsing history
+- **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen controls
+- **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families
+- **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
+- **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
+- **Clipboard sync** — copy and paste between the Manager and individual browser profiles
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
 - **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
-- **Playwright/Puppeteer API** — connect to any running profile programmatically via CDP, while still watching it live in the browser
-- **Optional authentication** — protect the web UI and API with a single token, or run wide open locally
-- **Powered by CloakBrowser** — 32 source-level C++ patches, passes Cloudflare Turnstile, 0.9 reCAPTCHA v3 score
+- **Playwright/Puppeteer API** — connect to any running profile through CDP while watching the same session live
+- **License and system status** — see the active tier, binary version, and Windows font health in the top bar
+- **Optional authentication** — protect the web UI and API with a single token, or run locally without authentication
+- **Powered by CloakBrowser** — 71 source-level C++ patches, tested against Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS, and BrowserScan
 
 ## Stack
 
@@ -133,15 +157,31 @@ docker compose up --build
 
 ## Updating
 
-Pull the latest image and restart:
+### Windows and macOS
+
+Pull the latest source and run the platform launcher again. It installs changed dependencies and rebuilds the interface automatically.
+
+```bash
+git pull
+```
+
+```text
+Windows: run-windows.bat
+macOS:   ./run-macos.sh
+```
+
+### Linux server
+
+Pull the latest image and recreate the container:
 
 ```bash
 docker pull cloakhq/cloakbrowser-manager
 docker stop <container-id>
-docker run -p 8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
+docker rm <container-id>
+docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
 ```
 
-Your profiles and session data are stored in the `cloakprofiles` volume and persist across updates.
+Profiles and session data remain in the native application-data directory or the `cloakprofiles` Docker volume across updates.
 
 ## Automation API
 
@@ -185,7 +225,7 @@ Then open `http://localhost:8080`.
 By default, there is no authentication (ideal for local use). To protect the web UI and API when hosting on a network, set the `AUTH_TOKEN` environment variable:
 
 ```bash
-docker run -p 8080:8080 -v cloakprofiles:/data -e AUTH_TOKEN=your-secret-token cloakhq/cloakbrowser-manager
+docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data -e AUTH_TOKEN=your-secret-token cloakhq/cloakbrowser-manager
 ```
 
 Or in `docker-compose.yml`:
@@ -204,30 +244,10 @@ When `AUTH_TOKEN` is set:
 
 > **Note**: The auth token is transmitted in cleartext over HTTP. If you expose the Manager to the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, Traefik).
 
-## Pro license key
-
-Without a key, the Manager runs the free keyless build. Add your CloakBrowser key once and every profile launches on the latest Pro build instead. The key is set per Manager instance, not per profile.
-
-After cloning, copy the example env file and fill it in:
-
-```bash
-cp .env.example .env
-```
-
-```bash
-# .env
-CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
-CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
-```
-
-The file is loaded automatically at startup on both native and Docker. It is read once, so you set it and forget it (restart the Manager after changing it). With Docker you can also pass the same values with `-e CLOAKBROWSER_LICENSE_KEY=...`. The badge in the top bar shows which tier and binary version are active.
-
-A **free key allows one concurrent session**, so only one profile can run at a time. Paid plans raise that limit. Get a key (free or paid) at [cloakbrowser.dev](https://cloakbrowser.dev).
-
 ## License
 
 - **This application** (GUI source code) — MIT. See [LICENSE](LICENSE).
-- **CloakBrowser binary** (compiled Chromium) — free to use, no redistribution. See [BINARY-LICENSE.md](BINARY-LICENSE.md).
+- **CloakBrowser binary** (compiled Chromium) — governed by version-specific subscription terms and may not be redistributed. See [BINARY-LICENSE.md](BINARY-LICENSE.md).
 
 The GUI application requires the CloakBrowser Chromium binary to function. The binary is automatically downloaded on first launch and is governed by its own license terms. If you fork or redistribute this application, your users must comply with the [CloakBrowser Binary License](BINARY-LICENSE.md).
 
