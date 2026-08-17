@@ -148,9 +148,13 @@ export function setOnUnauthorized(cb: (() => void) | null) {
 async function request<T>(
   path: string,
   options?: RequestInit,
+  bearerToken?: string,
 ): Promise<T> {
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
+    },
     ...options,
   });
   if (!res.ok) {
@@ -263,4 +267,25 @@ export const api = {
 
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
+
+  getScopedProfile: (id: string, token: string) =>
+    request<Pick<Profile, "id" | "name" | "status" | "viewer_mode" | "clipboard_sync">>(
+      `/api/scoped/profiles/${id}`,
+      undefined,
+      token,
+    ),
+
+  setScopedClipboard: (id: string, token: string, text: string) =>
+    request<{ ok: boolean }>(
+      `/api/scoped/profiles/${id}/clipboard`,
+      { method: "POST", body: JSON.stringify({ text }) },
+      token,
+    ),
+
+  getScopedClipboard: (id: string, token: string) =>
+    request<{ text: string }>(
+      `/api/scoped/profiles/${id}/clipboard`,
+      undefined,
+      token,
+    ),
 };

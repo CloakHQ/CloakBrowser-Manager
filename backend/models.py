@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -158,6 +159,7 @@ class StatusResponse(BaseModel):
     windows_fonts_present: int | None = None
     windows_fonts_required: int | None = None
     windows_fonts_complete: bool | None = None
+    proxy_auth_inline_supported: bool
 
 
 class UpdateCheckResponse(BaseModel):
@@ -205,6 +207,51 @@ class ProxyTestResponse(BaseModel):
     timezone: str | None = None
     latency_ms: int | None = None
     error: str | None = None
+
+
+class AutomationCookie(BaseModel):
+    name: str = Field(min_length=1, max_length=256)
+    value: str = Field(max_length=16_384)
+    url: str | None = Field(default=None, max_length=2_048)
+    domain: str | None = Field(default=None, max_length=255)
+    path: str = Field(default="/", max_length=2_048)
+    expires: float | None = None
+    httpOnly: bool = False
+    secure: bool = True
+    sameSite: Literal["Strict", "Lax", "None"] | None = None
+
+
+class AutomationBootstrapRequest(BaseModel):
+    cookies: list[AutomationCookie] = Field(default_factory=list, max_length=100)
+    allowed_origins: list[str] = Field(min_length=1, max_length=16)
+    start_url: str = Field(max_length=2_048)
+    username: str | None = Field(default=None, max_length=256)
+    password: str | None = Field(default=None, max_length=4_096)
+    totp_code: str | None = Field(default=None, pattern=r"^\d{6}$")
+
+
+class AutomationFileInputRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4_096)
+
+
+class ViewerGrantCreate(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    expires_in: int = Field(default=300, ge=30, le=14_400)
+
+
+class ViewerGrantResponse(BaseModel):
+    grant_id: str
+    profile_id: str
+    token: str
+    expires_at: datetime
+
+
+class ScopedProfileResponse(BaseModel):
+    id: str
+    name: str
+    status: Literal["running", "stopped"]
+    viewer_mode: ViewerMode
+    clipboard_sync: bool = True
 
 
 class LoginRequest(BaseModel):

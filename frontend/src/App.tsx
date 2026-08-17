@@ -18,6 +18,68 @@ type AuthState = "checking" | "required" | "ok" | "error";
 type View = "empty" | "create" | "edit" | "view";
 
 export default function App() {
+  const scopedMatch = window.location.pathname.match(/^\/viewer\/([^/]+)$/);
+  if (scopedMatch) {
+    return <ScopedViewer profileId={decodeURIComponent(scopedMatch[1]!)} />;
+  }
+  return <AdminApp />;
+}
+
+function ScopedViewer({ profileId }: { profileId: string }) {
+  const [token] = useState(() => {
+    const params = new URLSearchParams(window.location.hash.slice(1));
+    return params.get("token") || "";
+  });
+  const [profile, setProfile] = useState<{
+    id: string;
+    name: string;
+    status: "running" | "stopped" | "initializing";
+    viewer_mode: "native-window" | "vnc";
+    clipboard_sync: boolean;
+  } | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (token) window.history.replaceState(null, "", window.location.pathname);
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) {
+      setError("Viewer grant is missing");
+      return;
+    }
+    api.getScopedProfile(profileId, token)
+      .then((value) => {
+        if (value.status !== "running" || value.viewer_mode !== "vnc") {
+          setError("Browser profile is not available");
+          return;
+        }
+        setProfile(value);
+      })
+      .catch(() => setError("Viewer grant is invalid or expired"));
+  }, [profileId, token]);
+
+  if (error) {
+    return <div className="h-screen grid place-items-center bg-surface-0 text-sm text-red-400">{error}</div>;
+  }
+  if (!profile) {
+    return <div className="h-screen grid place-items-center bg-surface-0 text-sm text-gray-400">Connecting…</div>;
+  }
+  return (
+    <div className="h-screen bg-black">
+      <ProfileViewer
+        profileId={profile.id}
+        cdpUrl={null}
+        clipboardSync={profile.clipboard_sync}
+        onClipboardSyncChange={async () => undefined}
+        scopedToken={token}
+        onDisconnect={() => undefined}
+      />
+    </div>
+  );
+}
+
+function AdminApp() {
   const [authState, setAuthState] = useState<AuthState>("checking");
   const [authRequired, setAuthRequired] = useState(false);
 

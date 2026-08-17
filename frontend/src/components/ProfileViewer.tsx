@@ -9,10 +9,20 @@ interface ProfileViewerProps {
   clipboardSync: boolean;
   onClipboardSyncChange: (enabled: boolean) => Promise<void>;
   onDisconnect: () => void;
+  scopedToken?: string;
 }
 
 // X11 keysym for V key (Ctrl is already held in VNC by the time we intercept)
 const XK_v = 0x0076;
+
+function notifyParent(type: "cloak-viewer-ready" | "cloak-viewer-disconnected", profileId: string) {
+  try {
+    const targetOrigin = new URL(document.referrer).origin;
+    window.parent.postMessage({ type, profileId }, targetOrigin);
+  } catch {
+    // The standalone Manager viewer has no embedding parent to notify.
+  }
+}
 
 export function ProfileViewer({
   profileId,
@@ -20,6 +30,7 @@ export function ProfileViewer({
   clipboardSync: initialClipboardSync,
   onClipboardSyncChange,
   onDisconnect,
+  scopedToken,
 }: ProfileViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<any>(null);
@@ -42,10 +53,16 @@ export function ProfileViewer({
         if (cancelled) return;
 
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/api/profiles/${profileId}/vnc`;
+        const wsPath = scopedToken
+          ? `/api/scoped/profiles/${profileId}/vnc`
+          : `/api/profiles/${profileId}/vnc`;
+        const wsUrl = `${protocol}//${window.location.host}${wsPath}`;
+        const wsProtocols = scopedToken
+          ? ["binary", `cloak.viewer.${scopedToken}`]
+          : ["binary"];
 
         rfb = new RFB(containerRef.current!, wsUrl, {
-          wsProtocols: ["binary"],
+          wsProtocols,
         });
         rfbRef.current = rfb;
 
@@ -54,12 +71,16 @@ export function ProfileViewer({
         rfb.showDotCursor = true;
 
         rfb.addEventListener("connect", () => {
-          if (!cancelled) setConnected(true);
+          if (!cancelled) {
+            setConnected(true);
+            notifyParent("cloak-viewer-ready", profileId);
+          }
         });
 
         rfb.addEventListener("disconnect", () => {
           if (!cancelled) {
             setConnected(false);
+            notifyParent("cloak-viewer-disconnected", profileId);
             onDisconnect();
           }
         });
@@ -87,7 +108,7 @@ export function ProfileViewer({
       }
       rfbRef.current = null;
     };
-  }, [profileId, onDisconnect]);
+  }, [profileId, onDisconnect, scopedToken]);
 
   // Host→VNC: intercept Ctrl+V/Cmd+V at keydown (capture phase)
   // Must fire BEFORE noVNC's canvas listener to prevent the race condition
@@ -119,7 +140,8 @@ export function ProfileViewer({
         console.log("[clipboard] host clipboard text:", text?.substring(0, 50), "len:", text?.length);
         if (text) {
           console.log("[clipboard] calling setClipboard API...");
-          await api.setClipboard(profileId, text);
+          if (scopedToken) await api.setScopedClipboard(profileId, scopedToken, text);
+          else await api.setClipboard(profileId, text);
           console.log("[clipboard] setClipboard API success");
         }
       } catch (err) {
@@ -140,7 +162,7 @@ export function ProfileViewer({
     // capture: true ensures we fire before noVNC's canvas listener
     container.addEventListener("keydown", handleKeyDown, true);
     return () => container.removeEventListener("keydown", handleKeyDown, true);
-  }, [profileId, clipboardSync, connected]);
+  }, [profileId, clipboardSync, connected, scopedToken]);
 
   // VNC→Host: listen for noVNC "clipboard" event (fired when proxy converts
   // KasmVNC BinaryClipboard type 180 → standard ServerCutText type 3)
@@ -180,7 +202,9 @@ export function ProfileViewer({
     const poll = async () => {
       if (cancelled) return;
       try {
-        const { text } = await api.getClipboard(profileId);
+        const { text } = scopedToken
+          ? await api.getScopedClipboard(profileId, scopedToken)
+          : await api.getClipboard(profileId);
         if (text && text !== lastText) {
           lastText = text;
           console.log("[clipboard] poll: new VNC clipboard:", text.substring(0, 50), "len:", text.length);
@@ -204,7 +228,7 @@ export function ProfileViewer({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [profileId, clipboardSync, connected]);
+  }, [profileId, clipboardSync, connected, scopedToken]);
 
   const toggleClipboardSync = async () => {
     const previous = clipboardSync;
@@ -271,7 +295,7 @@ export function ProfileViewer({
           </span>
         </div>
         <div className="flex items-center gap-1">
-          <CdpEndpointButton cdpUrl={cdpUrl} />
+          {!scopedToken && <CdpEndpointButton cdpUrl={cdpUrl} />}
           <button
             onClick={toggleClipboardSync}
             className={`p-1 ${clipboardSync ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}

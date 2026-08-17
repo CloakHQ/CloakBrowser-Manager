@@ -149,3 +149,78 @@ def test_auth_status_always_accessible(client_auth: TestClient):
     """GET /api/auth/status must work without auth (frontend bootstrap)."""
     resp = client_auth.get("/api/auth/status")
     assert resp.status_code == 200
+
+
+def test_scoped_grant_can_access_only_its_profile(client_auth: TestClient):
+    headers = {"Authorization": "Bearer test-secret"}
+    first = client_auth.post("/api/profiles", json={"name": "First"}, headers=headers).json()
+    second = client_auth.post("/api/profiles", json={"name": "Second"}, headers=headers).json()
+    grant = client_auth.post(
+        f"/api/profiles/{first['id']}/viewer-grants",
+        json={"session_id": "entry-session", "expires_in": 300},
+        headers=headers,
+    )
+    assert grant.status_code == 201
+    token = grant.json()["token"]
+    scoped_headers = {"Authorization": f"Bearer {token}"}
+
+    allowed = client_auth.get(f"/api/scoped/profiles/{first['id']}", headers=scoped_headers)
+    denied = client_auth.get(f"/api/scoped/profiles/{second['id']}", headers=scoped_headers)
+    global_list = client_auth.get("/api/profiles", headers=scoped_headers)
+
+    assert allowed.status_code == 200
+    assert set(allowed.json()) == {"id", "name", "status", "viewer_mode", "clipboard_sync"}
+    assert denied.status_code == 403
+    assert global_list.status_code == 401
+
+
+def test_revoked_scoped_grant_is_rejected(client_auth: TestClient):
+    headers = {"Authorization": "Bearer test-secret"}
+    profile = client_auth.post("/api/profiles", json={"name": "Scoped"}, headers=headers).json()
+    grant = client_auth.post(
+        f"/api/profiles/{profile['id']}/viewer-grants",
+        json={"session_id": "entry-session", "expires_in": 300},
+        headers=headers,
+    ).json()
+    response = client_auth.delete(
+        f"/api/profiles/{profile['id']}/viewer-grants/{grant['grant_id']}",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert client_auth.get(
+        f"/api/scoped/profiles/{profile['id']}",
+        headers={"Authorization": f"Bearer {grant['token']}"},
+    ).status_code == 403
+
+
+def test_reissued_scoped_grant_revokes_previous_token(client_auth: TestClient):
+    headers = {"Authorization": "Bearer test-secret"}
+    profile = client_auth.post("/api/profiles", json={"name": "Scoped"}, headers=headers).json()
+    first = client_auth.post(
+        f"/api/profiles/{profile['id']}/viewer-grants",
+        json={"session_id": "entry-session", "expires_in": 300},
+        headers=headers,
+    ).json()
+    second = client_auth.post(
+        f"/api/profiles/{profile['id']}/viewer-grants",
+        json={"session_id": "entry-session", "expires_in": 300},
+        headers=headers,
+    ).json()
+
+    assert client_auth.get(
+        f"/api/scoped/profiles/{profile['id']}",
+        headers={"Authorization": f"Bearer {first['token']}"},
+    ).status_code == 403
+    assert client_auth.get(
+        f"/api/scoped/profiles/{profile['id']}",
+        headers={"Authorization": f"Bearer {second['token']}"},
+    ).status_code == 200
+
+
+def test_scoped_viewer_page_allows_only_configured_parent(client_auth: TestClient):
+    response = client_auth.get("/viewer/profile-id")
+    assert response.status_code == 200
+    assert "frame-ancestors http://localhost:3000" in response.headers[
+        "content-security-policy"
+    ]
+    assert response.headers["cache-control"] == "no-store"

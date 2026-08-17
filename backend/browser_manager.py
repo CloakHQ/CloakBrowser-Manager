@@ -10,7 +10,7 @@ import os
 import socket
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +134,46 @@ def _test_proxy_sync(proxy: str) -> dict[str, Any]:
         "timezone": timezone,
         "latency_ms": latency_ms,
     }
+
+
+def _warn_if_proxy_auth_unreliable(url: str) -> None:
+    """Log loudly when a credentialed HTTP(S) proxy can't get Chrome's native
+    ``--proxy-server=http://user:pass@host`` auth on this binary.
+
+    SOCKS5 always authenticates natively from the URL, so it's exempt.
+    Credentialed HTTP/HTTPS proxies below the platform's inline-auth version
+    floor silently fall back to Playwright's CDP auth interceptor (see
+    cloakbrowser's ``_resolve_proxy_config``), which can leave a proxy's own
+    login page on screen when nothing answers the 407 challenge — most often
+    because the Manager's own automation route guard also owns the page.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.username:
+        return
+    try:
+        from cloakbrowser.config import (
+            HTTP_PROXY_INLINE_AUTH_MIN_VERSION,
+            binary_supports_http_proxy_inline_auth,
+            get_effective_version,
+            get_platform_tag,
+        )
+    except ImportError:
+        return
+    if binary_supports_http_proxy_inline_auth():
+        return
+    platform_tag = get_platform_tag()
+    logger.warning(
+        "Credentialed HTTP proxy on %s: this binary (%s) is below the inline "
+        "proxy-auth floor (%s) and will fall back to Playwright's CDP auth "
+        "interceptor instead of Chrome's native --proxy-server auth. Pin the "
+        "container to a platform whose free binary clears the floor (e.g. "
+        "linux/amd64) or supply a Pro binary >= the floor.",
+        platform_tag,
+        get_effective_version(pro=False) or "unknown",
+        HTTP_PROXY_INLINE_AUTH_MIN_VERSION.get(platform_tag, "n/a"),
+    )
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
@@ -320,6 +360,10 @@ class RunningProfile:
     # context_async on the returned context). Read on close to tell a seat/
     # license denial apart from a real crash or a user-initiated close.
     denial_path: str | None = None
+    automation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    automation_origins: frozenset[str] | None = field(default=None, repr=False)
+    automation_route: Any | None = field(default=None, repr=False)
+    guarded_page_ids: set[int] = field(default_factory=set, repr=False)
 
 
 class BrowserManager:
@@ -504,6 +548,7 @@ class BrowserManager:
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
                 _validate_proxy(proxy)
+                _warn_if_proxy_auth_unreliable(proxy)
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],

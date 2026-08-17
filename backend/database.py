@@ -80,6 +80,22 @@ def _create_tags_table(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _create_viewer_grants_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS viewer_grants (
+            id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_viewer_grants_session ON viewer_grants(session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_viewer_grants_profile ON viewer_grants(profile_id)")
+
+
 def _rebuild_profiles(conn: sqlite3.Connection, old_columns: set[str]) -> None:
     """Rebuild the table in one transaction, retaining supported data and tags.
 
@@ -149,13 +165,17 @@ def init_db():
         if not exists:
             conn.execute(_PROFILE_SCHEMA)
             _create_tags_table(conn)
+            _create_viewer_grants_table(conn)
             conn.commit()
             return
         old_columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
         if old_columns != set(_PROFILE_COLUMNS):
             _rebuild_profiles(conn, old_columns)
+            _create_viewer_grants_table(conn)
+            conn.commit()
         else:
             _create_tags_table(conn)
+            _create_viewer_grants_table(conn)
             conn.commit()
 
 

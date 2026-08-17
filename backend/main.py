@@ -37,6 +37,12 @@ load_env_file()
 from . import database as db
 from cloakbrowser.license import CloakBrowserLicenseError
 
+from .automation import (
+    AutomationPolicyError,
+    bootstrap_profile,
+    profile_state,
+    set_file_input,
+)
 from .browser_manager import (
     BrowserManager,
     ProfileBusyError,
@@ -46,6 +52,8 @@ from .browser_manager import (
     test_proxy,
 )
 from .models import (
+    AutomationBootstrapRequest,
+    AutomationFileInputRequest,
     ClipboardRequest,
     LaunchResponse,
     LoginRequest,
@@ -57,14 +65,18 @@ from .models import (
     ProxyTestRequest,
     ProxyTestResponse,
     ReorderRequest,
+    ScopedProfileResponse,
     SettingsResponse,
     SettingsUpdate,
     StatusResponse,
     TagResponse,
     UpdateCheckResponse,
+    ViewerGrantCreate,
+    ViewerGrantResponse,
 )
 from .runtime import bundle_dir
 from .settings_store import load_settings, save_settings
+from .viewer_grants import create_grant, revoke_grant, validate_grant
 
 logger = logging.getLogger("cloakbrowser.manager")
 
@@ -109,6 +121,11 @@ diagnostics.install_stderr_tee()
 # (except /api/auth/status, /api/auth/login and /api/health) require Bearer
 # token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
+SCOPED_VIEWER_ORIGINS = frozenset(
+    item.strip().rstrip("/")
+    for item in os.environ.get("SCOPED_VIEWER_ORIGINS", "http://localhost:3000").split(",")
+    if item.strip()
+)
 
 # App-wide CloakBrowser Pro license. One key per Manager instance — the
 # concurrency-seat pool is per-license, so every launched profile shares it.
@@ -131,6 +148,10 @@ RELEASE_CHANNEL: str | None = _resolve_setting(
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/health"})
+
+
+def _is_scoped_api(path: str) -> bool:
+    return path.startswith("/api/scoped/")
 
 
 def _check_auth(scope: Scope) -> bool:
@@ -166,6 +187,34 @@ def _is_https(request: Request) -> bool:
     """Check if the original client connection was HTTPS (via reverse proxy header)."""
     proto = request.headers.get("x-forwarded-proto", "")
     return "https" in proto
+
+
+def _bearer_token(scope: Scope) -> str:
+    for key, val in scope.get("headers", []):
+        if key == b"authorization":
+            value = val.decode("latin-1")
+            if value.startswith("Bearer "):
+                return value[7:].strip()
+    return ""
+
+
+def _viewer_token(websocket: WebSocket) -> str:
+    prefix = "cloak.viewer."
+    return next(
+        (
+            protocol[len(prefix):]
+            for protocol in websocket.scope.get("subprotocols", [])
+            if protocol.startswith(prefix)
+        ),
+        "",
+    )
+
+
+def _scoped_http_grant(request: Request, profile_id: str) -> dict:
+    grant = validate_grant(profile_id, _bearer_token(request.scope))
+    if not grant:
+        raise HTTPException(status_code=403, detail="Viewer grant is invalid or expired")
+    return grant
 
 
 async def _check_websocket_origin(websocket: WebSocket) -> bool:
@@ -247,6 +296,26 @@ def _same_origin_request(request: Request) -> bool:
     return origin_netloc == host_normalized
 
 
+_scoped_viewer_connections: dict[str, set[WebSocket]] = {}
+
+
+async def _disconnect_viewer_grants(grant_ids: list[str]) -> None:
+    """Close live scoped viewer sockets as soon as their grants are revoked."""
+    sockets = {
+        websocket
+        for grant_id in grant_ids
+        for websocket in _scoped_viewer_connections.pop(grant_id, set())
+    }
+    if sockets:
+        await asyncio.gather(
+            *(
+                websocket.close(code=4403, reason="Viewer grant revoked")
+                for websocket in sockets
+            ),
+            return_exceptions=True,
+        )
+
+
 class AuthMiddleware:
     """Raw ASGI middleware for optional token auth.
 
@@ -266,7 +335,7 @@ class AuthMiddleware:
         path = scope["path"]
 
         # Skip auth for exempt endpoints and non-API paths (static frontend)
-        if path in _AUTH_EXEMPT or not path.startswith("/api/"):
+        if path in _AUTH_EXEMPT or _is_scoped_api(path) or not path.startswith("/api/"):
             await self.app(scope, receive, send)
             return
 
@@ -868,6 +937,89 @@ async def get_profile_status(profile_id: str):
     return ProfileStatusResponse(**status)
 
 
+# ── Scoped viewer grants and native automation ───────────────────────────────
+
+
+@app.post(
+    "/api/profiles/{profile_id}/viewer-grants",
+    response_model=ViewerGrantResponse,
+    status_code=201,
+)
+async def create_viewer_grant(profile_id: str, body: ViewerGrantCreate):
+    if not db.get_profile(profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    grant = create_grant(profile_id, body.session_id, body.expires_in)
+    await _disconnect_viewer_grants(grant.pop("_revoked_grant_ids"))
+    return ViewerGrantResponse(**grant)
+
+
+@app.delete("/api/profiles/{profile_id}/viewer-grants/{grant_id}")
+async def delete_viewer_grant(profile_id: str, grant_id: str):
+    if not revoke_grant(profile_id, grant_id):
+        raise HTTPException(status_code=404, detail="Viewer grant not found")
+    await _disconnect_viewer_grants([grant_id])
+    return {"ok": True}
+
+
+@app.get(
+    "/api/scoped/profiles/{profile_id}",
+    response_model=ScopedProfileResponse,
+)
+async def scoped_profile(profile_id: str, request: Request):
+    _scoped_http_grant(request, profile_id)
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    status = browser_mgr.get_status(profile_id)
+    return ScopedProfileResponse(
+        id=profile_id,
+        name=profile["name"],
+        status=status["status"],
+        viewer_mode=status["viewer_mode"],
+        clipboard_sync=bool(profile.get("clipboard_sync", True)),
+    )
+
+
+@app.post("/api/profiles/{profile_id}/automation/bootstrap")
+async def automation_bootstrap(profile_id: str, body: AutomationBootstrapRequest):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    try:
+        return await bootstrap_profile(running, body)
+    except AutomationPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Native browser bootstrap failed for %s", profile_id, exc_info=True)
+        raise HTTPException(status_code=502, detail="Browser bootstrap failed") from exc
+
+
+@app.get("/api/profiles/{profile_id}/automation/state")
+async def automation_state(profile_id: str):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    try:
+        return await profile_state(running)
+    except Exception as exc:
+        logger.error("Native browser state export failed for %s", profile_id, exc_info=True)
+        raise HTTPException(status_code=502, detail="Browser state export failed") from exc
+
+
+@app.post("/api/profiles/{profile_id}/automation/file-input")
+async def automation_file_input(profile_id: str, body: AutomationFileInputRequest):
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    try:
+        return {"accepted": await set_file_input(running, body.path)}
+    except AutomationPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Native file input failed for %s", profile_id, exc_info=True)
+        raise HTTPException(status_code=502, detail="Browser file input failed") from exc
+
+
 # ── System Status ─────────────────────────────────────────────────────────────
 
 
@@ -915,6 +1067,17 @@ async def get_system_status():
 
             binary_version = CHROMIUM_VERSION
 
+    # Surfaced so an operator can tell, without reading logs, whether
+    # credentialed HTTP/HTTPS proxies get Chrome's native --proxy-server auth
+    # or silently fall back to Playwright's CDP auth interceptor (see
+    # browser_manager.py's proxy-auth warning for the platform/version detail).
+    try:
+        from cloakbrowser.config import binary_supports_http_proxy_inline_auth
+
+        proxy_auth_inline_supported = binary_supports_http_proxy_inline_auth()
+    except ImportError:
+        proxy_auth_inline_supported = False
+
     profiles = db.list_profiles()
     fonts_present, fonts_required, fonts_complete = await asyncio.to_thread(
         _windows_font_health
@@ -930,6 +1093,7 @@ async def get_system_status():
         windows_fonts_present=fonts_present,
         windows_fonts_required=fonts_required,
         windows_fonts_complete=fonts_complete,
+        proxy_auth_inline_supported=proxy_auth_inline_supported,
     )
 
 
@@ -1212,6 +1376,18 @@ async def get_clipboard(profile_id: str):
     return {"text": text}
 
 
+@app.post("/api/scoped/profiles/{profile_id}/clipboard")
+async def scoped_set_clipboard(profile_id: str, body: ClipboardRequest, request: Request):
+    _scoped_http_grant(request, profile_id)
+    return await set_clipboard(profile_id, body)
+
+
+@app.get("/api/scoped/profiles/{profile_id}/clipboard")
+async def scoped_get_clipboard(profile_id: str, request: Request):
+    _scoped_http_grant(request, profile_id)
+    return await get_clipboard(profile_id)
+
+
 # ── VNC WebSocket Proxy ──────────────────────────────────────────────────────
 
 
@@ -1220,6 +1396,12 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
     """Proxy WebSocket frames between the frontend and a profile's KasmVNC."""
     if not await _check_websocket_origin(websocket):
         return
+
+    await _serve_vnc_proxy(websocket, profile_id)
+
+
+async def _serve_vnc_proxy(websocket: WebSocket, profile_id: str):
+    """Serve an already-authorized VNC WebSocket connection."""
 
     running = browser_mgr.running.get(profile_id)
     if not running:
@@ -1383,6 +1565,26 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
             await websocket.close()
         except Exception as exc:
             logger.debug("VNC proxy: websocket.close() failed: %s", exc)
+
+
+@app.websocket("/api/scoped/profiles/{profile_id}/vnc")
+async def scoped_vnc_proxy(websocket: WebSocket, profile_id: str):
+    if not await _check_websocket_origin(websocket):
+        return
+    grant = validate_grant(profile_id, _viewer_token(websocket))
+    if not grant:
+        await websocket.close(code=4403, reason="Viewer grant is invalid or expired")
+        return
+    grant_id = grant["id"]
+    _scoped_viewer_connections.setdefault(grant_id, set()).add(websocket)
+    try:
+        await _serve_vnc_proxy(websocket, profile_id)
+    finally:
+        connections = _scoped_viewer_connections.get(grant_id)
+        if connections is not None:
+            connections.discard(websocket)
+            if not connections:
+                _scoped_viewer_connections.pop(grant_id, None)
 
 
 # ── CDP WebSocket Proxy ──────────────────────────────────────────────────────
@@ -1583,6 +1785,19 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
 # Serve React build. Must be AFTER API routes so /api/* isn't caught by the SPA.
 if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
+
+    @app.get("/viewer/{profile_id}")
+    async def serve_scoped_viewer(profile_id: str):
+        del profile_id
+        frame_ancestors = " ".join(sorted(SCOPED_VIEWER_ORIGINS)) or "'none'"
+        return FileResponse(
+            FRONTEND_DIR / "index.html",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": f"frame-ancestors {frame_ancestors}",
+                "Referrer-Policy": "origin",
+            },
+        )
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
