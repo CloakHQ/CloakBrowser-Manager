@@ -130,8 +130,18 @@ def test_logout_clears_cookie(client_auth: TestClient):
 
 
 def test_healthcheck_always_accessible(client_auth: TestClient):
-    """GET /api/status must work without auth (Docker healthcheck)."""
+    """GET /api/health must work without auth (Docker healthcheck)."""
+    resp = client_auth.get("/api/health")
+    assert resp.status_code == 200
+
+
+def test_status_requires_auth(client_auth: TestClient):
+    """GET /api/status must require auth (leaks profile count and version)."""
     resp = client_auth.get("/api/status")
+    assert resp.status_code == 401
+    resp = client_auth.get(
+        "/api/status", headers={"Authorization": "Bearer test-secret"}
+    )
     assert resp.status_code == 200
 
 

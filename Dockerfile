@@ -57,7 +57,7 @@ RUN python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/status')" || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')" || exit 1
 
 VOLUME /data
 
