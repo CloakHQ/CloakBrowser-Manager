@@ -82,6 +82,17 @@ export interface SystemStatus {
   windows_fonts_complete: boolean | null;
 }
 
+export interface ManagerSettings {
+  license_key_set: boolean;
+  license_key_masked: string | null;
+  release_channel: string; // "stable" | "preview"
+}
+
+export interface SettingsUpdate {
+  license_key?: string | null; // omit = unchanged; "" = clear
+  release_channel?: string | null;
+}
+
 class ApiError extends Error {
   constructor(
     public status: number,
@@ -155,6 +166,17 @@ export const api = {
     request<{ ok: boolean }>(`/api/profiles/${id}/stop`, { method: "POST" }),
 
   getStatus: () => request<SystemStatus>("/api/status"),
+
+  shutdown: () =>
+    request<{ ok: boolean; message?: string }>("/api/shutdown", { method: "POST" }),
+
+  getSettings: () => request<ManagerSettings>("/api/settings"),
+
+  updateSettings: (data: SettingsUpdate) =>
+    request<SystemStatus>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
 
   setClipboard: (id: string, text: string) =>
     request<{ ok: boolean }>(`/api/profiles/${id}/clipboard`, {

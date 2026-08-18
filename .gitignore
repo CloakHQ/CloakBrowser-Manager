@@ -8,6 +8,12 @@ __pycache__/
 node_modules/
 frontend/dist/
 
+# Native packaging build output
+dist_native/
+build_native/
+dist_arm/
+.venv-build/
+
 # IDE
 .vscode/
 .idea/

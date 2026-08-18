@@ -27,27 +27,24 @@ Each profile is an isolated CloakBrowser instance with its own fingerprint, prox
 
 ### Windows and macOS
 
-Clone the repository:
+Download the installer from the [latest release](https://github.com/CloakHQ/CloakBrowser-Manager/releases) and run it:
+
+- **macOS** — open the `.dmg` and drag **CloakBrowser Manager** into Applications, then launch it.
+- **Windows** — run the setup `.exe`. (Unsigned during early access — if SmartScreen warns, click **More info → Run anyway**.)
+
+No Python, Node, or git required. The Manager starts on `127.0.0.1:8080` and opens in your default browser. On first launch it downloads the CloakBrowser engine. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
+
+Open **Settings** (gear icon, top right) to add your license key and pick the Stable or Preview channel.
+
+#### Run from source (developers)
 
 ```bash
 git clone https://github.com/CloakHQ/CloakBrowser-Manager.git
 cd CloakBrowser-Manager
+./run-macos.sh      # macOS  (or run-windows.bat on Windows)
 ```
 
-On Windows, run:
-
-```bat
-run-windows.bat
-```
-
-On macOS, run:
-
-```bash
-chmod +x run-macos.sh
-./run-macos.sh
-```
-
-The first run creates a local Python environment, installs dependencies, builds the React UI, starts Manager on `127.0.0.1:8080`, and opens it in your default browser. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS.
+This path requires Python 3.10+ and Node 18+; the first run creates a local Python environment, installs dependencies, and builds the React UI before starting the Manager.
 
 ### Linux server
 
@@ -73,7 +70,9 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 
 Without a key, the Manager uses the older keyless build. Add your key once and every profile will use it. The key is set per Manager instance, not per profile.
 
-After cloning, copy the example env file and fill it in:
+**Native app (Windows/macOS):** open **Settings** (gear icon, top right), paste your key, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
+
+**Docker or run-from-source:** set it in a manager-root `.env` instead:
 
 ```bash
 cp .env.example .env
@@ -85,7 +84,7 @@ CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
 CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
 ```
 
-The file is loaded automatically at startup on both native and Docker. Restart the Manager after changing it. With Docker, you can also pass the key with `-e CLOAKBROWSER_LICENSE_KEY=...`. The badge in the top bar shows which tier and binary version are active.
+The file is loaded automatically at startup. Restart the Manager after changing it. With Docker, you can also pass the key with `-e CLOAKBROWSER_LICENSE_KEY=...`. An environment variable overrides the in-app setting.
 
 ## Why Not Just Use a VPN?
 

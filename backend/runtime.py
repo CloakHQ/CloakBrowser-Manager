@@ -30,6 +30,21 @@ class RuntimeConfig:
         return self.runtime_mode == "native"
 
 
+def bundle_dir() -> Path:
+    """Root for bundled resources (frontend/dist, data files).
+
+    Under a PyInstaller/Nuitka freeze, resources are extracted to a temp dir
+    exposed as ``sys._MEIPASS``; running from source they sit one level above
+    the ``backend`` package (the manager repo root).
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
 def detect_host_os(platform_name: str | None = None) -> HostOS:
     """Map Python's platform identifier to Manager's supported hosts."""
     value = platform_name or sys.platform

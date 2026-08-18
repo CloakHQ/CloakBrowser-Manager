@@ -10,9 +10,11 @@ import asyncio
 import hmac
 import logging
 import os
+import signal
 import struct
 import shutil
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,12 +42,36 @@ from .models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    SettingsResponse,
+    SettingsUpdate,
     StatusResponse,
     TagResponse,
 )
+from .runtime import bundle_dir
+from .settings_store import load_settings, save_settings
 
 logger = logging.getLogger("cloakbrowser.manager")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+# Log to the console AND to a rotating file in the data dir. The native frozen
+# app has no visible terminal, so the file is the only way a user (or we, for
+# support) can see what happened. db.DATA_DIR is resolved at the import above.
+_LOG_HANDLERS: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    _log_dir = db.DATA_DIR / "logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _LOG_HANDLERS.append(
+        RotatingFileHandler(
+            _log_dir / "manager.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+    )
+except OSError as exc:  # read-only data dir etc. — keep console logging
+    logger.warning("Could not open log file, console only: %s", exc)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    handlers=_LOG_HANDLERS,
+)
 logging.getLogger("websockets").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -57,11 +83,24 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 # token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
-# App-wide CloakBrowser Pro license (set once in the manager-root .env). One key
-# per Manager instance — the concurrency-seat pool is per-license, so every
-# launched profile shares it. Release channel picks Stable vs Preview builds.
-LICENSE_KEY: str | None = os.environ.get("CLOAKBROWSER_LICENSE_KEY") or None
-RELEASE_CHANNEL: str | None = os.environ.get("CLOAKBROWSER_RELEASE_CHANNEL") or None
+# App-wide CloakBrowser Pro license. One key per Manager instance — the
+# concurrency-seat pool is per-license, so every launched profile shares it.
+# Release channel picks Stable vs Preview builds.
+#
+# Precedence: environment (incl. values load_env_file pulled from a .env) wins,
+# then the in-app Settings (settings.json). Native users have no .env and set
+# the key in the Settings UI; Docker/CI keep overriding via env vars.
+_STORED_SETTINGS = load_settings()
+
+
+def _resolve_setting(env_key: str, settings_key: str) -> str | None:
+    return os.environ.get(env_key) or _STORED_SETTINGS.get(settings_key) or None
+
+
+LICENSE_KEY: str | None = _resolve_setting("CLOAKBROWSER_LICENSE_KEY", "license_key")
+RELEASE_CHANNEL: str | None = _resolve_setting(
+    "CLOAKBROWSER_RELEASE_CHANNEL", "release_channel"
+)
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/health"})
@@ -152,6 +191,35 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
     return False
 
 
+def _same_origin_request(request: Request) -> bool:
+    """CSRF guard for state-changing simple POSTs (HTTP mirror of
+    _check_websocket_origin). A POST with no body/custom headers is a CORS
+    "simple request" (no preflight), so any website the user visits could hit a
+    localhost endpoint. If a browser Origin header is present it must match Host;
+    non-browser clients (curl, no Origin) are allowed.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = request.headers.get("host")
+    if not host:
+        return True
+    try:
+        parsed = urlparse(origin)
+        origin_host = parsed.hostname or ""
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    if origin_port and origin_port not in (80, 443):
+        origin_netloc = f"{origin_host}:{origin_port}"
+    else:
+        origin_netloc = origin_host
+    host_normalized = host
+    if host.endswith(":80") or host.endswith(":443"):
+        host_normalized = host.rsplit(":", 1)[0]
+    return origin_netloc == host_normalized
+
+
 class AuthMiddleware:
     """Raw ASGI middleware for optional token auth.
 
@@ -192,8 +260,9 @@ class AuthMiddleware:
 # Singleton browser manager
 browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CHANNEL)
 
-# Frontend build directory (React production build)
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+# Frontend build directory (React production build). bundle_dir() resolves to
+# the PyInstaller extraction root when frozen, else the manager repo root.
+FRONTEND_DIR = bundle_dir() / "frontend" / "dist"
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +699,96 @@ async def get_system_status():
         windows_fonts_required=fonts_required,
         windows_fonts_complete=fonts_complete,
     )
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+
+def _mask_key(key: str | None) -> str | None:
+    """Show enough of a license key to recognise it, never the whole thing."""
+    if not key:
+        return None
+    if len(key) <= 9:
+        return "…"
+    return f"{key[:5]}…{key[-4:]}"
+
+
+def _settings_response() -> SettingsResponse:
+    return SettingsResponse(
+        license_key_set=bool(browser_mgr.license_key),
+        license_key_masked=_mask_key(browser_mgr.license_key),
+        release_channel=(browser_mgr.release_channel or "stable"),
+    )
+
+
+@app.post("/api/shutdown")
+async def shutdown_manager(request: Request):
+    """Stop the Manager: graceful uvicorn shutdown → lifespan closes every
+    running browser (cleanup_all) → the process exits. Lets the user quit from
+    the UI so no orphaned server is left behind.
+
+    CSRF-guarded: a bodyless POST is a CORS simple request (no preflight), so
+    without this any site the user visits could kill the Manager via a no-cors
+    fetch. Reject when a browser Origin is present and doesn't match Host.
+    """
+    if not _same_origin_request(request):
+        logger.warning(
+            "Rejected cross-origin shutdown (origin=%s)", request.headers.get("origin")
+        )
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    logger.info("Shutdown requested via UI — stopping server")
+    server = getattr(app.state, "uvicorn_server", None)
+    if server is not None:
+        # Frozen/native path (app_entry holds the Server): flip the flag, uvicorn
+        # exits its serve loop gracefully. Cross-platform, no signals.
+        server.should_exit = True
+    else:
+        # Dev path (run.py spawns `uvicorn backend.main:app`): signal ourselves.
+        async def _signal_self():
+            await asyncio.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        asyncio.create_task(_signal_self())
+    return {"ok": True, "message": "CloakBrowser Manager is shutting down"}
+
+
+@app.get("/api/settings", response_model=SettingsResponse)
+async def get_settings():
+    return _settings_response()
+
+
+@app.put("/api/settings", response_model=StatusResponse)
+async def update_settings(payload: SettingsUpdate):
+    """Persist license key / release channel and hot-apply without a restart.
+
+    Returns the refreshed system status (tier + resolved binary version) so the
+    top-bar badge updates immediately. Re-resolving may download the Pro build,
+    so it runs off the event loop; the request completes when it's ready.
+    """
+    stored = load_settings()
+
+    if payload.license_key is not None:
+        key = payload.license_key.strip()
+        if key:
+            stored["license_key"] = key
+            browser_mgr.license_key = key
+        else:  # empty string = clear the key (back to keyless)
+            stored.pop("license_key", None)
+            browser_mgr.license_key = None
+
+    if payload.release_channel is not None:
+        channel = payload.release_channel.strip().lower()
+        if channel not in {"stable", "preview"}:
+            raise HTTPException(
+                status_code=400,
+                detail="release_channel must be 'stable' or 'preview'",
+            )
+        stored["release_channel"] = channel
+        browser_mgr.release_channel = channel
+
+    save_settings(stored)
+    await asyncio.to_thread(browser_mgr.resolve_binary_status)
+    return await get_system_status()
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────

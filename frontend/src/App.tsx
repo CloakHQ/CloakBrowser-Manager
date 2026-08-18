@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import { Lock, PanelLeftClose, PanelLeft } from "lucide-react";
+import { Lock, PanelLeftClose, PanelLeft, Settings, Power } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { api, setOnUnauthorized, type ProfileCreateData, type SystemStatus } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
@@ -9,6 +9,7 @@ import { NativeWindowStatus } from "./components/NativeWindowStatus";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { SystemStatusBadge } from "./components/SystemStatusBadge";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
@@ -96,6 +97,20 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [stopped, setStopped] = useState(false);
+
+  const handleQuit = useCallback(async () => {
+    if (!window.confirm("Quit CloakBrowser Manager? This stops the server and closes all running profiles.")) {
+      return;
+    }
+    setStopped(true);
+    try {
+      await api.shutdown();
+    } catch {
+      // The server exits mid-request, so a network error here is expected.
+    }
+  }, []);
 
   useEffect(() => {
     api.getStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
@@ -164,8 +179,25 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     );
   }
 
+  if (stopped) {
+    return (
+      <div className="h-screen flex flex-col items-center justify-center bg-surface-0 text-center px-6">
+        <Power className="h-10 w-10 text-gray-600 mb-4" />
+        <h1 className="text-lg font-medium mb-1">CloakBrowser Manager has stopped</h1>
+        <p className="text-sm text-gray-500">The server is no longer running. You can close this tab.</p>
+        <p className="text-xs text-gray-600 mt-4">Relaunch the app to start it again.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="h-screen flex">
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          onSaved={setSystemStatus}
+        />
+      )}
       {/* Sidebar */}
       {sidebarOpen && (
         <div className="w-64 border-r border-border bg-surface-1 flex-shrink-0">
@@ -199,6 +231,20 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           </div>
           <div className="flex items-center gap-3">
             <SystemStatusBadge status={systemStatus} />
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="text-gray-500 hover:text-gray-300 p-1"
+              title="Settings"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+            <button
+              onClick={handleQuit}
+              className="text-gray-500 hover:text-red-400 p-1"
+              title="Quit Manager (stops the server)"
+            >
+              <Power className="h-4 w-4" />
+            </button>
             {selected && (
               <LaunchButton
                 status={selected.status}

@@ -134,6 +134,18 @@ class StatusResponse(BaseModel):
     windows_fonts_complete: bool | None = None
 
 
+class SettingsResponse(BaseModel):
+    license_key_set: bool
+    license_key_masked: str | None = None
+    release_channel: str = "stable"
+
+
+class SettingsUpdate(BaseModel):
+    # None = leave unchanged; "" = clear the license key (back to keyless).
+    license_key: str | None = None
+    release_channel: str | None = None
+
+
 class ProfileStatusResponse(BaseModel):
     status: str
     runtime_mode: RuntimeMode
