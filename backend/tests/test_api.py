@@ -614,3 +614,186 @@ def test_ws_allows_no_origin(app_client: TestClient):
     except Exception as exc:
         assert "4403" not in str(exc)
     main.browser_mgr.running.pop(pid, None)
+
+
+# ── Shutdown CSRF Guard ──────────────────────────────────────────────────────
+
+
+def _fake_request(headers: dict[str, str]):
+    """Build a minimal Starlette Request carrying the given headers."""
+    from starlette.requests import Request
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    return Request({"type": "http", "method": "POST", "headers": raw})
+
+
+def test_shutdown_rejects_cross_origin(app_client: TestClient):
+    """A cross-origin POST /api/shutdown must be refused (403), never quit."""
+    resp = app_client.post("/api/shutdown", headers={"origin": "http://evil.com"})
+    assert resp.status_code == 403
+
+
+def test_shutdown_rejects_cross_port(app_client: TestClient):
+    """Same host, different port is still cross-origin (403)."""
+    resp = app_client.post(
+        "/api/shutdown", headers={"origin": "http://testserver:9999"}
+    )
+    assert resp.status_code == 403
+
+
+def test_same_origin_request_matches_host():
+    assert _same_origin_request_allows(
+        {"origin": "http://localhost:8080", "host": "localhost:8080"}
+    )
+
+
+def test_same_origin_request_rejects_mismatched_host():
+    assert not _same_origin_request_allows(
+        {"origin": "http://evil.com", "host": "localhost:8080"}
+    )
+
+
+def test_same_origin_request_rejects_mismatched_port():
+    assert not _same_origin_request_allows(
+        {"origin": "http://localhost:9999", "host": "localhost:8080"}
+    )
+
+
+def test_same_origin_request_allows_no_origin():
+    """Non-browser clients (curl, Playwright) send no Origin — allowed."""
+    assert _same_origin_request_allows({"host": "localhost:8080"})
+
+
+def test_same_origin_request_normalizes_default_ports():
+    """origin :443 vs bare host on https, and :80 on http, both match."""
+    assert _same_origin_request_allows(
+        {"origin": "https://app.example:443", "host": "app.example"}
+    )
+    assert _same_origin_request_allows(
+        {"origin": "http://app.example", "host": "app.example:80"}
+    )
+
+
+def _same_origin_request_allows(headers: dict[str, str]) -> bool:
+    return main._same_origin_request(_fake_request(headers))
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def settings_env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolate settings.json into the temp dir and neutralise the binary
+    re-resolve (which would validate/download a real Pro build)."""
+    from backend import settings_store
+
+    path = tmp_db / "settings.json"
+    monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
+    monkeypatch.setattr(main.browser_mgr, "resolve_binary_status", MagicMock())
+    # Known baseline so masking/clearing is deterministic.
+    monkeypatch.setattr(main.browser_mgr, "license_key", None)
+    monkeypatch.setattr(main.browser_mgr, "release_channel", "stable")
+    return path
+
+
+def test_get_settings_no_key(app_client: TestClient, settings_env: Path):
+    resp = app_client.get("/api/settings")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["license_key_set"] is False
+    assert data["license_key_masked"] is None
+    assert data["release_channel"] == "stable"
+
+
+def test_get_settings_masks_key(app_client: TestClient, settings_env: Path):
+    main.browser_mgr.license_key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
+    resp = app_client.get("/api/settings")
+    data = resp.json()
+    assert data["license_key_set"] is True
+    masked = data["license_key_masked"]
+    # Recognisable but not the whole key.
+    assert masked == "cb_ba…63aa"
+    assert "b142a68bc3088" not in masked
+
+
+def test_put_settings_persists_and_hot_applies(
+    app_client: TestClient, settings_env: Path
+):
+    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
+    resp = app_client.put("/api/settings", json={"license_key": key})
+    assert resp.status_code == 200
+    # Hot-applied to the live browser manager.
+    assert main.browser_mgr.license_key == key
+    main.browser_mgr.resolve_binary_status.assert_called_once()
+    # Persisted to settings.json.
+    import json
+
+    assert json.loads(settings_env.read_text())["license_key"] == key
+
+
+def test_put_settings_clears_key(app_client: TestClient, settings_env: Path):
+    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
+    main.browser_mgr.license_key = key
+    settings_env.write_text('{"license_key": "%s"}' % key)
+
+    resp = app_client.put("/api/settings", json={"license_key": ""})
+    assert resp.status_code == 200
+    assert main.browser_mgr.license_key is None
+    import json
+
+    assert "license_key" not in json.loads(settings_env.read_text())
+
+
+def test_put_settings_sets_channel(app_client: TestClient, settings_env: Path):
+    resp = app_client.put("/api/settings", json={"release_channel": "preview"})
+    assert resp.status_code == 200
+    assert main.browser_mgr.release_channel == "preview"
+    import json
+
+    assert json.loads(settings_env.read_text())["release_channel"] == "preview"
+
+
+def test_put_settings_rejects_bad_channel(
+    app_client: TestClient, settings_env: Path
+):
+    resp = app_client.put("/api/settings", json={"release_channel": "nightly"})
+    assert resp.status_code == 400
+    # Nothing persisted / applied on rejection.
+    assert main.browser_mgr.release_channel == "stable"
+    assert not settings_env.exists()
+
+
+# ── settings_store + runtime units ───────────────────────────────────────────
+
+
+def test_settings_store_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from backend import settings_store
+
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
+    assert settings_store.load_settings() == {}  # missing file → empty
+    settings_store.save_settings({"license_key": "cb_x", "release_channel": "preview"})
+    assert settings_store.load_settings() == {
+        "license_key": "cb_x",
+        "release_channel": "preview",
+    }
+
+
+def test_settings_store_ignores_corrupt_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from backend import settings_store
+
+    path = tmp_path / "settings.json"
+    path.write_text("{not valid json")
+    monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
+    assert settings_store.load_settings() == {}
+
+
+def test_bundle_dir_is_repo_root_when_unfrozen():
+    from backend import runtime
+
+    root = runtime.bundle_dir()
+    # Running from source: repo root holds the backend package + app_entry.py.
+    assert (root / "backend").is_dir()
+    assert (root / "app_entry.py").exists()
