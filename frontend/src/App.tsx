@@ -273,13 +273,51 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto overscroll-contain">
-          {view === "empty" && (
-            <div className="flex items-center justify-center h-full">
-              <div className="text-center">
-                <p className="text-gray-500 text-sm">Select a profile or create a new one</p>
+          {view === "empty" &&
+            ((systemStatus?.license_tier ?? "keyless") === "keyless" ? (
+              <div className="flex items-center justify-center h-full px-6">
+                <div className="max-w-sm text-center">
+                  <p className="text-sm font-medium text-gray-200">No license key set</p>
+                  <p className="mt-1.5 text-sm text-gray-500">
+                    You're running the free keyless build. Add a key to run the
+                    latest Pro build.
+                  </p>
+                  <div className="mt-5 flex flex-col items-center gap-2">
+                    <button
+                      onClick={() => setSettingsOpen(true)}
+                      className="btn-primary w-56"
+                    >
+                      Enter a key in Settings
+                    </button>
+                    <a
+                      href="https://cloakbrowser.dev/free"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn-secondary w-56"
+                    >
+                      Get a free key
+                    </a>
+                    <a
+                      href="https://cloakbrowser.dev/#pricing"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-gray-500 hover:text-gray-300"
+                    >
+                      See Pro plans &rarr;
+                    </a>
+                  </div>
+                  <p className="mt-6 text-xs text-gray-600">
+                    Or select a profile or create a new one to continue keyless.
+                  </p>
+                </div>
               </div>
-            </div>
-          )}
+            ) : (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center">
+                  <p className="text-gray-500 text-sm">Select a profile or create a new one</p>
+                </div>
+              </div>
+            ))}
 
           {view === "create" && (
             <ProfileForm
