@@ -30,7 +30,7 @@ def test_profile_create_minimal():
     assert p.geoip is True
     assert p.human_preset == "default"
     assert p.extension_paths == []
-    assert p.allow_3p_cookies is False
+    assert p.allow_3p_cookies is True
 
 
 def test_profile_create_all_fields():

@@ -14,6 +14,7 @@ from backend.browser_manager import (
     _validate_proxy,
     BrowserManager,
     RunningProfile,
+    SEARCH_ENGINE_MARKER,
 )
 from backend.runtime import RuntimeConfig
 
@@ -202,10 +203,15 @@ def test_launch_args_none_no_effect():
 
 
 def _launch_profile(tmp_path: Path) -> dict:
+    user_data_dir = tmp_path / "profile-1"
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    # Skip the one-time default-search-engine setup (unrelated to launch mechanics;
+    # it would otherwise spawn its own real browser launches during these tests).
+    (user_data_dir / SEARCH_ENGINE_MARKER).write_text("google\n")
     return {
         "id": "profile-1",
         "name": "Native",
-        "user_data_dir": str(tmp_path / "profile-1"),
+        "user_data_dir": str(user_data_dir),
         "screen_width": 1920,
         "screen_height": 1080,
         "launch_args": [],
@@ -329,6 +335,30 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_launch_gates_search_engine_on_flag(monkeypatch, tmp_path: Path, enabled: bool):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    monkeypatch.setattr(
+        module, "launch_persistent_context_async", AsyncMock(return_value=context)
+    )
+
+    profile = _launch_profile(tmp_path)
+    profile["set_google_default"] = enabled
+    await manager.launch(profile)
+
+    if enabled:
+        manager._ensure_search_engine.assert_awaited_once()
+    else:
+        manager._ensure_search_engine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_launch_retries_failed_cdp_and_closes_first_context(
     monkeypatch,
     tmp_path: Path,
@@ -423,13 +453,14 @@ def test_init_creates_bookmarks(tmp_path: Path):
     assert folder_names == {"Detection Tests", "Fingerprint", "Headers & TLS", "reCAPTCHA"}
 
 
-def test_init_creates_preferences(tmp_path: Path):
+def test_init_creates_bookmarks_not_preferences(tmp_path: Path):
     _init_profile_defaults(tmp_path)
-    prefs_path = tmp_path / "Default" / "Preferences"
-    assert prefs_path.exists()
-    data = json.loads(prefs_path.read_text())
-    assert "default_search_provider_data" in data
-    assert "DuckDuckGo" in data["default_search_provider_data"]["template_url_data"]["short_name"]
+    # Bookmarks are seeded here.
+    assert (tmp_path / "Default" / "Bookmarks").exists()
+    # The default search engine is NOT set via Preferences (it can't stick — it
+    # lives in MAC-protected Secure Preferences). That is handled once per profile
+    # by BrowserManager._ensure_search_engine, not here.
+    assert not (tmp_path / "Default" / "Preferences").exists()
 
 
 def test_init_idempotent(tmp_path: Path):

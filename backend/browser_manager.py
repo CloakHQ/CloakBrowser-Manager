@@ -123,29 +123,95 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
         bookmarks_path.write_text(json.dumps(bookmarks, indent=2))
         logger.info("Created default bookmarks for %s", user_data_dir.name)
 
-    # --- DuckDuckGo as default search engine ---
-    prefs_path = default_dir / "Preferences"
-    if not prefs_path.exists():
-        prefs = {
-            "default_search_provider_data": {
-                "template_url_data": {
-                    "keyword": "duckduckgo.com",
-                    "short_name": "DuckDuckGo",
-                    "url": "https://duckduckgo.com/?q={searchTerms}",
-                    "suggestions_url": "https://duckduckgo.com/ac/?q={searchTerms}&type=list",
-                    "favicon_url": "https://duckduckgo.com/favicon.ico",
-                }
-            },
-            "default_search_provider": {
-                "enabled": True,
-            },
-        }
-        prefs_path.write_text(json.dumps(prefs, indent=2))
-        logger.info("Set DuckDuckGo as default search for %s", user_data_dir.name)
+    # NOTE: the default search engine is NOT set here. The binary is built
+    # de-Googled (prepopulated default is "No Search"), and writing
+    # default_search_provider_data into Default/Preferences does NOT take — the
+    # authoritative value lives in the MAC-protected Default/Secure Preferences,
+    # rebuilt from the prepopulated set on every startup. Setting Google as the
+    # default requires a live TemplateURLService commit, done once per profile in
+    # BrowserManager._ensure_search_engine() (see that method).
 
 
 CDP_START_ATTEMPTS = 3
 CDP_READY_TIMEOUT = 10.0
+
+# One-time default-search-engine setup (see _ensure_search_engine).
+SEARCH_ENGINE_MARKER = ".cloak_search_engine"
+SEARCH_ENGINE_MAX_ATTEMPTS = 3
+SEARCH_ENGINE_NAME = "Google"
+SEARCH_ENGINE_KEYWORD = "google.com"
+SEARCH_ENGINE_URL = "https://www.google.com/search?q=%s"
+
+# Read the live default search engine straight from the settings WebUI backend.
+_ACTIVE_DEFAULT_JS = """async () => {
+  const cr = await import('chrome://resources/js/cr.js');
+  const l = await cr.sendWithPromise('getSearchEnginesList');
+  const a = (l.defaults || []).find(e => e.default);
+  return a ? {name: a.name, keyword: a.keyword} : null;
+}"""
+# Click the "Add" button that opens the add-search-engine dialog. We can't seed a
+# search engine by writing files: a hand-written Web Data row carries an invalid
+# url_hash (an HMAC we can't forge) and Chrome deletes it on load (strictly so on
+# Windows). Only Chrome may create the row, so we drive the real Add dialog.
+_CLICK_ADD_JS = """() => {
+  let clicked = false;
+  const walk = (root) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.tagName === 'CR-BUTTON'
+        && /^Add$/i.test((el.textContent || '').trim())
+        && /Add Site Search/i.test(el.getAttribute('aria-label') || '')) {
+      el.click(); clicked = true;
+    }
+  });
+  walk(document);
+  return clicked;
+}"""
+# Whether the dialog's Add action button is enabled (all fields validated).
+_ADD_ENABLED_JS = """() => {
+  let enabled = false;
+  const walk = (root) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.tagName === 'CR-BUTTON'
+        && /^Add$/i.test((el.textContent || '').trim())
+        && el.closest('cr-dialog')) enabled = !el.disabled;
+  });
+  walk(document);
+  return enabled;
+}"""
+# Click the (enabled) dialog Add button to commit the new engine.
+_SUBMIT_ADD_JS = """() => {
+  let clicked = false;
+  const walk = (root) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.tagName === 'CR-BUTTON'
+        && /^Add$/i.test((el.textContent || '').trim())
+        && el.closest('cr-dialog') && !el.disabled) { el.click(); clicked = true; }
+  });
+  walk(document);
+  return clicked;
+}"""
+# Open Google's "More actions" menu, then click "Make default". Exact aria-label
+# match so we don't hit the "Google AI Mode" starter-pack entry. Playwright
+# locators don't pierce this page's nested shadow DOM reliably, so we walk it.
+_MAKE_GOOGLE_DEFAULT_JS = """() => {
+  const walk = (root, fn) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot, fn);
+    fn(el);
+  });
+  walk(document, el => {
+    const label = ((el.getAttribute && el.getAttribute('aria-label')) || '').trim();
+    if (el.tagName === 'CR-ICON-BUTTON' && label === 'More actions for Google') el.click();
+  });
+  return new Promise(resolve => setTimeout(() => {
+    let clicked = false;
+    walk(document, el => {
+      if (el.tagName === 'BUTTON'
+          && /^Make default$/i.test((el.textContent || '').trim())
+          && !el.disabled) { el.click(); clicked = true; }
+    });
+    resolve(clicked);
+  }, 400));
+}"""
 
 
 @dataclass
@@ -174,6 +240,7 @@ class BrowserManager:
         self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
+        self._initializing: set[str] = set()  # profile IDs in one-time first-launch setup
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
         self._cdp_ports: set[int] = set()
@@ -256,6 +323,13 @@ class BrowserManager:
                     (user_data_dir / lock_file).unlink(missing_ok=True)
 
             _init_profile_defaults(user_data_dir)
+
+            # One-time per profile (opt-out via set_google_default): make Google
+            # the default search engine. Runs before the user-facing launch;
+            # reports "initializing" via get_status while it works (one short
+            # headless launch). Never fatal.
+            if profile.get("set_google_default", True):
+                await self._ensure_search_engine(profile_id, user_data_dir)
 
             if display is not None and ws_port is not None:
                 await self.vnc.start_vnc(
@@ -406,6 +480,122 @@ class BrowserManager:
                 await self.vnc.stop_vnc(display)
             raise
 
+    async def _ensure_search_engine(
+        self, profile_id: str, user_data_dir: Path
+    ) -> None:
+        """Make Google the default search engine, once per profile.
+
+        Marker-gated so it runs only on a profile's first launch. Reports
+        "initializing" via get_status while it works. Never fatal: on failure the
+        profile still launches (with the binary's de-Googled "No Search" default).
+
+        The marker records outcome: "google" = done (skip forever); "failed:N" =
+        N attempts spent. Retries up to SEARCH_ENGINE_MAX_ATTEMPTS, then gives up
+        so a persistently-failing profile doesn't pay an extra headless launch
+        (~5s) on every single launch, silently, forever.
+        """
+        marker = user_data_dir / SEARCH_ENGINE_MARKER
+        state = marker.read_text().strip() if marker.exists() else ""
+        if state == "google":
+            return
+        attempts = 0
+        if state.startswith("failed:"):
+            try:
+                attempts = int(state.split(":", 1)[1])
+            except ValueError:
+                attempts = 0
+            if attempts >= SEARCH_ENGINE_MAX_ATTEMPTS:
+                return  # gave up earlier — stop burning launches on every start
+
+        self._initializing.add(profile_id)
+        try:
+            await self._setup_google_default(user_data_dir)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("google\n")
+            logger.info(
+                "Set Google as default search engine for %s", user_data_dir.name
+            )
+        except Exception as exc:
+            attempts += 1
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(f"failed:{attempts}\n")
+            except OSError:
+                pass
+            log = logger.error if attempts >= SEARCH_ENGINE_MAX_ATTEMPTS else logger.warning
+            log(
+                "Default-search-engine setup failed for %s (attempt %d/%d, launching anyway): %s",
+                user_data_dir.name,
+                attempts,
+                SEARCH_ENGINE_MAX_ATTEMPTS,
+                exc,
+            )
+        finally:
+            self._initializing.discard(profile_id)
+
+    async def _setup_google_default(self, user_data_dir: Path) -> None:
+        """Add Google via the settings UI, then commit it as the default.
+
+        Single headless launch, no file seeding. A plain Preferences write can't
+        set the default (the authoritative value is MAC-protected in Secure
+        Preferences, rebuilt from the prepopulated set every startup), and a
+        hand-written Web Data keyword row is deleted on load for its invalid,
+        un-forgeable url_hash (strictly so on Windows). So we drive the real Add
+        dialog — Chrome creates the row with a valid hash — then "Make default".
+        Every later launch then carries Google via the profile's own files.
+        """
+        ctx = await self._headless_launch(user_data_dir)
+        try:
+            page = await ctx.new_page()
+            await page.goto("chrome://settings/searchEngines")
+            await asyncio.sleep(2)
+
+            if not await page.evaluate(_CLICK_ADD_JS):
+                raise RuntimeError("could not open the Add search engine dialog")
+            await asyncio.sleep(1.2)
+
+            # Real .fill() emits trusted events so the dialog's async field
+            # validation runs and enables the Add button; a synthetic value-set
+            # does not. Playwright pierces the cr-input's open shadow root.
+            await page.locator('cr-input[label="Name"] input').first.fill(SEARCH_ENGINE_NAME)
+            await page.locator('cr-input[label="Shortcut"] input').first.fill(SEARCH_ENGINE_KEYWORD)
+            await page.locator('cr-input[label^="URL"] input').first.fill(SEARCH_ENGINE_URL)
+
+            enabled = False
+            for _ in range(12):
+                await asyncio.sleep(0.25)
+                if await page.evaluate(_ADD_ENABLED_JS):
+                    enabled = True
+                    break
+            if not enabled:
+                raise RuntimeError("Add dialog stayed disabled after fill")
+
+            if not await page.evaluate(_SUBMIT_ADD_JS):
+                raise RuntimeError("could not submit the Add dialog")
+            await asyncio.sleep(1.2)
+
+            clicked = await page.evaluate(_MAKE_GOOGLE_DEFAULT_JS)
+            await asyncio.sleep(1)
+            active = await page.evaluate(_ACTIVE_DEFAULT_JS)
+            if not (active and active.get("keyword") == SEARCH_ENGINE_KEYWORD):
+                raise RuntimeError(
+                    f"make-default did not take (clicked={clicked}, active={active})"
+                )
+        finally:
+            await self._close_context(ctx, "search-init")
+        await asyncio.sleep(0.5)
+
+    async def _headless_launch(self, user_data_dir: Path) -> Any:
+        """Short headless launch used only by the one-time search-engine setup."""
+        for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            (user_data_dir / lock_file).unlink(missing_ok=True)
+        return await launch_persistent_context_async(
+            user_data_dir=str(user_data_dir),
+            headless=True,
+            license_key=self.license_key,
+            release_channel=self.release_channel,
+        )
+
     async def _close_context(self, context: Any, profile_id: str) -> None:
         try:
             await context.close()
@@ -448,8 +638,14 @@ class BrowserManager:
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status and viewer capabilities for a profile."""
         running = self.running.get(profile_id)
+        if running:
+            state = "running"
+        elif profile_id in self._initializing:
+            state = "initializing"
+        else:
+            state = "stopped"
         status = {
-            "status": "running" if running else "stopped",
+            "status": state,
             "runtime_mode": self.runtime.runtime_mode,
             "viewer_mode": self.runtime.viewer_mode,
             "vnc_ws_port": running.ws_port if running else None,

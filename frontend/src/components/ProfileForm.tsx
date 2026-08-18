@@ -44,7 +44,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onC
     geoip: true,
     clipboard_sync: true,
     auto_launch: false,
-    allow_3p_cookies: false,
+    allow_3p_cookies: true,
+    set_google_default: true,
     extension_paths: [],
     launch_args: [],
     tags: [],
@@ -76,6 +77,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onC
         color_scheme: profile.color_scheme,
         extension_paths: profile.extension_paths ?? [],
         allow_3p_cookies: profile.allow_3p_cookies,
+        set_google_default: profile.set_google_default,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
@@ -442,6 +444,20 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onC
               className="rounded border-border bg-surface-2"
             />
             Allow third-party cookies for login, SSO, and challenge flows
+          </label>
+          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+            <input
+              type="checkbox"
+              checked={form.set_google_default ?? true}
+              onChange={(e) => set("set_google_default", e.target.checked)}
+              className="rounded border-border bg-surface-2 mt-0.5"
+            />
+            <span>
+              Set Google as the default search engine
+              <span className="block text-xs text-gray-500">
+                Adds a few seconds to the profile's first launch (one-time setup).
+              </span>
+            </span>
           </label>
         </section>
 

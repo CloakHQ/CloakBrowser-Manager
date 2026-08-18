@@ -129,7 +129,7 @@ def test_create_profile_defaults(tmp_db: Path):
     assert p["humanize"] == 0
     assert p["geoip"] == 1
     assert p["extension_paths"] == []
-    assert p["allow_3p_cookies"] == 0
+    assert p["allow_3p_cookies"] == 1
     assert p["human_preset"] == "default"
     assert p["launch_args"] == []
 

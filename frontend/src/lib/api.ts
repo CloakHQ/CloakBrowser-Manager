@@ -25,12 +25,13 @@ export interface Profile {
   launch_args: string[];
   extension_paths: string[];
   allow_3p_cookies: boolean;
+  set_google_default: boolean;
   notes: string | null;
   user_data_dir: string;
   created_at: string;
   updated_at: string;
   tags: { tag: string; color: string | null }[];
-  status: "running" | "stopped";
+  status: "running" | "stopped" | "initializing";
   runtime_mode: RuntimeMode;
   viewer_mode: ViewerMode;
   vnc_ws_port: number | null;
@@ -55,6 +56,7 @@ export interface ProfileCreateData {
   launch_args?: string[];
   extension_paths?: string[];
   allow_3p_cookies?: boolean;
+  set_google_default?: boolean;
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }

@@ -28,7 +28,8 @@ class ProfileCreate(BaseModel):
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
-    allow_3p_cookies: bool = False
+    allow_3p_cookies: bool = True
+    set_google_default: bool = True
     notes: str | None = None
     tags: list[TagCreate] | None = None
 
@@ -53,6 +54,7 @@ class ProfileUpdate(BaseModel):
     launch_args: list[str] | None = None
     extension_paths: list[str] | None = None
     allow_3p_cookies: bool | None = None
+    set_google_default: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
@@ -98,7 +100,8 @@ class ProfileResponse(BaseModel):
     color_scheme: str | None = None
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
-    allow_3p_cookies: bool = False
+    allow_3p_cookies: bool = True
+    set_google_default: bool = True
     notes: str | None = None
     user_data_dir: str
     created_at: str
