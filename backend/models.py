@@ -30,6 +30,7 @@ class ProfileCreate(BaseModel):
     extension_paths: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
     set_google_default: bool = True
+    capture_preview: bool = True
     notes: str | None = None
     tags: list[TagCreate] | None = None
 
@@ -55,6 +56,7 @@ class ProfileUpdate(BaseModel):
     extension_paths: list[str] | None = None
     allow_3p_cookies: bool | None = None
     set_google_default: bool | None = None
+    capture_preview: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
@@ -106,6 +108,7 @@ class ProfileResponse(BaseModel):
     extension_paths: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
     set_google_default: bool = True
+    capture_preview: bool = True
     notes: str | None = None
     user_data_dir: str
     created_at: str

@@ -33,7 +33,7 @@ from .env_file import load_env_file
 load_env_file()
 
 from . import database as db
-from .browser_manager import BrowserManager
+from .browser_manager import BrowserManager, SCREENSHOT_FILENAME
 from .models import (
     ClipboardRequest,
     LaunchResponse,
@@ -1150,6 +1150,20 @@ async def cdp_info(profile_id: str):
         "usage": "playwright.chromium.connect_over_cdp('http://<host>/api/profiles/"
         + profile_id + "/cdp')",
     }
+
+
+@app.get("/api/profiles/{profile_id}/screenshot")
+async def profile_screenshot(profile_id: str):
+    """Serve the last captured browser preview (JPEG). 404 when none exists yet."""
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    path = Path(profile["user_data_dir"]) / SCREENSHOT_FILENAME
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No screenshot")
+    return FileResponse(
+        path, media_type="image/jpeg", headers={"Cache-Control": "no-store"}
+    )
 
 
 @app.get("/api/profiles/{profile_id}/cdp/json/version/")

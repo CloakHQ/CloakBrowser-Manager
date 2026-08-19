@@ -364,8 +364,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             ) : (
               <NativeWindowStatus
                 key={selected.id}
+                profileId={selected.id}
                 profileName={selected.name}
                 cdpUrl={selected.cdp_url}
+                capturePreview={selected.capture_preview}
               />
             )
           )}

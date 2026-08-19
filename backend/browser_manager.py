@@ -135,6 +135,13 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
 CDP_START_ATTEMPTS = 3
 CDP_READY_TIMEOUT = 10.0
 
+# Periodic browser preview capture (shown in the edit view of a stopped profile).
+# Captured every interval while running + once on stop; written to the profile's
+# own user_data_dir so it's removed with the profile.
+SCREENSHOT_FILENAME = "last_screenshot.jpg"
+SCREENSHOT_INTERVAL = 30.0
+SCREENSHOT_JPEG_QUALITY = 55
+
 # One-time default-search-engine setup (see _ensure_search_engine).
 SEARCH_ENGINE_MARKER = ".cloak_search_engine"
 SEARCH_ENGINE_MAX_ATTEMPTS = 3
@@ -221,6 +228,9 @@ class RunningProfile:
     cdp_port: int
     display: int | None = None
     ws_port: int | None = None
+    user_data_dir: Path | None = None
+    screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
+    capture_preview: bool = True
 
 
 class BrowserManager:
@@ -449,6 +459,8 @@ class BrowserManager:
                 cdp_port=cdp_port,
                 display=display,
                 ws_port=ws_port,
+                user_data_dir=user_data_dir,
+                capture_preview=bool(profile.get("capture_preview", True)),
             )
             context.on(
                 "close",
@@ -458,6 +470,15 @@ class BrowserManager:
             async with self._lock:
                 self.running[profile_id] = running
                 self._launching.discard(profile_id)
+
+            # Periodically snapshot the page so the edit view (and the native
+            # running view) can show the last frame. Runs even when the browser
+            # is closed from inside VNC, where an on-close capture is impossible.
+            # Per-profile opt-out via capture_preview.
+            if running.capture_preview:
+                running.screenshot_task = asyncio.ensure_future(
+                    self._screenshot_loop(profile_id)
+                )
 
             logger.info(
                 "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
@@ -596,6 +617,44 @@ class BrowserManager:
             release_channel=self.release_channel,
         )
 
+    async def _capture_screenshot(self, running: RunningProfile) -> None:
+        """Write a compressed JPEG of the profile's current page to disk.
+
+        Best-effort: a live page and user_data_dir are required. Written to a
+        temp file then atomically renamed so the endpoint never serves a
+        half-written image. Callers wrap this; it may raise on a dead/navigating
+        page.
+        """
+        if running.user_data_dir is None:
+            return
+        pages = list(running.context.pages)
+        if not pages:
+            return
+        page = pages[-1]  # most recently opened tab ≈ what the user is viewing
+        dest = running.user_data_dir / SCREENSHOT_FILENAME
+        tmp = running.user_data_dir / (SCREENSHOT_FILENAME + ".tmp")
+        await page.screenshot(
+            path=str(tmp), type="jpeg", quality=SCREENSHOT_JPEG_QUALITY
+        )
+        os.replace(tmp, dest)
+
+    async def _screenshot_loop(self, profile_id: str) -> None:
+        """Capture a preview every SCREENSHOT_INTERVAL while the profile runs."""
+        try:
+            while self.running.get(profile_id) is not None:
+                await asyncio.sleep(SCREENSHOT_INTERVAL)
+                running = self.running.get(profile_id)
+                if running is None:
+                    break
+                try:
+                    await self._capture_screenshot(running)
+                except Exception as exc:
+                    logger.debug(
+                        "Preview screenshot failed for %s: %s", profile_id, exc
+                    )
+        except asyncio.CancelledError:
+            pass
+
     async def _close_context(self, context: Any, profile_id: str) -> None:
         try:
             await context.close()
@@ -608,6 +667,8 @@ class BrowserManager:
         *,
         close_context: bool,
     ) -> None:
+        if running.screenshot_task is not None:
+            running.screenshot_task.cancel()
         if close_context:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:
@@ -633,6 +694,15 @@ class BrowserManager:
             return
 
         logger.info("Stopping profile %s", profile_id)
+        # Final preview capture while the context is still alive (the on-close
+        # path can't screenshot — the browser is already gone by then).
+        if running.capture_preview:
+            try:
+                await self._capture_screenshot(running)
+            except Exception as exc:
+                logger.debug(
+                    "Final preview screenshot failed for %s: %s", profile_id, exc
+                )
         await self._dispose_running(running, close_context=True)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:

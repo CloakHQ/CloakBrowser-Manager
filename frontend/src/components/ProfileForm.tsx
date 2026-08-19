@@ -47,10 +47,14 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     auto_launch: false,
     allow_3p_cookies: true,
     set_google_default: true,
+    capture_preview: true,
     extension_paths: [],
     launch_args: [],
     tags: [],
   });
+
+  const [previewError, setPreviewError] = useState(false);
+  const [previewBuster, setPreviewBuster] = useState(0);
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -85,15 +89,18 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         geoip: profile.geoip,
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
-        color_scheme: profile.color_scheme,
         extension_paths: profile.extension_paths ?? [],
         allow_3p_cookies: profile.allow_3p_cookies,
         set_google_default: profile.set_google_default,
+        capture_preview: profile.capture_preview,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
       });
     }
+    // Re-fetch the preview for the newly selected profile (bust the cache).
+    setPreviewError(false);
+    setPreviewBuster(Date.now());
   }, [profile?.id]);
 
   useEffect(() => {
@@ -236,6 +243,19 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       </div>
 
       <div className="space-y-5">
+        {/* Last preview — the last frame captured before the browser stopped */}
+        {isEdit && !previewError && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Last preview</h3>
+            <img
+              src={`/api/profiles/${profile!.id}/screenshot?t=${previewBuster}`}
+              onError={() => setPreviewError(true)}
+              alt="Last browser preview"
+              className="w-full rounded-md border border-border bg-surface-1 object-contain max-h-72"
+            />
+          </section>
+        )}
+
         {/* Basic */}
         <section>
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Basic</h3>
@@ -462,19 +482,20 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               />
               Launch automatically when Manager starts
             </label>
-            <div>
-              <label className="label">Color Scheme</label>
-              <select
-                className="input"
-                value={form.color_scheme ?? ""}
-                onChange={(e) => set("color_scheme", e.target.value || null)}
-              >
-                <option value="">System default</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-                <option value="no-preference">No preference</option>
-              </select>
-            </div>
+            <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.capture_preview ?? true}
+                onChange={(e) => set("capture_preview", e.target.checked)}
+                className="rounded border-border bg-surface-2 mt-0.5"
+              />
+              <span>
+                Save a preview screenshot of the browser
+                <span className="block text-xs text-gray-500">
+                  Captures the page periodically while running, shown here after the profile stops.
+                </span>
+              </span>
+            </label>
           </div>
         </section>
 

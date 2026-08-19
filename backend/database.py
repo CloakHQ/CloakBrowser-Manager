@@ -21,8 +21,8 @@ _PROFILE_COLUMNS = (
     "id", "name", "fingerprint_seed", "proxy", "timezone", "locale",
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
-    "extension_paths", "allow_3p_cookies", "set_google_default", "notes",
-    "user_data_dir", "created_at", "updated_at", "sort_order",
+    "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
+    "notes", "user_data_dir", "created_at", "updated_at", "sort_order",
 )
 
 _PROFILE_SCHEMA = """
@@ -46,6 +46,7 @@ CREATE TABLE profiles (
     extension_paths TEXT NOT NULL DEFAULT '[]',
     allow_3p_cookies BOOLEAN DEFAULT 1,
     set_google_default BOOLEAN DEFAULT 1,
+    capture_preview BOOLEAN DEFAULT 1,
     notes TEXT,
     user_data_dir TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -185,7 +186,8 @@ def create_profile(name: str, fingerprint_seed: int | None = None, **fields: Any
         "color_scheme": fields.get("color_scheme"), "launch_args": json.dumps(fields.get("launch_args") or []),
         "extension_paths": json.dumps(fields.get("extension_paths") or []),
         "allow_3p_cookies": fields.get("allow_3p_cookies", True),
-        "set_google_default": fields.get("set_google_default", True), "notes": fields.get("notes"),
+        "set_google_default": fields.get("set_google_default", True),
+        "capture_preview": fields.get("capture_preview", True), "notes": fields.get("notes"),
         "user_data_dir": user_data_dir, "created_at": now, "updated_at": now,
     }
     with get_db() as conn:
