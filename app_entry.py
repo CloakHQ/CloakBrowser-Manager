@@ -111,35 +111,89 @@ def _ui_mode() -> str:
     return mode
 
 
-def _set_dock_icon() -> None:
-    """Show our mark in the macOS Dock for the from-source dev run.
+def _set_app_icon() -> None:
+    """Show our mark in the Dock/taskbar for the from-source dev run.
 
-    The frozen .app already carries the icon via manager.spec's BUNDLE(icon=…),
-    so this is dev-only: `python app_entry.py` otherwise borrows the framework
-    Python.app's generic rocket. Requires pyobjc (pulled in with pywebview);
-    no-op on failure / non-macOS / frozen.
+    The frozen build already carries the icon (manager.spec BUNDLE(icon=…) on
+    macOS; the PyInstaller/Inno .ico on Windows), so this is dev-only:
+    `python app_entry.py` from source otherwise shows the interpreter's generic
+    icon (Python.app rocket on macOS, python.exe on Windows). No-op on failure /
+    unsupported platform / frozen.
     """
     import sys
     from pathlib import Path
 
-    if sys.platform != "darwin" or getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False):
         return
-    # Use the rounded macOS squircle (icon.icns), NOT icon.png (the square
-    # full-bleed master used for the Windows .ico).
     packaging = Path(__file__).resolve().parent / "packaging"
-    icon = packaging / "icon.icns"
-    if not icon.exists():
-        icon = packaging / "icon.png"
-    if not icon.exists():
-        return
-    try:
-        from AppKit import NSApplication, NSImage
 
-        image = NSImage.alloc().initWithContentsOfFile_(str(icon))
-        if image is not None:
-            NSApplication.sharedApplication().setApplicationIconImage_(image)
+    if sys.platform == "darwin":
+        # The rounded squircle (icon.icns), NOT icon.png (the square master).
+        icon = packaging / "icon.icns"
+        if not icon.exists():
+            icon = packaging / "icon.png"
+        if not icon.exists():
+            return
+        try:
+            from AppKit import NSApplication, NSImage
+
+            image = NSImage.alloc().initWithContentsOfFile_(str(icon))
+            if image is not None:
+                NSApplication.sharedApplication().setApplicationIconImage_(image)
+        except Exception:
+            pass
+
+    elif sys.platform == "win32":
+        icon = packaging / "icon.ico"
+        if not icon.exists():
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            image_icon, lr_loadfromfile, lr_defaultsize = 1, 0x10, 0x40
+            wm_seticon, icon_small, icon_big = 0x0080, 0, 1
+            hicon = user32.LoadImageW(
+                None, str(icon), image_icon, 0, 0,
+                lr_loadfromfile | lr_defaultsize,
+            )
+            if hicon:
+                # FindWindow by our exact title — the pywebview window is the
+                # only one using it. Set both title-bar and taskbar icons.
+                hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+                if hwnd:
+                    user32.SendMessageW(hwnd, wm_seticon, icon_small, hicon)
+                    user32.SendMessageW(hwnd, wm_seticon, icon_big, hicon)
+        except Exception:
+            pass
+
+
+def _focus_existing_window() -> bool:
+    """Raise an already-running Manager's window — Windows single-instance.
+
+    macOS handles single-instance via the app bundle's
+    LSMultipleInstancesProhibited plist, so this is the Windows path: find our
+    window by title and bring it to the foreground (restoring it if minimized).
+    Returns True if a window was focused. No-op / False on other platforms.
+    """
+    import sys
+
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+        if not hwnd:
+            return False
+        sw_restore = 9
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, sw_restore)
+        user32.SetForegroundWindow(hwnd)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _run_webview(server) -> int:
@@ -149,7 +203,22 @@ def _run_webview(server) -> int:
     uvicorn server is threaded here. uvicorn's install_signal_handlers()
     early-returns off the main thread, so a threaded server.run() is safe.
     """
+    import sys
+
     import webview
+
+    # Windows taskbar groups/icons by AppUserModelID; set an explicit one before
+    # the window exists so the dev-run taskbar icon can be ours (frozen build is
+    # unaffected — it has a real .exe identity). No-op elsewhere / on failure.
+    if sys.platform == "win32" and not getattr(sys, "frozen", False):
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "dev.cloakbrowser.manager"
+            )
+        except Exception:
+            pass
 
     server_thread = threading.Thread(target=server.run, daemon=True)
     server_thread.start()
@@ -185,9 +254,9 @@ def _run_webview(server) -> int:
 
     window.events.resized += _on_resized
     window.events.moved += _on_moved
-    # Set the Dock icon once the GUI (and its NSApplication) exists, on the main
-    # thread. Dev-only nicety; the frozen bundle already shows the icon.
-    window.events.shown += _set_dock_icon
+    # Set the Dock/taskbar icon once the window exists, on the main thread.
+    # Dev-only nicety; the frozen build already shows the icon.
+    window.events.shown += _set_app_icon
 
     webview.start()  # blocks on the main thread until the window is closed
 
@@ -204,8 +273,10 @@ def main() -> int:
     os.environ.setdefault("CLOAKBROWSER_MANAGER_RUNTIME", "native")
 
     if not _port_available():
-        # A Manager is already running on this machine — just surface it.
-        webbrowser.open(SERVER_URL)
+        # A Manager is already running on this machine. On Windows, focus its
+        # existing window (single-instance); otherwise surface it in a browser.
+        if not _focus_existing_window():
+            webbrowser.open(SERVER_URL)
         return 0
 
     import uvicorn
