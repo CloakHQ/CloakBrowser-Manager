@@ -4,3 +4,6 @@ pydantic>=2.0
 cloakbrowser[geoip]>=0.5.7
 websockets>=14.0
 httpx>=0.27.0
+# Native window shell for the frozen app (WKWebView on macOS, WebView2 on
+# Windows). app_entry.py falls back to the default browser if absent.
+pywebview>=5.0

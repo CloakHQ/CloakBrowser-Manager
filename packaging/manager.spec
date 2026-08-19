@@ -42,7 +42,7 @@ hiddenimports += collect_submodules("backend")
 # Playwright ships a Node driver as data + its own PyInstaller hooks; collect it
 # fully so cloakbrowser can drive the browser over CDP. (We do NOT ship
 # Playwright's downloaded browsers — cloakbrowser fetches its own Chromium.)
-for pkg in ("playwright", "cloakbrowser", "uvicorn"):
+for pkg in ("playwright", "cloakbrowser", "uvicorn", "webview"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -110,7 +110,10 @@ if IS_MAC:
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": APP_NAME,
             "NSHighResolutionCapable": True,
-            # Normal app: a browser tab is the UI, but keep a Dock icon.
             "LSApplicationCategoryType": "public.app-category.utilities",
+            # Single-instance: relaunching the app focuses the running instance
+            # instead of spawning a second process (which would hit the busy
+            # port and open a stray browser tab).
+            "LSMultipleInstancesProhibited": True,
         },
     )

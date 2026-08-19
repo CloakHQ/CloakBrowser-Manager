@@ -9,11 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
-import threading
-import time
-import urllib.request
 import venv
-import webbrowser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -102,17 +98,6 @@ def _ensure_server_port_available() -> None:
             ) from exc
 
 
-def _open_when_ready() -> None:
-    for _ in range(100):
-        try:
-            with urllib.request.urlopen(f"{SERVER_URL}/api/health", timeout=0.5):
-                webbrowser.open(SERVER_URL)
-                return
-        except OSError:
-            time.sleep(0.1)
-    print(f"[error] Manager did not become ready at {SERVER_URL}", file=sys.stderr)
-
-
 def main() -> int:
     try:
         python = _ensure_environment()
@@ -128,24 +113,16 @@ def main() -> int:
 
     env = {**os.environ, "CLOAKBROWSER_MANAGER_RUNTIME": "native"}
     print(f"[start] CloakBrowser Manager: {SERVER_URL}", flush=True)
-    threading.Thread(target=_open_when_ready, daemon=True).start()
-    process = subprocess.Popen(
-        [
-            str(python), "-m", "uvicorn", "backend.main:app",
-            "--host", "127.0.0.1", "--port", "8080",
-        ],
-        cwd=ROOT,
-        env=env,
-    )
-    try:
-        return process.wait()
-    except KeyboardInterrupt:
-        process.terminate()
-        try:
-            return process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return process.wait()
+    # Replace this bootstrap process with app_entry.py under the venv python.
+    # os.execve hands off entirely — no lingering parent, no wrapper-of-wrapper —
+    # so a dev run becomes the exact same in-process server + native webview
+    # window as the frozen build (which runs app_entry.py directly). app_entry
+    # opens the window, or a browser tab if pywebview is missing; set
+    # CLOAKBROWSER_MANAGER_UI=browser to force a tab. execve only returns (raises)
+    # on failure, so anything below is the error path.
+    os.chdir(ROOT)
+    os.execve(str(python), [str(python), str(ROOT / "app_entry.py")], env)
+    return 1  # unreachable unless execve failed
 
 
 if __name__ == "__main__":
