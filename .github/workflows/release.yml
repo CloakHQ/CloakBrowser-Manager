@@ -1,0 +1,209 @@
+name: Release
+
+# Builds the native installers on hosted runners and publishes a GitHub Release:
+#   - Windows x64  -> Inno Setup -setup.exe (unsigned)
+#   - macOS        -> ONE universal .dmg (arm64 + x86_64), signed + notarized
+#
+# Trigger: push a v* tag (cuts a real release). workflow_dispatch builds the
+# installers without publishing a release (green-light check before tagging).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            V="$GITHUB_REF_NAME"
+          else
+            V="$(git describe --tags --always)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V"
+
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        env:
+          CB_VERSION: ${{ needs.version.outputs.version }}
+        run: powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          path: dist_native/*-setup.exe
+          if-no-files-found: error
+
+  # Native single-arch .app builds (unsigned). Tarred to preserve symlinks +
+  # exec bits, which upload-artifact's zip would otherwise mangle.
+  build-mac:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Build unsigned .app
+        run: bash packaging/build_macos.sh   # no CB_SIGN_IDENTITY -> unsigned
+      - name: Sanity — arch of main executable
+        run: lipo -archs "dist_native/CloakBrowser Manager.app/Contents/MacOS/CloakBrowser Manager"
+      - name: Tar the .app
+        run: COPYFILE_DISABLE=1 tar czpf "app-${{ matrix.arch }}.tar.gz" -C dist_native "CloakBrowser Manager.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-app-${{ matrix.arch }}
+          path: app-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # Fuse the two arch apps into one universal .app, sign + notarize + staple,
+  # and produce the distributable .dmg.
+  universal:
+    needs: [version, build-mac]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: mac-app-arm64, path: _arm }
+      - uses: actions/download-artifact@v4
+        with: { name: mac-app-x86_64, path: _intel }
+      - name: Unpack arch apps
+        run: |
+          mkdir -p arm intel
+          tar xzpf _arm/app-arm64.tar.gz -C arm
+          tar xzpf _intel/app-x86_64.tar.gz -C intel
+      - name: Merge -> universal .app
+        run: |
+          bash packaging/make_universal_app.sh \
+            "arm/CloakBrowser Manager.app" \
+            "intel/CloakBrowser Manager.app" \
+            "dist_native/CloakBrowser Manager.app"
+      - name: Import signing cert into a temp keychain
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KP="$(uuidgen)"
+          echo "KEYCHAIN_PW=$KP" >> "$GITHUB_ENV"
+          KC="$RUNNER_TEMP/build.keychain-db"
+          echo "KEYCHAIN=$KC" >> "$GITHUB_ENV"
+          echo "$CERT_B64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PW" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KC" | grep -c "Developer ID Application" | xargs echo "Developer ID identities in keychain:"
+      - name: Sign (inside-out, hardened runtime)
+        env:
+          CB_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          KEYCHAIN: ${{ env.KEYCHAIN }}
+        run: bash packaging/sign_macos_app.sh "dist_native/CloakBrowser Manager.app"
+      - name: Build .dmg
+        run: |
+          APP="dist_native/CloakBrowser Manager.app"
+          DMG="dist_native/CloakBrowser-Manager-${{ needs.version.outputs.version }}-universal.dmg"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+          STAGE="$(mktemp -d)"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "CloakBrowser Manager" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          rm -rf "$STAGE"
+      - name: Notarize + staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler staple "dist_native/CloakBrowser Manager.app"
+      - name: Gatekeeper verify
+        run: |
+          spctl -a -vvv --type install "$DMG" || true
+          spctl -a -vvv "dist_native/CloakBrowser Manager.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal-dmg
+          path: dist_native/*-universal.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [version, build-windows, universal]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4   # for CHANGELOG.md
+      - uses: actions/download-artifact@v4
+        with: { name: windows-setup, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: macos-universal-dmg, path: dist }
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la dist
+          VER="${TAG#v}"
+          # Slice this version's section out of CHANGELOG.md (body only, no header).
+          awk -v ver="$VER" '/^## \[/{ if ($0 ~ "^## \\["ver"\\]") {f=1; next} else if (f) exit } f' \
+            CHANGELOG.md > notes.md || true
+          if [ ! -s notes.md ]; then
+            echo "Native desktop installers for CloakBrowser Manager $TAG." > notes.md
+          fi
+          {
+            echo
+            echo "---"
+            echo "**macOS** — universal \`.dmg\` (Apple Silicon + Intel), signed & notarized. **Windows** — \`.exe\` installer (per-user, unsigned; SmartScreen may prompt). The stealth Chromium binary downloads on first launch."
+          } >> notes.md
+          echo "=== release notes ===" && cat notes.md
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CloakBrowser Manager $TAG" \
+            --notes-file notes.md \
+            dist/*-universal.dmg dist/*-setup.exe
