@@ -1,4 +1,4 @@
-import { Save, Trash2, X } from "lucide-react";
+import { RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { HostOS, Profile, ProfileCreateData, ViewerMode } from "../lib/api";
 
@@ -8,6 +8,7 @@ interface ProfileFormProps {
   viewerMode: ViewerMode | null;
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
+  onReset?: () => Promise<void>;
   onCancel: () => void;
 }
 
@@ -31,7 +32,7 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -53,6 +54,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onC
 
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [extensionPathInput, setExtensionPathInput] = useState("");
@@ -117,6 +119,23 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onC
     }
   };
 
+  const handleReset = async () => {
+    if (!onReset) return;
+    if (
+      !confirm(
+        "Reset this profile? Cookies, history and site data will be wiped and a " +
+          "new fingerprint generated. Bookmarks, settings and default search are kept.",
+      )
+    )
+      return;
+    setResetting(true);
+    try {
+      await onReset();
+    } finally {
+      setResetting(false);
+    }
+  };
+
   const randomizeSeed = () => {
     set("fingerprint_seed", Math.floor(Math.random() * 90000) + 10000);
   };
@@ -167,6 +186,17 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onC
           <h2 className="text-lg font-semibold">
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
+          {isEdit && onReset && (
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={resetting}
+              className="btn-secondary flex items-center gap-1.5"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              <span>{resetting ? "Resetting..." : "Reset"}</span>
+            </button>
+          )}
           {isEdit && onDelete && (
             <button
               type="button"

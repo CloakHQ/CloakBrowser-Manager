@@ -88,5 +88,20 @@ export function useProfiles() {
     [refresh],
   );
 
-  return { profiles, loading, error, refresh, create, update, remove, launch, stop };
+  // Wipe browser state + re-roll fingerprint. Stays stopped — the profile keeps
+  // its config (proxy, locale, bookmarks, default search) and takes a fresh
+  // identity; the user launches it when ready.
+  const reset = useCallback(
+    async (id: string) => {
+      try {
+        await api.resetProfile(id);
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to reset profile");
+      }
+    },
+    [refresh],
+  );
+
+  return { profiles, loading, error, refresh, create, update, remove, launch, stop, reset };
 }

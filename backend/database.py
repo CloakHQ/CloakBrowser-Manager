@@ -266,3 +266,21 @@ def delete_profile(profile_id: str) -> bool:
         cursor = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
         conn.commit()
         return cursor.rowcount > 0
+
+
+def reset_profile(profile_id: str) -> dict[str, Any] | None:
+    """Re-roll fingerprint_seed and bump updated_at. Returns the updated profile or None.
+
+    A fresh seed is the point of a reset: the profile keeps its config (name,
+    proxy, locale, tags) but takes on a new identity. Seed range mirrors
+    create_profile.
+    """
+    if not get_profile(profile_id):
+        return None
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE profiles SET fingerprint_seed = ?, updated_at = ? WHERE id = ?",
+            (random.randint(10000, 99999), _now(), profile_id),
+        )
+        conn.commit()
+    return get_profile(profile_id)

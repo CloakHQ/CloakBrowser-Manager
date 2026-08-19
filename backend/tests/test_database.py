@@ -276,3 +276,37 @@ def test_delete_profile_cascades_tags(tmp_db: Path):
             "SELECT * FROM profile_tags WHERE profile_id = ?", (p["id"],)
         ).fetchall()
     assert len(rows) == 0
+
+
+# ── reset_profile ────────────────────────────────────────────────────────────
+
+
+def test_reset_profile_changes_seed(tmp_db: Path):
+    p = db.create_profile("ResetMe", fingerprint_seed=11111)
+    result = db.reset_profile(p["id"])
+    assert result is not None
+    assert result["fingerprint_seed"] != 11111
+    assert 10000 <= result["fingerprint_seed"] <= 99999
+
+
+def test_reset_profile_preserves_config(tmp_db: Path):
+    p = db.create_profile(
+        "KeepConfig", proxy="http://proxy:8080", tags=[{"tag": "work", "color": "#ff0000"}]
+    )
+    result = db.reset_profile(p["id"])
+    assert result["name"] == "KeepConfig"
+    assert result["proxy"] == "http://proxy:8080"
+    assert len(result["tags"]) == 1
+    assert result["tags"][0]["tag"] == "work"
+
+
+def test_reset_profile_bumps_updated_at(tmp_db: Path):
+    p = db.create_profile("Stamp")
+    time.sleep(0.01)
+    result = db.reset_profile(p["id"])
+    assert result["updated_at"] > p["updated_at"]
+    assert result["created_at"] == p["created_at"]
+
+
+def test_reset_profile_not_found(tmp_db: Path):
+    assert db.reset_profile("nonexistent") is None

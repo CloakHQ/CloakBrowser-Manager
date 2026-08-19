@@ -797,3 +797,84 @@ def test_bundle_dir_is_repo_root_when_unfrozen():
     # Running from source: repo root holds the backend package + app_entry.py.
     assert (root / "backend").is_dir()
     assert (root / "app_entry.py").exists()
+
+
+# ── Profile Reset ────────────────────────────────────────────────────────────
+
+
+def test_reset_profile_not_found(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/reset")
+    assert resp.status_code == 404
+
+
+def test_reset_profile_returns_updated_profile(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResetTest", "fingerprint_seed": 99999})
+    pid = create.json()["id"]
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "ResetTest"
+    assert data["fingerprint_seed"] != 99999
+    assert data["status"] == "stopped"
+
+
+def test_reset_profile_stops_running(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResetRunning"})
+    pid = create.json()["id"]
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.display = 100
+    mock_running.ws_port = 6100
+    mock_running.cdp_port = 5100
+    main.browser_mgr.running[pid] = mock_running
+    main.browser_mgr.stop = AsyncMock()
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    main.browser_mgr.stop.assert_called_once_with(pid)
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_reset_profile_wipes_state_but_preserves_config_files(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ResetWipe"})
+    pid = create.json()["id"]
+    default_dir = Path(app_client.get(f"/api/profiles/{pid}").json()["user_data_dir"]) / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    (default_dir / "Cookies").write_text("c")
+    (default_dir / "History").write_text("h")
+    (default_dir / "Web Data").write_text("w")
+    (default_dir / "Secure Preferences").write_text("s")
+    (default_dir / "Bookmarks").write_text("{}")
+    (default_dir / "Preferences").write_text("{}")
+    cache = default_dir / "Cache"
+    cache.mkdir()
+    (cache / "data").write_text("x")
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    # Wiped: identity/session state
+    assert not (default_dir / "Cookies").exists()
+    assert not (default_dir / "History").exists()
+    assert not cache.exists()
+    # Preserved: config + default search engine (Web Data holds the keyword row,
+    # Secure Preferences the default pointer) + bookmarks
+    assert (default_dir / "Web Data").exists()
+    assert (default_dir / "Secure Preferences").exists()
+    assert (default_dir / "Bookmarks").exists()
+    assert (default_dir / "Preferences").exists()
+
+
+def test_reset_profile_preserves_search_engine_marker(app_client: TestClient):
+    """Reset keeps the search config, so the one-time setup marker must survive
+    (no fragile Google rebuild is triggered on the next launch)."""
+    from backend.browser_manager import SEARCH_ENGINE_MARKER
+
+    create = app_client.post("/api/profiles", json={"name": "ResetMarker"})
+    pid = create.json()["id"]
+    user_data_dir = Path(app_client.get(f"/api/profiles/{pid}").json()["user_data_dir"])
+    (user_data_dir / "Default").mkdir(parents=True, exist_ok=True)
+    marker = user_data_dir / SEARCH_ENGINE_MARKER
+    marker.write_text("google\n")
+
+    resp = app_client.post(f"/api/profiles/{pid}/reset")
+    assert resp.status_code == 200
+    assert marker.exists()
+    assert marker.read_text().strip() == "google"

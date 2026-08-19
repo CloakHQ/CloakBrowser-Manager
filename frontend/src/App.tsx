@@ -92,7 +92,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, launch, stop } = useProfiles();
+  const { profiles, loading, error, create, update, remove, launch, stop, reset } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -160,6 +160,12 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     await stop(selectedId);
     setView("edit");
   }, [selectedId, stop]);
+
+  const handleReset = useCallback(async () => {
+    if (!selectedId) return;
+    await reset(selectedId);
+    // Stays in the edit view — the profile is wiped but not launched.
+  }, [selectedId, reset]);
 
   const handleClipboardSyncChange = useCallback(async (enabled: boolean) => {
     if (!selectedId) throw new Error("No profile selected");
@@ -336,6 +342,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleUpdate}
               onDelete={handleDelete}
+              onReset={handleReset}
               onCancel={() => {
                 setSelectedId(null);
                 setView("empty");
