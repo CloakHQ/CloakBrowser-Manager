@@ -269,7 +269,31 @@ def _run_webview(server) -> int:
     return 0
 
 
+def _harden_std_streams() -> None:
+    """Make stdout/stderr non-fatal on non-ASCII output.
+
+    A frozen GUI app on Windows has no console, so sys.stdout/stderr carry the
+    legacy console codepage (cp1252) with errors="strict". A dependency writing
+    a glyph that codepage lacks (e.g. the cloakbrowser welcome banner's → and —,
+    printed on the first Pro-binary download) then raises UnicodeEncodeError.
+    Because that write sits on the binary-download path, the exception aborts the
+    whole profile launch. Switch both streams to errors="replace" so an
+    unencodable glyph degrades to '?' instead of crashing the process.
+    """
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main() -> int:
+    _harden_std_streams()
     os.environ.setdefault("CLOAKBROWSER_MANAGER_RUNTIME", "native")
 
     if not _port_available():
