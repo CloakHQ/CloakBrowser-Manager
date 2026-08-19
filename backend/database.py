@@ -22,7 +22,7 @@ _PROFILE_COLUMNS = (
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "notes",
-    "user_data_dir", "created_at", "updated_at",
+    "user_data_dir", "created_at", "updated_at", "sort_order",
 )
 
 _PROFILE_SCHEMA = """
@@ -49,7 +49,8 @@ CREATE TABLE profiles (
     notes TEXT,
     user_data_dir TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -188,6 +189,9 @@ def create_profile(name: str, fingerprint_seed: int | None = None, **fields: Any
         "user_data_dir": user_data_dir, "created_at": now, "updated_at": now,
     }
     with get_db() as conn:
+        # New profiles land on top of the manual order (smallest sort_order).
+        min_order = conn.execute("SELECT MIN(sort_order) FROM profiles").fetchone()[0]
+        values["sort_order"] = (min_order - 1) if min_order is not None else 0
         cols = ", ".join(_PROFILE_COLUMNS)
         placeholders = ", ".join("?" for _ in _PROFILE_COLUMNS)
         conn.execute(
@@ -227,8 +231,20 @@ def get_profile(profile_id: str) -> dict[str, Any] | None:
 
 def list_profiles() -> list[dict[str, Any]]:
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM profiles ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM profiles ORDER BY sort_order ASC, created_at DESC"
+        ).fetchall()
         return [_hydrate_profile(conn, row) for row in rows]
+
+
+def reorder_profiles(ordered_ids: list[str]) -> None:
+    """Persist a manual profile order: sort_order = position in ordered_ids."""
+    with get_db() as conn:
+        conn.executemany(
+            "UPDATE profiles SET sort_order = ? WHERE id = ?",
+            [(index, profile_id) for index, profile_id in enumerate(ordered_ids)],
+        )
+        conn.commit()
 
 
 def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:

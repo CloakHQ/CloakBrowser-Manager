@@ -92,7 +92,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, launch, stop, reset } = useProfiles();
+  const { profiles, loading, error, create, update, remove, reorder, launch, stop, reset } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -212,6 +212,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             selectedId={selectedId}
             onSelect={handleSelect}
             onNew={handleNew}
+            onReorder={reorder}
           />
         </div>
       )}

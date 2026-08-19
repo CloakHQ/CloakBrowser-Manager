@@ -51,6 +51,26 @@ export function useProfiles() {
     [],
   );
 
+  // Persist a manual order. Optimistic so the UI updates instantly; the 3s poll
+  // then confirms the server order rather than reverting it. Resync on failure.
+  const reorder = useCallback(
+    async (orderedIds: string[]) => {
+      setProfiles((prev) => {
+        const byId = new Map(prev.map((p) => [p.id, p]));
+        return orderedIds
+          .map((id) => byId.get(id))
+          .filter((p): p is Profile => p !== undefined);
+      });
+      try {
+        await api.reorderProfiles(orderedIds);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to reorder profiles");
+        await refresh();
+      }
+    },
+    [refresh],
+  );
+
   const remove = useCallback(
     async (id: string) => {
       try {
@@ -103,5 +123,5 @@ export function useProfiles() {
     [refresh],
   );
 
-  return { profiles, loading, error, refresh, create, update, remove, launch, stop, reset };
+  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset };
 }

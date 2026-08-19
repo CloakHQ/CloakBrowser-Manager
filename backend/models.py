@@ -76,6 +76,10 @@ class TagResponse(BaseModel):
     color: str | None = None
 
 
+class ReorderRequest(BaseModel):
+    ordered_ids: list[str]
+
+
 class ProfileResponse(BaseModel):
     id: str
     name: str
@@ -106,6 +110,7 @@ class ProfileResponse(BaseModel):
     user_data_dir: str
     created_at: str
     updated_at: str
+    sort_order: int = 0
     tags: list[TagResponse] = Field(default_factory=list)
     status: str = "stopped"
     runtime_mode: RuntimeMode = "docker"

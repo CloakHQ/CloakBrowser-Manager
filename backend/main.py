@@ -42,6 +42,7 @@ from .models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ReorderRequest,
     SettingsResponse,
     SettingsUpdate,
     StatusResponse,
@@ -544,6 +545,12 @@ async def create_profile(req: ProfileCreate):
     else:
         data["tags"] = []
     return _profile_response(db.create_profile(**data))
+
+
+@app.post("/api/profiles/reorder")
+async def reorder_profiles(req: ReorderRequest):
+    db.reorder_profiles(req.ordered_ids)
+    return {"ok": True}
 
 
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)

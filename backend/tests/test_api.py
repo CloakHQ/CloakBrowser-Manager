@@ -82,6 +82,17 @@ def test_get_profile_not_found(app_client: TestClient):
     assert resp.status_code == 404
 
 
+def test_reorder_profiles(app_client: TestClient):
+    a = app_client.post("/api/profiles", json={"name": "A"}).json()["id"]
+    b = app_client.post("/api/profiles", json={"name": "B"}).json()["id"]
+    c = app_client.post("/api/profiles", json={"name": "C"}).json()["id"]
+    resp = app_client.post("/api/profiles/reorder", json={"ordered_ids": [a, b, c]})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    names = [p["name"] for p in app_client.get("/api/profiles").json()]
+    assert names == ["A", "B", "C"]
+
+
 def test_update_profile(app_client: TestClient):
     create = app_client.post("/api/profiles", json={"name": "Original"})
     pid = create.json()["id"]

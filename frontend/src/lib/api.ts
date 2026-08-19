@@ -30,6 +30,7 @@ export interface Profile {
   user_data_dir: string;
   created_at: string;
   updated_at: string;
+  sort_order: number;
   tags: { tag: string; color: string | null }[];
   status: "running" | "stopped" | "initializing";
   runtime_mode: RuntimeMode;
@@ -143,6 +144,12 @@ export const api = {
     request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
 
   listProfiles: () => request<Profile[]>("/api/profiles"),
+
+  reorderProfiles: (ids: string[]) =>
+    request<{ ok: boolean }>("/api/profiles/reorder", {
+      method: "POST",
+      body: JSON.stringify({ ordered_ids: ids }),
+    }),
 
   getProfile: (id: string) => request<Profile>(`/api/profiles/${id}`),
 

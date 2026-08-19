@@ -223,6 +223,36 @@ def test_list_profiles_includes_tags(tmp_db: Path):
     assert len(profiles[0]["tags"]) == 1
 
 
+# ── sort_order / reorder ─────────────────────────────────────────────────────
+
+
+def test_create_profile_lands_on_top(tmp_db: Path):
+    a = db.create_profile("A")
+    b = db.create_profile("B")
+    # Newest sits on top via the smallest sort_order.
+    assert b["sort_order"] < a["sort_order"]
+    assert [p["name"] for p in db.list_profiles()] == ["B", "A"]
+
+
+def test_reorder_profiles_persists_order(tmp_db: Path):
+    a = db.create_profile("A")
+    b = db.create_profile("B")
+    c = db.create_profile("C")
+    db.reorder_profiles([a["id"], b["id"], c["id"]])
+    profiles = db.list_profiles()
+    assert [p["name"] for p in profiles] == ["A", "B", "C"]
+    assert [p["sort_order"] for p in profiles] == [0, 1, 2]
+
+
+def test_reorder_then_create_lands_on_top(tmp_db: Path):
+    a = db.create_profile("A")
+    b = db.create_profile("B")
+    db.reorder_profiles([a["id"], b["id"]])  # A=0, B=1
+    d = db.create_profile("D")  # min-1 => -1, so on top
+    assert d["sort_order"] == -1
+    assert [p["name"] for p in db.list_profiles()] == ["D", "A", "B"]
+
+
 # ── update_profile ───────────────────────────────────────────────────────────
 
 
