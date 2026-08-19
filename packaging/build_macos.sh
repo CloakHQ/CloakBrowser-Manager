@@ -42,6 +42,18 @@ fi
 "$BUILD_VENV/bin/python" -m pip install --disable-pip-version-check -q \
   -r backend/requirements.txt -r packaging/requirements-build.txt
 
+# 2a. Pin cryptography to the self-contained universal2 wheel (static OpenSSL).
+# The newest cryptography ships no single-arch macOS wheel, so on the Intel
+# runner pip source-builds it against Homebrew's openssl@3 and PyInstaller then
+# bundles that libssl.3.dylib — which mismatches the extension and makes the
+# frozen app die at launch: `dlopen(_rust.abi3.so): Symbol not found:
+# _SSL_get0_group_name`. The universal2 wheel statically links OpenSSL (no
+# external libssl) and is fat, so BOTH arches get an identical static extension
+# and the later lipo merge is a no-op. --force-reinstall replaces whatever the
+# requirements step resolved; --only-binary forbids a source build.
+"$BUILD_VENV/bin/python" -m pip install --disable-pip-version-check -q \
+  --force-reinstall --no-deps --only-binary=:all: 'cryptography>=44,<49'
+
 # 3. Freeze.
 echo "[build] pyinstaller"
 rm -rf "$DIST" "$BUILD"
@@ -51,6 +63,17 @@ rm -rf "$DIST" "$BUILD"
 
 APP="$DIST/$APP_NAME.app"
 [ -d "$APP" ] || { echo "[error] $APP not produced"; exit 1; }
+
+# 3a. Guard: the frozen cryptography extension must NOT link an external libssl.
+# That dependency is the launch-crash bug (a dynamically-linked, source-built
+# cryptography leaking Homebrew's OpenSSL into the bundle). Step 2a prevents it;
+# fail loud here if it ever regresses instead of shipping a broken .dmg.
+RUST_SO="$(find "$APP/Contents" -path '*cryptography*' -name '_rust.abi3.so' | head -1)"
+if [ -n "$RUST_SO" ] && otool -L "$RUST_SO" | grep -q 'libssl'; then
+  echo "[error] cryptography _rust.abi3.so links external libssl — dynamic OpenSSL leaked into the bundle:"
+  otool -L "$RUST_SO" | grep -iE 'ssl|crypto'
+  exit 1
+fi
 
 # 4. Codesign (hardened runtime) if an identity is provided.
 #    Sign inside-out: every nested Mach-O first, then the bundle. `--deep` is
