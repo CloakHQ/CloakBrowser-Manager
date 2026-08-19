@@ -2,11 +2,11 @@
 <img src="https://i.imgur.com/cqkp6fG.png" width="500" alt="CloakBrowser">
 </p>
 
-<h3 align="center">Run a hundred accounts like a hundred real people.</h3>
+<h3 align="center">Browser Profile Manager for CloakBrowser</h3>
 
 <p align="center">
-A self-hosted browser for managing unlimited accounts, each one a genuinely separate machine:<br>
-its own fingerprint, GPU, proxy, cookies, and history.<br>
+A self-hosted browser for managing unlimited accounts and profiles,<br>
+each one a genuinely separate machine: its own fingerprint, GPU, proxy, cookies, and history.<br>
 Powered by CloakBrowser, the stealth engine that passes Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS and BrowserScan.<br>
 The identities don't just look different. They hold up.
 </p>
