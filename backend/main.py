@@ -668,6 +668,21 @@ async def reset_profile(profile_id: str):
     return _profile_response(updated)
 
 
+@app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
+async def duplicate_profile(profile_id: str):
+    """Clone a profile's config into a new profile (name suffixed ' (copy)').
+
+    Config-only: settings, tags, notes and the same fingerprint seed are copied,
+    but no browser state — the clone gets a fresh, empty user_data_dir.
+    """
+    if not db.get_profile(profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    clone = db.duplicate_profile(profile_id)
+    if not clone:
+        raise HTTPException(status_code=500, detail="Failed to duplicate profile")
+    return _profile_response(clone)
+
+
 # ── Launch / Stop ─────────────────────────────────────────────────────────────
 
 

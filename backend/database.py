@@ -302,3 +302,28 @@ def reset_profile(profile_id: str) -> dict[str, Any] | None:
         )
         conn.commit()
     return get_profile(profile_id)
+
+
+def duplicate_profile(profile_id: str) -> dict[str, Any] | None:
+    """Clone a profile's config into a brand-new profile. Returns it or None.
+
+    Config-only clone: every setting, the tags, notes, and the SAME
+    fingerprint_seed are carried over, but no on-disk browser state is copied.
+    create_profile mints a fresh uuid, user_data_dir and sort_order, so the
+    clone launches with an empty profile dir built fresh on first use.
+    """
+    src = get_profile(profile_id)
+    if src is None:
+        return None
+    fields = {
+        key: value
+        for key, value in src.items()
+        if key not in {"id", "name", "fingerprint_seed", "tags",
+                       "user_data_dir", "created_at", "updated_at", "sort_order"}
+    }
+    return create_profile(
+        name=f"{src['name']} (copy)",
+        fingerprint_seed=src["fingerprint_seed"],
+        tags=src.get("tags"),
+        **fields,
+    )

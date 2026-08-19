@@ -123,5 +123,20 @@ export function useProfiles() {
     [refresh],
   );
 
-  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset };
+  // Clone a profile's config into a new profile (same settings + fingerprint,
+  // fresh browser state). Returns the clone so the caller can select it.
+  const duplicate = useCallback(
+    async (id: string): Promise<Profile | undefined> => {
+      try {
+        const profile = await api.duplicateProfile(id);
+        setProfiles((prev) => [profile, ...prev]);
+        return profile;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to duplicate profile");
+      }
+    },
+    [],
+  );
+
+  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, duplicate };
 }

@@ -1,4 +1,4 @@
-import { Check, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, Copy, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
@@ -16,6 +16,7 @@ interface ProfileFormProps {
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
   onReset?: () => Promise<void>;
+  onDuplicate?: () => Promise<void>;
   onCancel: () => void;
 }
 
@@ -39,7 +40,7 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onDuplicate, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -68,6 +69,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resetDone, setResetDone] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -182,6 +184,23 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     }
   };
 
+  const handleDuplicate = async () => {
+    if (!onDuplicate) return;
+    if (
+      !confirm(
+        "Duplicate this profile? A new profile with the same settings and " +
+          "fingerprint is created. Browser state (cookies, history) is not copied.",
+      )
+    )
+      return;
+    setDuplicating(true);
+    try {
+      await onDuplicate();
+    } finally {
+      setDuplicating(false);
+    }
+  };
+
   const randomizeSeed = () => {
     set("fingerprint_seed", Math.floor(Math.random() * 90000) + 10000);
   };
@@ -232,6 +251,17 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
           <h2 className="text-lg font-semibold">
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
+          {isEdit && onDuplicate && (
+            <button
+              type="button"
+              onClick={handleDuplicate}
+              disabled={duplicating}
+              className="btn-secondary flex items-center gap-1.5"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
+            </button>
+          )}
           {isEdit && onReset && (
             <button
               type="button"
