@@ -2,11 +2,18 @@
 <img src="https://i.imgur.com/cqkp6fG.png" width="500" alt="CloakBrowser">
 </p>
 
-<h3 align="center">Browser Profile Manager for CloakBrowser</h3>
+<h3 align="center">Run a hundred accounts like a hundred real people.</h3>
 
 <p align="center">
-Create, manage, and launch isolated browser profiles with unique fingerprints.<br>
-Free, self-hosted alternative to Multilogin, GoLogin, and AdsPower.
+A self-hosted browser for managing unlimited accounts, each one a genuinely separate machine:<br>
+its own fingerprint, GPU, proxy, cookies, and history.<br>
+Powered by CloakBrowser, the stealth engine that passes Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS and BrowserScan.<br>
+The identities don't just look different. They hold up.
+</p>
+
+<p align="center">
+Self-hosted alternative to Multilogin, GoLogin, and AdsPower.<br>
+Start free with one concurrent browser, scale to more on a paid plan.
 </p>
 
 <p align="center">
@@ -18,18 +25,18 @@ Free, self-hosted alternative to Multilogin, GoLogin, and AdsPower.
 ---
 
 <p align="center">
-<img src="https://i.imgur.com/twdX81Q.png" width="800" alt="CloakBrowser Manager — Browser View">
-<br>
-<img src="https://i.imgur.com/XFYn1qY.png" width="800" alt="CloakBrowser Manager — Profile Settings">
+<img src="https://raw.githubusercontent.com/CloakHQ/CloakBrowser-Manager/main/assets/manager-macos.png" width="800" alt="CloakBrowser Manager on macOS">
 </p>
 
-Each profile is an isolated CloakBrowser instance with its own fingerprint, proxy, cookies, and session data. Profiles persist across restarts. Windows and macOS launch browsers directly in native desktop windows; Linux keeps the Docker/KasmVNC server experience.
+Open a profile and you don't get a new tab, you get a different computer: its own browser fingerprint, GPU, screen, timezone, proxy, cookies, and history. Nothing bleeds between profiles, so your accounts never link back to each other, or to you. Close a profile and reopen it next day, it's the same person, warmed up and ready.
+
+Windows and macOS launch browsers directly in native desktop windows; Linux keeps the Docker/KasmVNC server experience.
 
 ### Windows and macOS
 
 Download the installer from the [latest release](https://github.com/CloakHQ/CloakBrowser-Manager/releases) and run it:
 
-- **macOS** — open the `.dmg` and drag **CloakBrowser Manager** into Applications, then launch it.
+- **macOS** — open the `.dmg` and drag **CloakBrowser Manager** into Applications. (Unsigned during early access — on first launch, run `xattr -rc "/Applications/CloakBrowser Manager.app"` in Terminal, or approve it under **System Settings → Privacy & Security → Open Anyway**.)
 - **Windows** — run the setup `.exe`. (Unsigned during early access — if SmartScreen warns, click **More info → Run anyway**.)
 
 No Python, Node, or git required. The Manager starts on `127.0.0.1:8080` and opens in your default browser. On first launch it downloads the CloakBrowser engine. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
@@ -66,9 +73,11 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 
 ## CloakBrowser license key
 
-[Get a free key with GitHub](https://cloakbrowser.dev/free) to use the current CloakBrowser build with one concurrent browser session. Paid plans at [cloakbrowser.dev](https://cloakbrowser.dev) let you run more profiles at once.
+The Manager runs on the CloakBrowser engine, so it needs a key.<br>
+[Get a free one with GitHub](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
+[Paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time, from a handful to thousands.
 
-Without a key, the Manager uses the older keyless build. Add your key once and every profile will use it. The key is set per Manager instance, not per profile.
+Add your key once and every profile uses it.
 
 **Native app (Windows/macOS):** open **Settings** (gear icon, top right), paste your key, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
 
@@ -86,34 +95,38 @@ CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
 
 The file is loaded automatically at startup. Restart the Manager after changing it. With Docker, you can also pass the key with `-e CLOAKBROWSER_LICENSE_KEY=...`. An environment variable overrides the in-app setting.
 
-## Why Not Just Use a VPN?
+## Why Not a Cloud Anti-Detect Browser?
 
-A VPN changes your IP, while Incognito and standard Chrome profiles mainly separate local browsing data. They still expose the same underlying browser and hardware signals.
+The popular anti-detect browsers solve the fingerprint, then hand you a new problem: every account you own, every cookie, every session, sits on someone else's servers. And the disguise increasingly doesn't survive real detection, shortcuts in how fingerprints are faked, GPU and WebGL values that don't add up, identities that pass a test page and fail the real site.
 
-CloakBrowser Manager gives every profile a persistent, seeded browser identity alongside its own proxy, cookies, storage, and history.
+CloakBrowser Manager runs on your own machine, and every profile inherits the CloakBrowser engine, so the identities actually hold up.
 
-| Solution | What it isolates | Browser fingerprint isolation |
+| | Typical cloud anti-detect browser | **CloakBrowser Manager** |
 |---|---|---|
-| VPN | IP address | No |
-| Incognito | Temporary cookies and storage | No |
-| Chrome profiles | Cookies, history, and bookmarks | No |
-| **CloakBrowser Manager** | **Profile data, network settings, and browser identity** | **Yes — per-profile identity** |
+| Pricing model | Per profile + per seat, forced up-tiering | **Flat by concurrency, unlimited profiles** |
+| Where profiles live | Their cloud | **Your machine** |
+| Fingerprinting | JS-injected into a stock browser | **Source-level C++ patched engine** |
+| The app | Closed box | **Open-source GUI (MIT)** |
+| Native desktop windows | Rare | **Windows + macOS** |
+| Automation API | Add-on / higher tier | **CDP built in, every profile** |
+| Cost of idle accounts | Counts against your limit | **Free** |
 
 ## Features
 
+- **Unlimited profiles, no per-profile tax** — create as many identities as you want. You pay only for how many run at the same time, not how many you keep. Dormant accounts cost nothing.
+- **Each profile is a different machine** — its own fingerprint seed, GPU family, screen, cookies, localStorage, cache, and history, persistent across restarts
+- **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
+- **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
-- **Persistent identities** — each profile keeps its fingerprint seed, cookies, localStorage, cache, and browsing history
-- **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen controls
-- **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families
-- **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
-- **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
-- **Clipboard sync** — copy and paste between the Manager and Linux VNC browser profiles
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
 - **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
 - **Playwright/Puppeteer API** — connect to any running profile through CDP while watching the same session live
+- **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
+- **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
+- **Clipboard sync** — copy and paste between the Manager and Linux VNC browser profiles
 - **License and system status** — see the active tier, binary version, and Windows font health in the top bar
 - **Optional authentication** — protect the web UI and API with a single token, or run locally without authentication
-- **Powered by CloakBrowser** — 71 source-level C++ patches, tested against Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS, and BrowserScan
+- **Powered by CloakBrowser** — the identities don't just look different, they hold up: a source-level C++ patched Chromium engine tested against Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS, and BrowserScan
 
 ## Stack
 
