@@ -290,6 +290,7 @@ class BrowserManager:
         self.release_channel = release_channel
         # Resolved at startup by resolve_binary_status(); read by GET /api/status.
         self.license_tier = "keyless"
+        self.license_plan: str | None = None
         self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
@@ -331,6 +332,7 @@ class BrowserManager:
                 logger.warning("License validation failed: %s", exc)
             if info and info.valid:
                 tier = "free" if info.plan == "free" else "pro"
+                self.license_plan = info.plan
                 try:
                     version = get_pro_latest_version(self.release_channel) or keyless_version
                 except Exception as exc:
@@ -347,12 +349,28 @@ class BrowserManager:
             logger.info("Binary ready: tier=%s version=%s", tier, version)
         except Exception as exc:
             logger.error(
-                "Binary pre-download failed (keyless fallback remains): %s", exc
+                "Binary pre-download failed (keyless fallback remains): %s",
+                exc,
+                exc_info=True,
             )
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
         profile_id = profile["id"]
+
+        # Per-launch context so any launch failure carries the inputs that
+        # produced it. Proxy credentials are redacted; never log the key.
+        from . import diagnostics
+
+        logger.info(
+            "Launching profile %s: seed=%s proxy=%s tier=%s plan=%s runtime=%s",
+            profile_id,
+            profile.get("fingerprint_seed"),
+            diagnostics.redact_proxy(profile.get("proxy")),
+            self.license_tier,
+            self.license_plan or "-",
+            self.runtime.runtime_mode,
+        )
 
         async with self._lock:
             if profile_id in self.running or profile_id in self._launching:

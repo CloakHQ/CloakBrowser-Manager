@@ -80,6 +80,17 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
+# Diagnostics: snapshot the raw stream encoding (before app_entry reconfigures
+# it), route uncaught exceptions from every thread to the file log with a full
+# traceback, and mirror the wrapper's direct-to-stderr output into the log. This
+# runs at import so it covers both the native (app_entry) and Docker (uvicorn)
+# entry paths; the startup fingerprint + asyncio handler are added in lifespan.
+from . import diagnostics  # noqa: E402
+
+diagnostics.capture_stream_state()
+diagnostics.install_crash_hooks(logger)
+diagnostics.install_stderr_tee()
+
 # Optional authentication via AUTH_TOKEN env var.
 # If not set, all routes are open (local dev). If set, all /api/* routes
 # (except /api/auth/status, /api/auth/login and /api/health) require Bearer
@@ -468,6 +479,8 @@ async def lifespan(app: FastAPI):
     # Resolve tier + pre-download the (Pro) binary before serving launches, so the
     # download never blocks a launch or auto-launch's 60s timeout.
     await asyncio.to_thread(browser_mgr.resolve_binary_status)
+    diagnostics.install_asyncio_handler(asyncio.get_running_loop(), logger)
+    logger.info(diagnostics.startup_line(browser_mgr))
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
     logger.info("CloakBrowser Manager started")
     yield
@@ -699,7 +712,9 @@ async def launch_profile(profile_id: str):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        logger.error("Failed to launch profile %s: %s", profile_id, exc)
+        logger.error(
+            "Failed to launch profile %s: %s", profile_id, exc, exc_info=True
+        )
         raise HTTPException(status_code=500, detail="Failed to launch browser")
 
     return LaunchResponse(

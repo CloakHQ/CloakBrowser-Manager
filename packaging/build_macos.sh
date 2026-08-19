@@ -23,6 +23,10 @@ BUILD_VENV="${PACKAGING_VENV:-$ROOT/.venv-build}"
 
 echo "[build] CloakBrowser Manager $VERSION (macOS)"
 
+# Bake the version into the bundle so the frozen app can log its own build
+# (no .git at runtime). manager.spec ships backend/version.txt as data.
+printf '%s' "$VERSION" > "$ROOT/backend/version.txt"
+
 # 1. Build the React frontend (embedded into the app as data).
 echo "[build] frontend"
 ( cd frontend && npm ci && npm run build )

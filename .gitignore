@@ -33,3 +33,4 @@ CLAUDE.md
 publish-docker.sh
 .beads
 debug
+backend/version.txt

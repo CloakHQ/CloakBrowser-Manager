@@ -282,6 +282,15 @@ def _harden_std_streams() -> None:
     """
     import sys
 
+    # Snapshot the real encoding BEFORE reconfiguring, so the startup
+    # fingerprint records the cp1252/strict that actually crashes, not "replace".
+    try:
+        from backend import diagnostics
+
+        diagnostics.capture_stream_state()
+    except Exception:
+        pass
+
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:

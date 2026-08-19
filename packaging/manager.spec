@@ -36,6 +36,12 @@ if not (frontend_dist / "index.html").exists():
     )
 datas.append((str(frontend_dist), "frontend/dist"))
 
+# Baked build version (build_macos.sh / build_windows.ps1 write it) so the
+# frozen app can report its own version — there is no .git at runtime.
+version_file = ROOT / "backend" / "version.txt"
+if version_file.exists():
+    datas.append((str(version_file), "backend"))
+
 # Our own backend package (main.py lazy-imports several cloakbrowser modules).
 hiddenimports += collect_submodules("backend")
 

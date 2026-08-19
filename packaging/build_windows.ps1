@@ -30,6 +30,10 @@ $BuildVenv = if ($env:PACKAGING_VENV) { $env:PACKAGING_VENV } else { Join-Path $
 
 Write-Host "[build] CloakBrowser Manager $Version (Windows)"
 
+# Bake the version into the bundle so the frozen app can log its own build
+# (no .git at runtime). manager.spec ships backend/version.txt as data.
+[IO.File]::WriteAllText((Join-Path $Root "backend/version.txt"), $Version)
+
 # 1. Frontend.
 Write-Host "[build] frontend"
 Push-Location (Join-Path $Root "frontend")
