@@ -55,6 +55,49 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing port: {url}")
 
 
+async def test_proxy(raw_proxy: str) -> dict[str, Any]:
+    """Connect through a proxy, return exit IP + geo + latency (or an error).
+
+    Reuses the same normalize/validate as launch, then resolves the exit IP
+    via cloakbrowser's geoip echo services. Blocking work runs off-thread.
+    """
+    proxy = _normalize_proxy(raw_proxy)
+    _validate_proxy(proxy)  # raises ValueError on bad format -> 400 in the route
+    return await asyncio.to_thread(_test_proxy_sync, proxy)
+
+
+def _test_proxy_sync(proxy: str) -> dict[str, Any]:
+    from cloakbrowser.geoip import _ensure_geoip_db, resolve_proxy_exit_ip
+
+    t0 = time.monotonic()
+    try:
+        ip = resolve_proxy_exit_ip(proxy)
+    except Exception as exc:  # SOCKS w/o socksio, connection refused, etc.
+        logger.warning("Proxy test failed: %s", exc)
+        return {"ok": False, "error": "Could not connect through proxy"}
+    latency_ms = round((time.monotonic() - t0) * 1000)
+    if not ip:
+        return {"ok": False, "error": "Proxy did not return an exit IP (timeout or blocked)"}
+    country = city = timezone = None
+    try:  # geo is best-effort; never fails the test
+        import geoip2.database
+
+        with geoip2.database.Reader(_ensure_geoip_db()) as reader:
+            resp = reader.city(ip)
+            country, city = resp.country.iso_code, resp.city.name
+            timezone = resp.location.time_zone
+    except Exception as exc:
+        logger.debug("Proxy test geo lookup failed for %s: %s", ip, exc)
+    return {
+        "ok": True,
+        "ip": ip,
+        "country": country,
+        "city": city,
+        "timezone": timezone,
+        "latency_ms": latency_ms,
+    }
+
+
 def _init_profile_defaults(user_data_dir: Path) -> None:
     """Set up bookmarks and DuckDuckGo search on first launch."""
     default_dir = user_data_dir / "Default"

@@ -33,7 +33,7 @@ from .env_file import load_env_file
 load_env_file()
 
 from . import database as db
-from .browser_manager import BrowserManager, SCREENSHOT_FILENAME
+from .browser_manager import BrowserManager, SCREENSHOT_FILENAME, test_proxy
 from .models import (
     ClipboardRequest,
     LaunchResponse,
@@ -42,6 +42,8 @@ from .models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ProxyTestRequest,
+    ProxyTestResponse,
     ReorderRequest,
     SettingsResponse,
     SettingsUpdate,
@@ -534,6 +536,15 @@ def _profile_response(profile: dict) -> ProfileResponse:
 @app.get("/api/profiles", response_model=list[ProfileResponse])
 async def list_profiles():
     return [_profile_response(profile) for profile in db.list_profiles()]
+
+
+@app.post("/api/profiles/test-proxy", response_model=ProxyTestResponse)
+async def test_proxy_endpoint(req: ProxyTestRequest):
+    """Connect through a proxy and report exit IP + geo + latency."""
+    try:
+        return await test_proxy(req.proxy)
+    except ValueError as exc:  # bad proxy format from _validate_proxy
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)

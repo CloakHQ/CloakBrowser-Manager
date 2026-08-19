@@ -74,6 +74,16 @@ export interface LaunchResult {
   cdp_url: string | null;
 }
 
+export interface ProxyTestResult {
+  ok: boolean;
+  ip?: string | null;
+  country?: string | null;
+  city?: string | null;
+  timezone?: string | null;
+  latency_ms?: number | null;
+  error?: string | null;
+}
+
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
@@ -98,7 +108,7 @@ export interface SettingsUpdate {
   release_channel?: string | null;
 }
 
-class ApiError extends Error {
+export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
@@ -159,6 +169,12 @@ export const api = {
     request<Profile>("/api/profiles", {
       method: "POST",
       body: JSON.stringify(data),
+    }),
+
+  testProxy: (proxy: string) =>
+    request<ProxyTestResult>("/api/profiles/test-proxy", {
+      method: "POST",
+      body: JSON.stringify({ proxy }),
     }),
 
   updateProfile: (id: string, data: Partial<ProfileCreateData>) =>

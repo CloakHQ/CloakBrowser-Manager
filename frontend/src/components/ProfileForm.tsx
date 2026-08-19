@@ -1,6 +1,13 @@
-import { Check, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { HostOS, Profile, ProfileCreateData, ViewerMode } from "../lib/api";
+import { api, ApiError } from "../lib/api";
+import type {
+  HostOS,
+  Profile,
+  ProfileCreateData,
+  ProxyTestResult,
+  ViewerMode,
+} from "../lib/api";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
@@ -61,6 +68,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resetDone, setResetDone] = useState(false);
+  const [testingProxy, setTestingProxy] = useState(false);
+  const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -111,6 +120,21 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
   const set = <K extends keyof ProfileCreateData>(key: K, value: ProfileCreateData[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleTestProxy = async () => {
+    if (!form.proxy) return;
+    setProxyTest(null);
+    setTestingProxy(true);
+    try {
+      setProxyTest(await api.testProxy(form.proxy));
+    } catch (err) {
+      const message =
+        err instanceof ApiError ? err.message : "Proxy test failed";
+      setProxyTest({ ok: false, error: message });
+    } finally {
+      setTestingProxy(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -322,12 +346,39 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
           <div className="space-y-3">
             <div>
               <label className="label">Proxy</label>
-              <input
-                className="input"
-                value={form.proxy ?? ""}
-                onChange={(e) => set("proxy", e.target.value || null)}
-                placeholder="http://user:pass@host:port"
-              />
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1"
+                  value={form.proxy ?? ""}
+                  onChange={(e) => {
+                    set("proxy", e.target.value || null);
+                    setProxyTest(null);
+                  }}
+                  placeholder="http://user:pass@host:port"
+                />
+                <button
+                  type="button"
+                  className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                  onClick={handleTestProxy}
+                  disabled={!form.proxy || testingProxy}
+                >
+                  {testingProxy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Test
+                </button>
+              </div>
+              {proxyTest && !testingProxy && (
+                <p
+                  className={`text-xs mt-1 ${proxyTest.ok ? "text-emerald-400" : "text-red-400"}`}
+                >
+                  {proxyTest.ok
+                    ? `✓ ${proxyTest.ip}` +
+                      (proxyTest.city || proxyTest.country
+                        ? ` · ${[proxyTest.city, proxyTest.country].filter(Boolean).join(", ")}`
+                        : "") +
+                      (proxyTest.latency_ms != null ? ` · ${proxyTest.latency_ms}ms` : "")
+                    : proxyTest.error || "Proxy test failed"}
+                </p>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>

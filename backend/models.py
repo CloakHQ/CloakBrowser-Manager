@@ -170,5 +170,20 @@ class ClipboardRequest(BaseModel):
     text: str = Field(max_length=1_048_576)
 
 
+class ProxyTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    proxy: str = Field(min_length=1, max_length=512)
+
+
+class ProxyTestResponse(BaseModel):
+    ok: bool
+    ip: str | None = None
+    country: str | None = None
+    city: str | None = None
+    timezone: str | None = None
+    latency_ms: int | None = None
+    error: str | None = None
+
+
 class LoginRequest(BaseModel):
     token: str
