@@ -1,5 +1,5 @@
-import { RotateCcw, Save, Trash2, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Check, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { HostOS, Profile, ProfileCreateData, ViewerMode } from "../lib/api";
 
 interface ProfileFormProps {
@@ -53,8 +53,17 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   });
 
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [resetDone, setResetDone] = useState(false);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => () => {
+    clearTimeout(savedTimer.current);
+    clearTimeout(resetTimer.current);
+  }, []);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [extensionPathInput, setExtensionPathInput] = useState("");
@@ -103,6 +112,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     setSaving(true);
     try {
       await onSave(form);
+      setSaved(true);
+      clearTimeout(savedTimer.current);
+      savedTimer.current = setTimeout(() => setSaved(false), 1500);
     } finally {
       setSaving(false);
     }
@@ -131,6 +143,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     setResetting(true);
     try {
       await onReset();
+      setResetDone(true);
+      clearTimeout(resetTimer.current);
+      resetTimer.current = setTimeout(() => setResetDone(false), 1500);
     } finally {
       setResetting(false);
     }
@@ -190,11 +205,11 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             <button
               type="button"
               onClick={handleReset}
-              disabled={resetting}
+              disabled={resetting || resetDone}
               className="btn-secondary flex items-center gap-1.5"
             >
-              <RotateCcw className="h-3.5 w-3.5" />
-              <span>{resetting ? "Resetting..." : "Reset"}</span>
+              {resetDone ? <Check className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" />}
+              <span>{resetDone ? "Reset done" : resetting ? "Resetting..." : "Reset"}</span>
             </button>
           )}
           {isEdit && onDelete && (
@@ -213,9 +228,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
           <button type="button" onClick={onCancel} className="btn-secondary">
             Cancel
           </button>
-          <button type="submit" disabled={saving} className="btn-primary flex items-center gap-1.5">
-            <Save className="h-3.5 w-3.5" />
-            <span>{saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
+          <button type="submit" disabled={saving || saved} className="btn-primary flex items-center gap-1.5">
+            {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
+            <span>{saved ? "Saved" : saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
           </button>
         </div>
       </div>
