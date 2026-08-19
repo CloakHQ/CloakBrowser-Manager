@@ -406,6 +406,10 @@ class BrowserManager:
             extra_args = self._build_fingerprint_args(profile)
             extra_args += user_launch_args
             extra_args.append("--remote-debugging-address=127.0.0.1")
+            # Reopen the tabs the user had open when the profile was last stopped.
+            # Chrome's persistent session is saved on disk but only restored when told to.
+            if profile.get("restore_session", True):
+                extra_args.append("--restore-last-session")
 
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None

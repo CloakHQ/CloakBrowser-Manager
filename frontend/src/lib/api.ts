@@ -27,6 +27,7 @@ export interface Profile {
   allow_3p_cookies: boolean;
   set_google_default: boolean;
   capture_preview: boolean;
+  restore_session: boolean;
   notes: string | null;
   user_data_dir: string;
   created_at: string;
@@ -60,6 +61,7 @@ export interface ProfileCreateData {
   allow_3p_cookies?: boolean;
   set_google_default?: boolean;
   capture_preview?: boolean;
+  restore_session?: boolean;
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }

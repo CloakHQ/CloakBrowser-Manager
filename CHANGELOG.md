@@ -4,6 +4,20 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-08-19
+
+### Added
+- **Restore previous tabs on launch.** Each profile can reopen the tabs that were open when it was last stopped. Enabled by default; toggle it off per profile in the Behavior section.
+- **Clone / duplicate a profile.** Copy an existing profile's full configuration and fingerprint into a fresh profile with its own `user_data_dir`, ready to launch independently.
+- **Proxy test button.** Test a profile's proxy from the form and see the exit IP, geolocation, and latency before launching.
+- **Last-browser-screenshot preview.** The profile shows a preview image captured from its last browser session.
+- **Drag-and-drop reordering** of the profile list.
+- **Profile reset.** Wipe a profile's browser state and re-roll its fingerprint in one action.
+- **Transient confirmation on form buttons.** Save and Reset now show an inline "Saved" / "Reset done" confirmation.
+
+### Changed
+- README: restored the "Browser Profile Manager" headline and tightened the tagline.
+
 ## [0.1.0] - 2026-08-19
 
 ### Added

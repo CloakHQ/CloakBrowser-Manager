@@ -31,6 +31,7 @@ class ProfileCreate(BaseModel):
     allow_3p_cookies: bool = True
     set_google_default: bool = True
     capture_preview: bool = True
+    restore_session: bool = True
     notes: str | None = None
     tags: list[TagCreate] | None = None
 
@@ -57,6 +58,7 @@ class ProfileUpdate(BaseModel):
     allow_3p_cookies: bool | None = None
     set_google_default: bool | None = None
     capture_preview: bool | None = None
+    restore_session: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
@@ -109,6 +111,7 @@ class ProfileResponse(BaseModel):
     allow_3p_cookies: bool = True
     set_google_default: bool = True
     capture_preview: bool = True
+    restore_session: bool = True
     notes: str | None = None
     user_data_dir: str
     created_at: str

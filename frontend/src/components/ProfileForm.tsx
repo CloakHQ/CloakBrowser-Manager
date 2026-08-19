@@ -56,6 +56,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     allow_3p_cookies: true,
     set_google_default: true,
     capture_preview: true,
+    restore_session: true,
     extension_paths: [],
     launch_args: [],
     tags: [],
@@ -104,6 +105,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         allow_3p_cookies: profile.allow_3p_cookies,
         set_google_default: profile.set_google_default,
         capture_preview: profile.capture_preview,
+        restore_session: profile.restore_session,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
@@ -574,6 +576,20 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 Save a preview screenshot of the browser
                 <span className="block text-xs text-gray-500">
                   Captures the page periodically while running, shown here after the profile stops.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.restore_session ?? true}
+                onChange={(e) => set("restore_session", e.target.checked)}
+                className="rounded border-border bg-surface-2 mt-0.5"
+              />
+              <span>
+                Restore previous tabs on launch
+                <span className="block text-xs text-gray-500">
+                  Reopens the tabs that were open when this profile was last stopped.
                 </span>
               </span>
             </label>
