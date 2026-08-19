@@ -110,7 +110,7 @@ _mgr = BrowserManager(DOCKER_RUNTIME)
 def test_build_args_uses_only_current_managed_flags():
     args = _mgr._build_fingerprint_args({})
     assert "--disable-infobars" not in args
-    assert "--test-type" in args
+    assert "--test-type" not in args
     assert "--use-angle=swiftshader" in args
 
 
@@ -157,8 +157,8 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Linux warning suppression, Docker software rendering, and runtime platform.
-    assert len(args) == 3
+    # Docker software rendering + runtime platform.
+    assert len(args) == 2
 
 
 def test_native_build_args_do_not_force_software_gl():

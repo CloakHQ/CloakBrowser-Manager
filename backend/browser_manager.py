@@ -883,9 +883,7 @@ class BrowserManager:
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:
         """Build extra Chromium args from profile fingerprint settings."""
-        # Keep --test-type until the Linux Docker/VNC no-sandbox warning path
-        # is verified without it. Playwright already supplies --disable-infobars.
-        args: list[str] = ["--test-type"]
+        args: list[str] = []
         if self.runtime.viewer_mode == "vnc":
             args.append("--use-angle=swiftshader")
 

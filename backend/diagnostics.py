@@ -86,6 +86,21 @@ def app_version() -> str:
     return "unknown"
 
 
+def wrapper_version() -> str:
+    """Version of the cloakbrowser wrapper package (drives download/launch)."""
+    try:
+        from importlib.metadata import version
+
+        return version("cloakbrowser")
+    except Exception:
+        try:
+            from cloakbrowser._version import __version__
+
+            return __version__
+        except Exception:
+            return "unknown"
+
+
 def redact_proxy(url: str | None) -> str:
     """Proxy string with any user:pass stripped — never log credentials."""
     if not url:
@@ -114,6 +129,7 @@ def startup_line(browser_mgr) -> str:
         f"host_os={getattr(rt, 'host_os', '?')} data_dir={data_dir} | "
         f"tier={getattr(browser_mgr, 'license_tier', '?')} "
         f"plan={getattr(browser_mgr, 'license_plan', None) or '-'} "
+        f"wrapper={wrapper_version()} "
         f"binary={getattr(browser_mgr, 'binary_version', None) or '?'}"
     )
 
