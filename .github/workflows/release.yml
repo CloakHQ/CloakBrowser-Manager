@@ -117,30 +117,18 @@ jobs:
             "arm/CloakBrowser Manager.app" \
             "intel/CloakBrowser Manager.app" \
             "dist_native/CloakBrowser Manager.app"
-      - name: Import signing cert into a temp keychain
-        env:
-          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          CERT_PW: ${{ secrets.APPLE_CERT_PASSWORD }}
+      - name: Ad-hoc sign the universal app
+        # We ship UNSIGNED (no Developer ID, no notarization) to keep a personal
+        # certificate name off the public binary — consistent with the ad-hoc
+        # signed Chromium engine. But lipo-merging invalidated the per-arch
+        # signatures, and arm64 refuses to launch without at least an ad-hoc
+        # signature, so re-sign ad-hoc (identity "-": no name, no cert). Users
+        # clear the download quarantine on first launch (see README). Switch to a
+        # CloakHQ org Developer ID later to drop that step + notarize.
         run: |
-          KP="$(uuidgen)"
-          echo "KEYCHAIN_PW=$KP" >> "$GITHUB_ENV"
-          KC="$RUNNER_TEMP/build.keychain-db"
-          echo "KEYCHAIN=$KC" >> "$GITHUB_ENV"
-          echo "$CERT_B64" | base64 -d > "$RUNNER_TEMP/cert.p12"
-          security create-keychain -p "$KP" "$KC"
-          security set-keychain-settings -lut 21600 "$KC"
-          security unlock-keychain -p "$KP" "$KC"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PW" \
-            -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" "$KC" >/dev/null
-          security list-keychains -d user -s "$KC" login.keychain-db
-          rm -f "$RUNNER_TEMP/cert.p12"
-          security find-identity -v -p codesigning "$KC" | grep -c "Developer ID Application" | xargs echo "Developer ID identities in keychain:"
-      - name: Sign (inside-out, hardened runtime)
-        env:
-          CB_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
-          KEYCHAIN: ${{ env.KEYCHAIN }}
-        run: bash packaging/sign_macos_app.sh "dist_native/CloakBrowser Manager.app"
+          codesign --force --deep --sign - "dist_native/CloakBrowser Manager.app"
+          codesign -dvv "dist_native/CloakBrowser Manager.app" 2>&1 | grep -i "Signature=adhoc" \
+            && echo "ad-hoc signature OK"
       - name: Build .dmg
         run: |
           APP="dist_native/CloakBrowser Manager.app"
@@ -151,20 +139,6 @@ jobs:
           ln -s /Applications "$STAGE/Applications"
           hdiutil create -volname "CloakBrowser Manager" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
           rm -rf "$STAGE"
-      - name: Notarize + staple
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          xcrun notarytool submit "$DMG" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
-          xcrun stapler staple "$DMG"
-          xcrun stapler staple "dist_native/CloakBrowser Manager.app"
-      - name: Gatekeeper verify
-        run: |
-          spctl -a -vvv --type install "$DMG" || true
-          spctl -a -vvv "dist_native/CloakBrowser Manager.app"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-universal-dmg
@@ -189,6 +163,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           ls -la dist
+          # SHA-256 manifest over the installers (filenames only, for clean `-c`).
+          ( cd dist && sha256sum *-universal.dmg *-setup.exe > SHA256SUMS && cat SHA256SUMS )
           VER="${TAG#v}"
           # Slice this version's section out of CHANGELOG.md (body only, no header).
           awk -v ver="$VER" '/^## \[/{ if ($0 ~ "^## \\["ver"\\]") {f=1; next} else if (f) exit } f' \
@@ -199,11 +175,18 @@ jobs:
           {
             echo
             echo "---"
-            echo "**macOS** — universal \`.dmg\` (Apple Silicon + Intel), signed & notarized. **Windows** — \`.exe\` installer (per-user, unsigned; SmartScreen may prompt). The stealth Chromium binary downloads on first launch."
+            echo
+            echo "**macOS (universal — Apple Silicon + Intel):** not notarized yet, so macOS blocks the first launch. Run \`xattr -rc \"/Applications/CloakBrowser Manager.app\"\` once, or use **System Settings → Privacy & Security → Open Anyway**."
+            echo
+            echo "**Windows:** if SmartScreen warns, click **More info → Run anyway**."
+            echo
+            echo "_The stealth Chromium engine downloads on first launch._"
+            echo
+            echo "_Verify your download against \`SHA256SUMS\` (attached): \`shasum -a 256 -c SHA256SUMS\`._"
           } >> notes.md
           echo "=== release notes ===" && cat notes.md
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "CloakBrowser Manager $TAG" \
             --notes-file notes.md \
-            dist/*-universal.dmg dist/*-setup.exe
+            dist/*-universal.dmg dist/*-setup.exe dist/SHA256SUMS
