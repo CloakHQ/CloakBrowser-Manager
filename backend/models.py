@@ -148,6 +148,13 @@ class StatusResponse(BaseModel):
     windows_fonts_complete: bool | None = None
 
 
+class UpdateCheckResponse(BaseModel):
+    current: str
+    latest: str | None = None
+    update_available: bool = False
+    release_url: str | None = None
+
+
 class SettingsResponse(BaseModel):
     license_key_set: bool
     license_key_masked: str | None = None

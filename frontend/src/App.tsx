@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { Lock, PanelLeftClose, PanelLeft, Settings, Power } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
-import { api, setOnUnauthorized, type ProfileCreateData, type SystemStatus } from "./lib/api";
+import { api, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -9,6 +9,7 @@ import { NativeWindowStatus } from "./components/NativeWindowStatus";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { SystemStatusBadge } from "./components/SystemStatusBadge";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { LoginPage } from "./components/LoginPage";
 
@@ -97,6 +98,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [stopped, setStopped] = useState(false);
 
@@ -114,6 +117,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
   useEffect(() => {
     api.getStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
+    api.checkUpdate().then(setUpdateInfo).catch(() => setUpdateInfo(null));
   }, []);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
@@ -206,13 +210,17 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   }
 
   return (
-    <div className="h-screen flex">
+    <div className="h-screen flex flex-col">
       {settingsOpen && (
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}
           onSaved={setSystemStatus}
         />
       )}
+      {updateInfo?.update_available && !updateDismissed && (
+        <UpdateBanner info={updateInfo} onDismiss={() => setUpdateDismissed(true)} />
+      )}
+      <div className="flex-1 flex min-h-0">
       {/* Sidebar */}
       {sidebarOpen && (
         <div className="w-64 border-r border-border bg-surface-1 flex-shrink-0">
@@ -382,6 +390,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             )
           )}
         </div>
+      </div>
       </div>
     </div>
   );

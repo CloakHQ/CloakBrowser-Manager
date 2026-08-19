@@ -99,6 +99,13 @@ export interface SystemStatus {
   windows_fonts_complete: boolean | null;
 }
 
+export interface UpdateInfo {
+  current: string;
+  latest: string | null;
+  update_available: boolean;
+  release_url: string | null;
+}
+
 export interface ManagerSettings {
   license_key_set: boolean;
   license_key_masked: string | null;
@@ -201,6 +208,14 @@ export const api = {
     request<{ ok: boolean }>(`/api/profiles/${id}/stop`, { method: "POST" }),
 
   getStatus: () => request<SystemStatus>("/api/status"),
+
+  checkUpdate: () => request<UpdateInfo>("/api/update-check"),
+
+  openExternal: (url: string) =>
+    request<{ ok: boolean }>("/api/open-external", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
 
   shutdown: () =>
     request<{ ok: boolean; message?: string }>("/api/shutdown", { method: "POST" }),

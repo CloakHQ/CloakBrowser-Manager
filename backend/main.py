@@ -13,6 +13,8 @@ import os
 import signal
 import struct
 import shutil
+import time
+import webbrowser
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
@@ -49,6 +51,7 @@ from .models import (
     SettingsUpdate,
     StatusResponse,
     TagResponse,
+    UpdateCheckResponse,
 )
 from .runtime import bundle_dir
 from .settings_store import load_settings, save_settings
@@ -808,6 +811,93 @@ async def get_system_status():
         windows_fonts_required=fonts_required,
         windows_fonts_complete=fonts_complete,
     )
+
+
+# ── Update check ─────────────────────────────────────────────────────────────
+
+# Latest Manager release on the public GitHub repo. No auth needed; anonymous
+# GitHub API allows 60 req/hr/IP, so the result is cached to fetch at most once
+# per TTL regardless of how many clients/reloads hit the endpoint.
+_GITHUB_LATEST_RELEASE_URL = (
+    "https://api.github.com/repos/CloakHQ/CloakBrowser-Manager/releases/latest"
+)
+_UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60
+_update_cache: tuple[float, UpdateCheckResponse] | None = None
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    """Normalise 'v0.1.1-1-g367823f' / '0.1.1' → (0, 1, 1). None if unparseable."""
+    core = text.strip().lstrip("v").split("-", 1)[0]
+    if not core:
+        return None
+    try:
+        return tuple(int(part) for part in core.split("."))
+    except ValueError:
+        return None
+
+
+def _version_gt(latest: str, current: str) -> bool:
+    """True if `latest` is a strictly newer semver than `current`."""
+    a, b = _parse_version(latest), _parse_version(current)
+    if a is None or b is None:
+        return False
+    length = max(len(a), len(b))
+    a += (0,) * (length - len(a))
+    b += (0,) * (length - len(b))
+    return a > b
+
+
+async def _fetch_update_status() -> UpdateCheckResponse:
+    current = diagnostics.app_version()
+    result = UpdateCheckResponse(current=current)
+    if current == "unknown":
+        # Dev checkout with no git, or unresolvable build — nothing to compare.
+        return result
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                _GITHUB_LATEST_RELEASE_URL,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        latest = (data.get("tag_name") or "").strip()
+        if latest:
+            result.latest = latest
+            result.release_url = data.get("html_url")
+            result.update_available = _version_gt(latest, current)
+    except Exception as exc:  # network, rate-limit, parse — never fail the request
+        logger.info("Update check skipped (%s)", exc)
+    return result
+
+
+@app.post("/api/open-external")
+async def open_external(payload: dict):
+    """Open an http(s) URL in the host's default browser. The native app runs
+    inside a pywebview/WKWebView window where JS `window.open` is a no-op, so the
+    frontend routes external links through here. The server is local in native
+    mode, so this launches the user's own browser."""
+    url = (payload or {}).get("url", "")
+    if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only http(s) URLs allowed")
+    opened = await asyncio.to_thread(webbrowser.open, url)
+    return {"ok": bool(opened)}
+
+
+@app.get("/api/update-check", response_model=UpdateCheckResponse)
+async def check_for_update():
+    """Report whether a newer Manager release exists on GitHub. Fail-soft +
+    cached (6h) so it never hammers GitHub or errors the caller."""
+    global _update_cache
+    now = time.monotonic()
+    if _update_cache is not None and now - _update_cache[0] < _UPDATE_CACHE_TTL_SECONDS:
+        return _update_cache[1]
+    result = await _fetch_update_status()
+    # Only cache a result that actually reached GitHub — otherwise a transient
+    # outage would pin update_available=false for the full TTL.
+    if result.latest is not None or result.current == "unknown":
+        _update_cache = (now, result)
+    return result
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
