@@ -1,8 +1,9 @@
 name: Release
 
-# Builds the native installers on hosted runners and publishes a GitHub Release:
+# Builds the native installers and Docker image on hosted runners:
 #   - Windows x64  -> Inno Setup -setup.exe (unsigned)
 #   - macOS        -> ONE universal .dmg (arm64 + x86_64), signed + notarized
+#   - Linux Docker -> ONE multi-architecture image (amd64 + arm64)
 #
 # Trigger: push a v* tag (cuts a real release). workflow_dispatch builds the
 # installers without publishing a release (green-light check before tagging).
@@ -21,6 +22,7 @@ permissions:
 env:
   PYTHON_VERSION: "3.12"
   NODE_VERSION: "20"
+  REGISTRY_IMAGE: cloakhq/cloakbrowser-manager
 
 jobs:
   version:
@@ -28,13 +30,17 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - id: v
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             V="$GITHUB_REF_NAME"
+            if [[ ! "$V" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Invalid release tag '$V'; expected canonical vMAJOR.MINOR.PATCH" >&2
+              exit 1
+            fi
           else
             V="$(git describe --tags --always)"
           fi
@@ -45,10 +51,10 @@ jobs:
     needs: version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: "${{ env.PYTHON_VERSION }}" }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: "${{ env.NODE_VERSION }}" }
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
@@ -56,7 +62,7 @@ jobs:
         env:
           CB_VERSION: ${{ needs.version.outputs.version }}
         run: powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-setup
           path: dist_native/*-setup.exe
@@ -76,12 +82,12 @@ jobs:
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: "${{ env.PYTHON_VERSION }}" }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: "${{ env.NODE_VERSION }}" }
       - name: Build unsigned .app
         run: bash packaging/build_macos.sh   # no CB_SIGN_IDENTITY -> unsigned
@@ -89,7 +95,7 @@ jobs:
         run: lipo -archs "dist_native/CloakBrowser Manager.app/Contents/MacOS/CloakBrowser Manager"
       - name: Tar the .app
         run: COPYFILE_DISABLE=1 tar czpf "app-${{ matrix.arch }}.tar.gz" -C dist_native "CloakBrowser Manager.app"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mac-app-${{ matrix.arch }}
           path: app-${{ matrix.arch }}.tar.gz
@@ -101,10 +107,10 @@ jobs:
     needs: [version, build-mac]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: mac-app-arm64, path: _arm }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: mac-app-x86_64, path: _intel }
       - name: Unpack arch apps
         run: |
@@ -139,23 +145,420 @@ jobs:
           ln -s /Applications "$STAGE/Applications"
           hdiutil create -volname "CloakBrowser Manager" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
           rm -rf "$STAGE"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-universal-dmg
           path: dist_native/*-universal.dmg
           if-no-files-found: error
 
+  # Build each Linux architecture on a native GitHub-hosted runner. Manual
+  # dispatches validate both builds without publishing; release tags push
+  # content-addressed images for the manifest job below.
+  build-docker:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build image (validation only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+      - name: Build and push image by digest
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=min
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+      - name: Export architecture-bound image digest
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest: $DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "${{ runner.temp }}/digests"
+          printf '{"platform":"%s","digest":"%s"}\n' "$PLATFORM" "$DIGEST" \
+            > "${{ runner.temp }}/digests/${ARCH}.json"
+      - name: Upload image digest
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Join the native amd64 and arm64 images under the public release tags.
+  docker-manifest:
+    needs: [version, build-docker]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: docker-digest-amd64
+          path: ${{ runner.temp }}/digests/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: docker-digest-arm64
+          path: ${{ runner.temp }}/digests/arm64
+      - name: Validate candidate and create multi-architecture manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          DIGEST_DIR: ${{ runner.temp }}/digests
+          SOURCES_FILE: ${{ runner.temp }}/sources.txt
+          CANDIDATE_FILE: ${{ runner.temp }}/candidate-manifest.json
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          digest_dir = Path(os.environ["DIGEST_DIR"])
+          expected = {
+              Path("amd64/amd64.json"): "linux/amd64",
+              Path("arm64/arm64.json"): "linux/arm64",
+          }
+          actual_files = {path.relative_to(digest_dir) for path in digest_dir.rglob("*") if path.is_file()}
+          if actual_files != set(expected):
+              raise SystemExit(
+                  f"Expected digest metadata {sorted(map(str, expected))}, "
+                  f"found {sorted(map(str, actual_files))}"
+              )
+
+          sources = []
+          seen_digests = set()
+          for relative_path, platform in expected.items():
+              metadata = json.loads((digest_dir / relative_path).read_text())
+              if set(metadata) != {"platform", "digest"}:
+                  raise SystemExit(f"Unexpected fields in {relative_path}: {sorted(metadata)}")
+              if metadata["platform"] != platform:
+                  raise SystemExit(f"{relative_path} contains {metadata['platform']}, expected {platform}")
+              digest = metadata["digest"]
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  raise SystemExit(f"Invalid digest in {relative_path}: {digest}")
+              if digest in seen_digests:
+                  raise SystemExit(f"Duplicate architecture digest: {digest}")
+              seen_digests.add(digest)
+              sources.append(f"{os.environ['REGISTRY_IMAGE']}@{digest}")
+
+          Path(os.environ["SOURCES_FILE"]).write_text("\n".join(sources) + "\n")
+          print(f"Validated digest metadata: {sources}")
+          PY
+
+          sources=()
+          while IFS= read -r source; do
+            sources+=("$source")
+          done < "$SOURCES_FILE"
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "Expected 2 validated manifest sources, found ${#sources[@]}" >&2
+            exit 1
+          fi
+          docker buildx imagetools create --dry-run "${sources[@]}" > "$CANDIDATE_FILE"
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          manifest = json.loads(Path(os.environ["CANDIDATE_FILE"]).read_text())
+          if manifest.get("schemaVersion") != 2:
+              raise SystemExit(f"Invalid candidate schema: {manifest.get('schemaVersion')}")
+          valid_index_types = {
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+          }
+          if manifest.get("mediaType") not in valid_index_types:
+              raise SystemExit(f"Invalid candidate media type: {manifest.get('mediaType')}")
+
+          required = {("linux", "amd64"), ("linux", "arm64")}
+          valid_manifest_types = {
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          }
+          image_descriptors = {}
+          attestation_references = []
+          descriptor_digests = set()
+          for descriptor in manifest.get("manifests", []):
+              digest = descriptor.get("digest", "")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  raise SystemExit(f"Invalid candidate descriptor digest: {digest}")
+              if digest in descriptor_digests:
+                  raise SystemExit(f"Duplicate candidate descriptor digest: {digest}")
+              descriptor_digests.add(digest)
+              if not isinstance(descriptor.get("size"), int) or descriptor["size"] <= 0:
+                  raise SystemExit(f"Invalid candidate descriptor size: {descriptor.get('size')}")
+              if descriptor.get("mediaType") not in valid_manifest_types:
+                  raise SystemExit(f"Invalid candidate descriptor media type: {descriptor.get('mediaType')}")
+
+              platform_data = descriptor.get("platform", {})
+              platform = (platform_data.get("os"), platform_data.get("architecture"))
+              if platform in required:
+                  if platform in image_descriptors:
+                      raise SystemExit(f"Duplicate candidate platform: {platform}")
+                  image_descriptors[platform] = digest
+                  continue
+              if platform != ("unknown", "unknown"):
+                  raise SystemExit(f"Unexpected candidate platform: {platform}")
+
+              annotations = descriptor.get("annotations", {})
+              if annotations.get("vnd.docker.reference.type") != "attestation-manifest":
+                  raise SystemExit(f"Unknown descriptor is not an attestation: {digest}")
+              reference = annotations.get("vnd.docker.reference.digest", "")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", reference):
+                  raise SystemExit(f"Invalid attestation reference: {reference}")
+              attestation_references.append(reference)
+
+          if set(image_descriptors) != required:
+              raise SystemExit(f"Invalid candidate image platforms: {sorted(image_descriptors)}")
+          if len(attestation_references) != len(set(attestation_references)):
+              raise SystemExit("Duplicate candidate attestation references")
+          if set(attestation_references) != set(image_descriptors.values()):
+              raise SystemExit("Candidate must contain one attestation for each image")
+          if len(manifest.get("manifests", [])) != 4:
+              raise SystemExit("Candidate must contain exactly 2 images and 2 attestations")
+          print(f"Validated unpublished candidate descriptors: {sorted(required)}")
+          PY
+
+          docker buildx imagetools create \
+            --tag "${REGISTRY_IMAGE}:${VERSION}" \
+            "${sources[@]}"
+      - name: Verify published manifest matches candidate
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          CANDIDATE_FILE: ${{ runner.temp }}/candidate-manifest.json
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          reference = f"{os.environ['REGISTRY_IMAGE']}:{os.environ['VERSION']}"
+          published = None
+          last_error = ""
+          for attempt in range(5):
+              result = subprocess.run(
+                  ["docker", "buildx", "imagetools", "inspect", "--raw", reference],
+                  text=True,
+                  capture_output=True,
+              )
+              if result.returncode == 0:
+                  try:
+                      published = json.loads(result.stdout)
+                      break
+                  except json.JSONDecodeError as error:
+                      last_error = str(error)
+              else:
+                  last_error = result.stderr.strip()
+              if attempt < 4:
+                  time.sleep(2 ** attempt)
+          if published is None:
+              raise SystemExit(f"Unable to verify published manifest: {last_error}")
+
+          candidate = json.loads(Path(os.environ["CANDIDATE_FILE"]).read_text())
+          candidate_top = {key: value for key, value in candidate.items() if key != "manifests"}
+          published_top = {key: value for key, value in published.items() if key != "manifests"}
+          if candidate_top != published_top:
+              raise SystemExit("Published manifest metadata differs from candidate")
+
+          def descriptors_by_digest(manifest):
+              descriptors = manifest.get("manifests", [])
+              by_digest = {descriptor.get("digest"): descriptor for descriptor in descriptors}
+              if len(by_digest) != len(descriptors):
+                  raise SystemExit("Published manifest contains duplicate descriptor digests")
+              return by_digest
+
+          candidate_descriptors = descriptors_by_digest(candidate)
+          published_descriptors = descriptors_by_digest(published)
+          if candidate_descriptors != published_descriptors:
+              raise SystemExit("Published manifest descriptors differ from validated candidate")
+          print(f"Verified published manifest exactly matches candidate: {reference}")
+          PY
+
+  # Reconcile `latest` to the newest stable SemVer image that exists and has
+  # both required platforms. Every surviving serialized job considers all
+  # releases, so GitHub cancelling an intermediate pending job is harmless.
+  promote-docker-latest:
+    needs: docker-manifest
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    concurrency:
+      group: docker-latest
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Find newest complete stable image
+        id: newest
+        shell: bash
+        run: |
+          git fetch --force --tags origin
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+
+          image = os.environ["REGISTRY_IMAGE"]
+          stable_pattern = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+          candidates = []
+          for tag in subprocess.check_output(["git", "tag", "--list"], text=True).splitlines():
+              match = stable_pattern.fullmatch(tag)
+              if match:
+                  candidates.append((tuple(map(int, match.groups())), tag))
+
+          def inspect_manifest(reference):
+              last_result = None
+              for attempt in range(5):
+                  last_result = subprocess.run(
+                      ["docker", "buildx", "imagetools", "inspect", "--raw", reference],
+                      text=True,
+                      capture_output=True,
+                  )
+                  if last_result.returncode == 0:
+                      try:
+                          return json.loads(last_result.stdout)
+                      except json.JSONDecodeError:
+                          pass
+                  if attempt < 4:
+                      time.sleep(2 ** attempt)
+
+              error = (last_result.stderr or last_result.stdout).lower()
+              missing_markers = ("manifest unknown", "no such manifest", f"{reference.lower()}: not found")
+              if last_result.returncode != 0 and any(marker in error for marker in missing_markers):
+                  return None
+              raise SystemExit(f"Unable to inspect {reference}: {error.strip()}")
+
+          required = {("linux", "amd64"), ("linux", "arm64")}
+          selected = ""
+          for _, tag in sorted(candidates, reverse=True):
+              manifest = inspect_manifest(f"{image}:{tag}")
+              if manifest is None:
+                  continue
+              platforms = {
+                  (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture"))
+                  for item in manifest.get("manifests", [])
+              }
+              if required <= platforms:
+                  selected = tag
+                  break
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"tag={selected}\n")
+          if selected:
+              print(f"Newest complete stable image: {image}:{selected}")
+          else:
+              print("No complete stable image is available for latest promotion")
+          PY
+      - name: Promote newest stable image to latest
+        if: steps.newest.outputs.tag != ''
+        shell: bash
+        env:
+          VERSION: ${{ steps.newest.outputs.tag }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${REGISTRY_IMAGE}:latest" \
+            "${REGISTRY_IMAGE}:${VERSION}"
+
+          python - <<'PY'
+          import hashlib
+          import os
+          import subprocess
+          import time
+
+          image = os.environ["REGISTRY_IMAGE"]
+          version = os.environ["VERSION"]
+          references = (f"{image}:{version}", f"{image}:latest")
+          last_errors = []
+
+          for attempt in range(5):
+              manifests = []
+              last_errors = []
+              for reference in references:
+                  result = subprocess.run(
+                      ["docker", "buildx", "imagetools", "inspect", "--raw", reference],
+                      capture_output=True,
+                  )
+                  if result.returncode == 0:
+                      manifests.append(result.stdout)
+                  else:
+                      manifests.append(None)
+                      last_errors.append(result.stderr.decode(errors="replace").strip())
+
+              if None not in manifests and manifests[0] == manifests[1]:
+                  digest = hashlib.sha256(manifests[0]).hexdigest()
+                  print(f"Verified latest -> {version} (sha256:{digest})")
+                  raise SystemExit(0)
+              if attempt < 4:
+                  time.sleep(2 ** attempt)
+
+          details = "; ".join(error for error in last_errors if error) or "manifest digest mismatch"
+          raise SystemExit(f"latest did not resolve to {version}: {details}")
+          PY
+
   release:
-    needs: [version, build-windows, universal]
-    if: github.ref_type == 'tag'
+    needs: [version, build-windows, universal, docker-manifest]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4   # for CHANGELOG.md
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, for CHANGELOG.md
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: windows-setup, path: dist }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: macos-universal-dmg, path: dist }
       - name: Create GitHub Release
         env:

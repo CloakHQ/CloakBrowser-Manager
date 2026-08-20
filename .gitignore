@@ -34,3 +34,4 @@ publish-docker.sh
 .beads
 debug
 backend/version.txt
+.plans
