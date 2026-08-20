@@ -35,7 +35,15 @@ from .env_file import load_env_file
 load_env_file()
 
 from . import database as db
-from .browser_manager import BrowserManager, SCREENSHOT_FILENAME, test_proxy
+from cloakbrowser.license import CloakBrowserLicenseError
+
+from .browser_manager import (
+    BrowserManager,
+    SCREENSHOT_FILENAME,
+    is_seat_limit_error,
+    license_error_detail,
+    test_proxy,
+)
 from .models import (
     ClipboardRequest,
     LaunchResponse,
@@ -712,6 +720,13 @@ async def launch_profile(profile_id: str):
 
     try:
         running = await browser_mgr.launch(profile)
+    except CloakBrowserLicenseError as exc:
+        # Out of seats / bad key / expired / server unreachable — surface the real
+        # reason instead of a flat "failed to launch". 402 for the seat case (with
+        # an upgrade CTA), 403 for the other license problems.
+        logger.warning("License denial launching profile %s: %s", profile_id, exc)
+        detail = license_error_detail(exc)
+        raise HTTPException(status_code=402 if is_seat_limit_error(exc) else 403, detail=detail)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

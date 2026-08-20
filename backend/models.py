@@ -123,6 +123,9 @@ class ProfileResponse(BaseModel):
     viewer_mode: ViewerMode = "vnc"
     vnc_ws_port: int | None = None
     cdp_url: str | None = None
+    # Set when the profile's last launch closed on a license denial (out of
+    # seats / bad key). {message, reason, upgrade_url?}. Cleared on next launch.
+    last_error: dict[str, str] | None = None
 
 
 class LaunchResponse(BaseModel):

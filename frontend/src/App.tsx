@@ -1,7 +1,7 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { Lock, PanelLeftClose, PanelLeft, Settings, Power } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
-import { api, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo } from "./lib/api";
+import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -10,6 +10,7 @@ import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { LoginPage } from "./components/LoginPage";
 
@@ -100,6 +101,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [launchError, setLaunchError] = useState<LaunchDenial | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [stopped, setStopped] = useState(false);
 
@@ -121,6 +123,22 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   }, []);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
+
+  // Switching profiles clears the banner (like X); a post-handshake denial
+  // (profile.last_error, arriving via the poll) shows only while its own
+  // profile stays selected, never carried across a switch.
+  const prevSelectedId = useRef(selectedId);
+  const selectedLastErrorMsg = selected?.last_error?.message ?? null;
+  useEffect(() => {
+    const switched = prevSelectedId.current !== selectedId;
+    prevSelectedId.current = selectedId;
+    if (switched) {
+      setLaunchError(null);
+      return;
+    }
+    if (selected?.last_error) setLaunchError(selected.last_error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, selectedLastErrorMsg]);
 
   const handleSelect = useCallback((id: string) => {
     setSelectedId(id);
@@ -155,8 +173,26 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
   const handleLaunch = useCallback(async () => {
     if (!selectedId) return;
-    const result = await launch(selectedId);
-    if (result) setView("view");
+    setLaunchError(null);
+    try {
+      const result = await launch(selectedId);
+      if (result) setView("view");
+    } catch (err) {
+      // A license denial (out of seats, bad/expired key) → 402/403 with a
+      // structured detail; surface it in the top banner.
+      if (err instanceof ApiError && (err.status === 402 || err.status === 403)) {
+        setLaunchError({
+          message: err.message,
+          reason: (err.reason as LaunchDenial["reason"]) ?? "license",
+          upgrade_url: err.upgradeUrl,
+        });
+      } else {
+        setLaunchError({
+          message: err instanceof Error ? err.message : "Failed to launch profile",
+          reason: "license",
+        });
+      }
+    }
   }, [selectedId, launch]);
 
   const handleStop = useCallback(async () => {
@@ -220,6 +256,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
       {updateInfo?.update_available && !updateDismissed && (
         <UpdateBanner info={updateInfo} onDismiss={() => setUpdateDismissed(true)} />
       )}
+      {launchError && (
+        <LaunchErrorBanner error={launchError} onDismiss={() => setLaunchError(null)} />
+      )}
       <div className="flex-1 flex min-h-0">
       {/* Sidebar */}
       {sidebarOpen && (
@@ -271,6 +310,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             </button>
             {selected && (
               <LaunchButton
+                key={selected.id}
                 status={selected.status}
                 onLaunch={handleLaunch}
                 onStop={handleStop}

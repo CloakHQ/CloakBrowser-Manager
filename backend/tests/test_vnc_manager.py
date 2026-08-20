@@ -126,6 +126,7 @@ def test_get_status_stopped():
         "vnc_ws_port": None,
         "display": None,
         "cdp_url": None,
+        "last_error": None,
     }
 
 
@@ -148,4 +149,5 @@ def test_get_status_running():
         "vnc_ws_port": 6100,
         "display": ":100",
         "cdp_url": "/api/profiles/abc/cdp",
+        "last_error": None,
     }

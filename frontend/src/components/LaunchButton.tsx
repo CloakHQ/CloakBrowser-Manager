@@ -9,11 +9,9 @@ interface LaunchButtonProps {
 
 export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const handleClick = async () => {
     setLoading(true);
-    setError(null);
     try {
       if (status === "running") {
         await onStop();
@@ -21,8 +19,8 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
         await onLaunch();
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Action failed";
-      setError(msg);
+      // Launch/license errors are surfaced by the top LaunchErrorBanner (set in
+      // App.handleLaunch); nothing to render here.
       console.error("Action failed:", err);
     } finally {
       setLoading(false);
@@ -54,12 +52,9 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
   }
 
   return (
-    <div>
-      <button onClick={handleClick} className="btn-primary flex items-center gap-1.5">
-        <Play className="h-3.5 w-3.5" />
-        <span>Launch</span>
-      </button>
-      {error && <p className="text-red-400 text-xs mt-1">{error}</p>}
-    </div>
+    <button onClick={handleClick} className="btn-primary flex items-center gap-1.5">
+      <Play className="h-3.5 w-3.5" />
+      <span>Launch</span>
+    </button>
   );
 }

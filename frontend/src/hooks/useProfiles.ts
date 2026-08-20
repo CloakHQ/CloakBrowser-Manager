@@ -85,13 +85,12 @@ export function useProfiles() {
 
   const launch = useCallback(
     async (id: string) => {
-      try {
-        const result = await api.launchProfile(id);
-        await refresh();
-        return result;
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to launch profile");
-      }
+      // Don't swallow: a launch denial (out of seats, bad/expired key) carries a
+      // structured reason + upgrade CTA that LaunchButton renders. Re-throw so it
+      // reaches the button's own catch instead of a flat hook-level banner.
+      const result = await api.launchProfile(id);
+      await refresh();
+      return result;
     },
     [refresh],
   );

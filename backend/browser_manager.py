@@ -14,11 +14,48 @@ from pathlib import Path
 from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
+from cloakbrowser.license import (
+    CloakBrowserLicenseError,
+    license_error_for_code,
+    read_denial_file,
+)
 
 from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
+
+
+UPGRADE_URL = "https://cloakbrowser.dev/#pricing"
+
+
+def is_seat_limit_error(exc: BaseException) -> bool:
+    """True if a license error is specifically the concurrency-seat denial (76).
+
+    The wrapper turns exit code 76 into a message containing "session limit
+    reached"; the other license codes (invalid/expired key, server unreachable,
+    local config) carry different text. Used to attach the upgrade CTA only to
+    the out-of-seats case.
+    """
+    return "session limit reached" in str(exc).lower()
+
+
+def license_error_detail(exc: BaseException) -> dict[str, str]:
+    """Build the structured launch-error payload the frontend renders.
+
+    ``{message, reason, upgrade_url?}`` — reason is "seat_limit" (out of seats,
+    with an upgrade CTA) or "license" (bad/expired/revoked key, server
+    unreachable, local config). Shared by the synchronous launch-raises path
+    (main.py) and the post-handshake close path (_on_browser_closed).
+    """
+    seat = is_seat_limit_error(exc)
+    detail: dict[str, str] = {
+        "message": str(exc),
+        "reason": "seat_limit" if seat else "license",
+    }
+    if seat:
+        detail["upgrade_url"] = UPGRADE_URL
+    return detail
 
 
 def _normalize_proxy(raw: str) -> str:
@@ -274,6 +311,10 @@ class RunningProfile:
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
     capture_preview: bool = True
+    # Path to the wrapper's per-launch denial file (set by launch_persistent_
+    # context_async on the returned context). Read on close to tell a seat/
+    # license denial apart from a real crash or a user-initiated close.
+    denial_path: str | None = None
 
 
 class BrowserManager:
@@ -293,6 +334,12 @@ class BrowserManager:
         self.license_plan: str | None = None
         self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
+        # Last launch failure per profile, surfaced on the status poll and cleared
+        # on the next launch. Holds post-handshake denials (out of seats, bad key)
+        # that land AFTER launch() already returned 200 — the browser boots, gets
+        # denied ~1s later, and self-closes, so there's no HTTP response to carry
+        # the reason. get_status() returns this so the frontend can show it.
+        self._last_errors: dict[str, dict[str, str]] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
         self._initializing: set[str] = set()  # profile IDs in one-time first-launch setup
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
@@ -376,6 +423,9 @@ class BrowserManager:
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
+            # Fresh attempt — drop any stale denial from a previous launch so the
+            # status poll doesn't keep showing an old "out of seats" message.
+            self._last_errors.pop(profile_id, None)
 
         display: int | None = None
         ws_port: int | None = None
@@ -465,7 +515,16 @@ class BrowserManager:
                 ]
                 try:
                     context = await launch_persistent_context_async(**launch_options)
-                    await self._wait_for_cdp(cdp_port)
+                    # An over-cap/denied seat leaves the browser booting but never
+                    # serving a usable CDP endpoint — so waiting on CDP would just
+                    # time out (or worse). The wrapper wrote the reason to a denial
+                    # file; check it immediately and each CDP poll so a denial bails
+                    # in ~1s instead of waiting out CDP that will never come.
+                    denial_path = getattr(context, "_cloak_denial_path", None)
+                    lic = self._denial_error(denial_path)
+                    if lic is not None:
+                        raise lic
+                    await self._wait_for_cdp(cdp_port, denial_path=denial_path)
                     break
                 except asyncio.CancelledError:
                     if context is not None:
@@ -476,11 +535,24 @@ class BrowserManager:
                     raise
                 except Exception as exc:
                     last_cdp_error = exc
+                    # Grab the denial path before dropping the context: a denial
+                    # that lands during _wait_for_cdp surfaces as a TimeoutError,
+                    # not the license exception, so check the file explicitly.
+                    dp = getattr(context, "_cloak_denial_path", None) if context is not None else None
                     if context is not None:
                         await self._close_context(context, profile_id)
                     self._release_cdp_port(cdp_port)
                     context = None
                     cdp_port = None
+                    # A license denial (out of seats, bad/expired key, server
+                    # unreachable, local config) is deterministic — retrying just
+                    # wastes ~10s and re-denies. Fail fast with the real reason,
+                    # whether it raised as the license exception or as a timeout.
+                    if isinstance(exc, CloakBrowserLicenseError):
+                        raise
+                    lic = self._denial_error(dp)
+                    if lic is not None:
+                        raise lic from exc
                     logger.warning(
                         "Browser/CDP startup attempt %d/%d failed for %s: %s",
                         attempt,
@@ -526,10 +598,11 @@ class BrowserManager:
                 ws_port=ws_port,
                 user_data_dir=user_data_dir,
                 capture_preview=bool(profile.get("capture_preview", True)),
+                denial_path=getattr(context, "_cloak_denial_path", None),
             )
             context.on(
                 "close",
-                lambda *_: asyncio.ensure_future(self._on_browser_closed(profile_id)),
+                lambda *_: asyncio.ensure_future(self._on_browser_closed(running)),
             )
 
             async with self._lock:
@@ -601,6 +674,11 @@ class BrowserManager:
             logger.info(
                 "Set Google as default search engine for %s", user_data_dir.name
             )
+        except CloakBrowserLicenseError:
+            # A license denial (out of seats, bad key, …) isn't a search-engine
+            # failure — don't burn a retry on the marker; abort the launch so the
+            # API surfaces the real reason.
+            raise
         except Exception as exc:
             attempts += 1
             try:
@@ -740,14 +818,54 @@ class BrowserManager:
             await self.vnc.stop_vnc(running.display)
         self._release_cdp_port(running.cdp_port)
 
-    async def _on_browser_closed(self, profile_id: str):
-        """Release resources after a browser crash or user-initiated close."""
-        async with self._lock:
-            running = self.running.pop(profile_id, None)
+    async def _on_browser_closed(self, running: RunningProfile):
+        """Release resources after a browser crash or user-initiated close.
 
-        if running:
-            logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            await self._dispose_running(running, close_context=False)
+        A post-handshake license denial (out of seats, bad/expired key) lands
+        HERE, not at launch: the browser boots, launch() returns 200, then the
+        binary self-exits ~1s later. It leaves the reason in a denial file the
+        wrapper minted; read it so the status poll can tell the user why the
+        profile just vanished instead of silently flipping back to stopped.
+
+        Takes the specific RunningProfile (not just its id): a late close event
+        from a superseded launch must not pop/dispose a healthy relaunch that now
+        owns the same profile_id, nor stamp a stale denial onto it.
+        """
+        profile_id = running.profile_id
+        async with self._lock:
+            if self.running.get(profile_id) is not running:
+                return  # superseded — a newer launch owns this profile now
+            # Record the denial and pop under the SAME lock so it can't race with
+            # a concurrent launch() clearing _last_errors at its start.
+            self._record_denial_if_any(profile_id, running.denial_path)
+            self.running.pop(profile_id, None)
+
+        logger.info("Browser closed for profile %s, cleaning up", profile_id)
+        await self._dispose_running(running, close_context=False)
+
+    def _denial_error(self, denial_path: str | None) -> CloakBrowserLicenseError | None:
+        """Read the wrapper's denial file → a license error, or None.
+
+        Destructive read (consumes the file) but cached in-process, so it's safe
+        even if the wrapper's guard already consumed it. Non-license closes (real
+        crash, user closed the tab) leave no file → None.
+        """
+        if not denial_path:
+            return None
+        try:
+            code = read_denial_file(denial_path)
+        except Exception as exc:  # never let cleanup fail on a read error
+            logger.debug("Denial-file read failed: %s", exc)
+            return None
+        return license_error_for_code(code) if code is not None else None
+
+    def _record_denial_if_any(self, profile_id: str, denial_path: str | None) -> None:
+        """If the close was a license denial, stash it for the status poll."""
+        lic = self._denial_error(denial_path)
+        if lic is None:
+            return
+        self._last_errors[profile_id] = license_error_detail(lic)
+        logger.warning("Profile %s closed on a license denial: %s", profile_id, lic)
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance and release all owned resources."""
@@ -790,6 +908,10 @@ class BrowserManager:
                 else None
             ),
             "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+            # Set when the last launch closed on a license denial (post-handshake
+            # out-of-seats / bad key). Only meaningful while stopped; cleared on
+            # the next launch. {message, reason, upgrade_url?} or None.
+            "last_error": None if running else self._last_errors.get(profile_id),
         }
         return status
 
@@ -863,11 +985,20 @@ class BrowserManager:
         self,
         port: int,
         timeout: float = CDP_READY_TIMEOUT,
+        denial_path: str | None = None,
     ) -> None:
-        """Wait for and verify Chromium's debugger endpoint on the reserved port."""
+        """Wait for and verify Chromium's debugger endpoint on the reserved port.
+
+        If ``denial_path`` is given, the wrapper's denial file is checked each
+        poll: a seat/license denial makes the browser never serve CDP, so bail
+        immediately with the real reason instead of waiting out ``timeout``.
+        """
         deadline = asyncio.get_running_loop().time() + timeout
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
+            lic = self._denial_error(denial_path)
+            if lic is not None:
+                raise lic
             try:
                 version = await self._fetch_cdp_version(port)
                 websocket_url = str(version.get("webSocketDebuggerUrl") or "")
@@ -876,9 +1007,15 @@ class BrowserManager:
                         f"CDP endpoint returned an unexpected debugger URL: {websocket_url!r}"
                     )
                 return
+            except CloakBrowserLicenseError:
+                raise
             except Exception as exc:
                 last_error = exc
                 await asyncio.sleep(0.1)
+        # One last check — the denial may have landed on the final poll.
+        lic = self._denial_error(denial_path)
+        if lic is not None:
+            raise lic
         raise TimeoutError(f"CDP endpoint on 127.0.0.1:{port} was not ready") from last_error
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:

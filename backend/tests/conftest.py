@@ -31,6 +31,13 @@ _mock_license = types.ModuleType("cloakbrowser.license")
 _mock_license.resolve_license_key = lambda key=None: key  # type: ignore[attr-defined]
 _mock_license.validate_license = lambda key: None  # type: ignore[attr-defined]
 _mock_license.get_pro_latest_version = lambda channel=None: None  # type: ignore[attr-defined]
+# browser_manager.py surfaces license/seat denials — it imports these at module
+# level, so the mock must expose them or collection fails with ImportError.
+_mock_license.CloakBrowserLicenseError = type(  # type: ignore[attr-defined]
+    "CloakBrowserLicenseError", (RuntimeError,), {}
+)
+_mock_license.license_error_for_code = lambda code: None  # type: ignore[attr-defined]
+_mock_license.read_denial_file = lambda path: None  # type: ignore[attr-defined]
 
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
 sys.modules.setdefault("cloakbrowser.config", _mock_config)

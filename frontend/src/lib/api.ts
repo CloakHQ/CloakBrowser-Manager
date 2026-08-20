@@ -39,6 +39,15 @@ export interface Profile {
   viewer_mode: ViewerMode;
   vnc_ws_port: number | null;
   cdp_url: string | null;
+  // Set when the last launch closed on a license denial (out of seats / bad
+  // key). Cleared on the next launch. Shown under the Launch button.
+  last_error: LaunchDenial | null;
+}
+
+export interface LaunchDenial {
+  message: string;
+  reason: "seat_limit" | "license";
+  upgrade_url?: string;
 }
 
 export interface ProfileCreateData {
@@ -121,6 +130,10 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    // Set when the backend returns a structured detail (e.g. a launch blocked
+    // by a license/seat problem): "seat_limit" | "license", plus an upgrade URL.
+    public reason?: string,
+    public upgradeUrl?: string,
   ) {
     super(message);
   }
@@ -146,7 +159,18 @@ async function request<T>(
       throw new ApiError(401, "Unauthorized");
     }
     const body = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiError(res.status, body.detail || res.statusText);
+    const detail = body.detail;
+    // FastAPI detail is usually a string, but license/seat denials return an
+    // object {message, reason, upgrade_url} so the UI can show a CTA.
+    if (detail && typeof detail === "object") {
+      throw new ApiError(
+        res.status,
+        detail.message || res.statusText,
+        detail.reason,
+        detail.upgrade_url,
+      );
+    }
+    throw new ApiError(res.status, detail || res.statusText);
   }
   return res.json();
 }
