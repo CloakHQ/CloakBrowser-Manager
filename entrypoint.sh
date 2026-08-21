@@ -4,6 +4,11 @@ set -e
 # Initialize data directories
 mkdir -p /data/profiles
 
+# Refresh fonts supplied through the private runtime mount.
+if [ -d /usr/local/share/fonts/windows ]; then
+    fc-cache -f /usr/local/share/fonts/windows >/dev/null
+fi
+
 # Kill stale processes from previous container runs
 pkill -f 'Xvnc :[0-9]' 2>/dev/null || true
 pkill -f 'cloakbrowser.*chrome' 2>/dev/null || true
