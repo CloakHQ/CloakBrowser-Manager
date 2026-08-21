@@ -1031,6 +1031,10 @@ class BrowserManager:
         # Persona is always determined by the runtime, not editable profile data.
         platform = "macos" if self.runtime.host_os == "macos" else "windows"
         args.append(f"--fingerprint-platform={platform}")
+        # The Linux runtime presents a Windows persona. With licensed Windows
+        # fonts mounted, align Chromium's text measurements with that persona.
+        if self.runtime.host_os == "linux":
+            args.append("--fingerprint-windows-font-metrics")
 
         # Apple GPU models are selected automatically by the seeded macOS
         # persona. Windows vendor-family overrides are incoherent on macOS.

@@ -125,7 +125,9 @@ def test_build_args_no_seed():
 
 
 def test_build_args_platform_comes_from_runtime():
-    assert "--fingerprint-platform=windows" in _mgr._build_fingerprint_args({})
+    docker_args = _mgr._build_fingerprint_args({})
+    assert "--fingerprint-platform=windows" in docker_args
+    assert "--fingerprint-windows-font-metrics" in docker_args
     mac_runtime = RuntimeConfig(
         host_os="macos",
         runtime_mode="native",
@@ -133,7 +135,9 @@ def test_build_args_platform_comes_from_runtime():
         data_dir=Path("/tmp/manager-data"),
     )
     mac_manager = BrowserManager(mac_runtime)
-    assert "--fingerprint-platform=macos" in mac_manager._build_fingerprint_args({})
+    mac_args = mac_manager._build_fingerprint_args({})
+    assert "--fingerprint-platform=macos" in mac_args
+    assert "--fingerprint-windows-font-metrics" not in mac_args
     assert not any(
         "gpu-vendor" in arg
         for arg in mac_manager._build_fingerprint_args({"gpu_family": "nvidia"})
@@ -157,13 +161,14 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Docker software rendering + runtime platform.
-    assert len(args) == 2
+    # Docker software rendering, Windows persona, and matching font metrics.
+    assert len(args) == 3
 
 
 def test_native_build_args_do_not_force_software_gl():
     args = BrowserManager(NATIVE_RUNTIME)._build_fingerprint_args({})
     assert "--use-angle=swiftshader" not in args
+    assert "--fingerprint-windows-font-metrics" not in args
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────

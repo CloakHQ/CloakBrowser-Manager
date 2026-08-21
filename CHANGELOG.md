@@ -4,6 +4,11 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Linux Docker font identity now matches the Windows persona more closely.** The image includes the recommended emoji and CJK baseline fonts, replaces the incomplete XP-era core-font download with a private licensed-font mount, refreshes that mount at startup, and enables CloakBrowser's Windows font-metrics profile for Linux sessions.
+
 ## [0.1.4] - 2026-08-21
 
 ### Fixed

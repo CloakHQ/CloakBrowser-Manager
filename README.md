@@ -160,6 +160,23 @@ npm run dev
 docker compose up --build
 ```
 
+Linux containers present a Windows browser persona. For coherent emoji, CJK,
+and canvas rendering, the image includes CloakBrowser's recommended baseline
+font packages. To supply separately licensed Windows fonts, keep them outside
+the repository and mount them read-only into Fontconfig's local font directory:
+
+```yaml
+services:
+  manager:
+    volumes:
+      - ~/.cloakbrowser-manager:/data
+      - /srv/cloakbrowser-manager/fonts/windows:/usr/local/share/fonts/windows:ro
+```
+
+The container refreshes the mounted directory's Fontconfig cache at startup.
+After recreating it, `/api/status` and the top-bar badge report whether all
+required Windows persona font families are available.
+
 ## Requirements
 
 - Windows or macOS native: Python 3.10+, Node.js 18+
