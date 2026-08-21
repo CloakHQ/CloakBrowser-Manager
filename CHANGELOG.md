@@ -4,6 +4,17 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-08-21
+
+### Fixed
+- **Memory leak when a browser closed on its own.** If a browser exited outside the Stop button (a crash, or closing Chrome from inside the profile window), a helper process was left running and holding around 130 MB. These built up over time on a long-running manager. The manager now releases it on that path as well.
+
+### Added
+- **Automated multi-architecture Docker releases.** Version tags now build Linux AMD64 and ARM64 images on native GitHub-hosted runners, combine them under one Docker tag, and publish both the release version and `latest` alongside the Windows and macOS installers.
+
+### Changed
+- **Safer release validation.** Docker architecture digests, provenance, and the combined manifest are validated before publication, and `latest` is promoted only from a complete verified release. Release tags are validated as canonical semantic versions, and workflow dependencies are pinned to immutable revisions.
+
 ## [0.1.3] - 2026-08-19
 
 ### Fixed

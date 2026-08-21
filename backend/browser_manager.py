@@ -841,7 +841,7 @@ class BrowserManager:
             self.running.pop(profile_id, None)
 
         logger.info("Browser closed for profile %s, cleaning up", profile_id)
-        await self._dispose_running(running, close_context=False)
+        await self._dispose_running(running, close_context=True)
 
     def _denial_error(self, denial_path: str | None) -> CloakBrowserLicenseError | None:
         """Read the wrapper's denial file → a license error, or None.
