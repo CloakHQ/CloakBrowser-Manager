@@ -81,7 +81,16 @@ Add your key once and every profile uses it.
 
 **Native app (Windows/macOS):** open **Settings** (gear icon, top right), paste your key, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
 
-**Docker or run-from-source:** set it in a manager-root `.env` instead:
+**Docker:** open **Settings** (gear icon, top right) the same way, paste your key, and Save. It applies immediately and is stored in the mounted `/data` volume, so it persists across restarts and image updates. For automated or headless setups, pass it at `docker run` instead:
+
+```bash
+docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data \
+  -e CLOAKBROWSER_LICENSE_KEY=cb_your_key_here \
+  -e CLOAKBROWSER_RELEASE_CHANNEL=preview \
+  cloakhq/cloakbrowser-manager
+```
+
+**Run from source (or `docker compose`):** set it in a manager-root `.env`:
 
 ```bash
 cp .env.example .env
@@ -93,7 +102,7 @@ CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
 CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
 ```
 
-The file is loaded automatically at startup. Restart the Manager after changing it. With Docker, you can also pass the key with `-e CLOAKBROWSER_LICENSE_KEY=...`. An environment variable overrides the in-app setting.
+The file is loaded automatically at startup (`docker compose` reads it too); restart the Manager after changing it. An environment variable overrides the in-app setting.
 
 ## Why Not a Cloud Anti-Detect Browser?
 
