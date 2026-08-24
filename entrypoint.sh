@@ -2,7 +2,12 @@
 set -e
 
 # Initialize data directories
-mkdir -p /data/profiles
+mkdir -p /data/profiles "${CLOAKBROWSER_CACHE_DIR:-/data/binaries}"
+
+# Refresh fonts supplied through the private runtime mount.
+if [ -d /usr/local/share/fonts/windows ]; then
+    fc-cache -f /usr/local/share/fonts/windows >/dev/null
+fi
 
 # Kill stale processes from previous container runs
 pkill -f 'Xvnc :[0-9]' 2>/dev/null || true

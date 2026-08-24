@@ -127,10 +127,8 @@ def startup_line(browser_mgr) -> str:
         f"ui={os.environ.get('CLOAKBROWSER_MANAGER_UI', 'auto')} "
         f"runtime={getattr(rt, 'runtime_mode', '?')} "
         f"host_os={getattr(rt, 'host_os', '?')} data_dir={data_dir} | "
-        f"tier={getattr(browser_mgr, 'license_tier', '?')} "
-        f"plan={getattr(browser_mgr, 'license_plan', None) or '-'} "
         f"wrapper={wrapper_version()} "
-        f"binary={getattr(browser_mgr, 'binary_version', None) or '?'}"
+        f"binary_cache={os.environ.get('CLOAKBROWSER_CACHE_DIR', '?')}"
     )
 
 

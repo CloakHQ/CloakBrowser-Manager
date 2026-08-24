@@ -125,7 +125,9 @@ def test_build_args_no_seed():
 
 
 def test_build_args_platform_comes_from_runtime():
-    assert "--fingerprint-platform=windows" in _mgr._build_fingerprint_args({})
+    docker_args = _mgr._build_fingerprint_args({})
+    assert "--fingerprint-platform=windows" in docker_args
+    assert "--fingerprint-windows-font-metrics" in docker_args
     mac_runtime = RuntimeConfig(
         host_os="macos",
         runtime_mode="native",
@@ -133,7 +135,9 @@ def test_build_args_platform_comes_from_runtime():
         data_dir=Path("/tmp/manager-data"),
     )
     mac_manager = BrowserManager(mac_runtime)
-    assert "--fingerprint-platform=macos" in mac_manager._build_fingerprint_args({})
+    mac_args = mac_manager._build_fingerprint_args({})
+    assert "--fingerprint-platform=macos" in mac_args
+    assert "--fingerprint-windows-font-metrics" not in mac_args
     assert not any(
         "gpu-vendor" in arg
         for arg in mac_manager._build_fingerprint_args({"gpu_family": "nvidia"})
@@ -157,13 +161,14 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Docker software rendering + runtime platform.
-    assert len(args) == 2
+    # Docker software rendering, Windows persona, and matching font metrics.
+    assert len(args) == 3
 
 
 def test_native_build_args_do_not_force_software_gl():
     args = BrowserManager(NATIVE_RUNTIME)._build_fingerprint_args({})
     assert "--use-angle=swiftshader" not in args
+    assert "--fingerprint-windows-font-metrics" not in args
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────
@@ -315,9 +320,7 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
 
     context = MagicMock(pages=[])
     context.add_init_script = AsyncMock()
-    manager = BrowserManager(
-        NATIVE_RUNTIME, license_key="cb_test", release_channel="preview"
-    )
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
     launch = AsyncMock(return_value=context)
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
@@ -325,11 +328,15 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
     profile = _launch_profile(tmp_path)
     profile["extension_paths"] = ["/tmp/extension"]
     profile["launch_args"] = ["--raw-flag"]
+    profile["license_key"] = "cb_test"
+    profile["release_channel"] = "preview"
+    profile["browser_version"] = "148.0.7778.215.2"
     await manager.launch(profile)
 
     options = launch.await_args.kwargs
     assert options["license_key"] == "cb_test"
     assert options["release_channel"] == "preview"
+    assert options["browser_version"] == "148.0.7778.215.2"
     assert options["extension_paths"] == ["/tmp/extension"]
     assert options["args"].index("--raw-flag") > options["args"].index("--fingerprint-platform=windows")
 

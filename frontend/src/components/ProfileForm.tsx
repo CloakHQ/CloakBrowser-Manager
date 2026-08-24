@@ -17,6 +17,7 @@ interface ProfileFormProps {
   onDelete?: () => Promise<void>;
   onReset?: () => Promise<void>;
   onDuplicate?: () => Promise<void>;
+  onBrowserPrepared?: () => void;
   onCancel: () => void;
 }
 
@@ -40,11 +41,14 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onDuplicate, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onDuplicate, onBrowserPrepared, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
     name: "",
+    license_key: null,
+    release_channel: "stable",
+    browser_version: null,
     screen_width: 1920,
     screen_height: 1080,
     gpu_family: "auto",
@@ -73,6 +77,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [duplicating, setDuplicating] = useState(false);
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
+  const [browserPreparing, setBrowserPreparing] = useState(false);
+  const [browserMessage, setBrowserMessage] = useState<string | null>(null);
+  const [browserError, setBrowserError] = useState<string | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -89,6 +96,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     if (profile) {
       setForm({
         name: profile.name,
+        license_key: undefined,
+        release_channel: profile.release_channel,
+        browser_version: profile.browser_version,
         fingerprint_seed: profile.fingerprint_seed,
         proxy: profile.proxy,
         timezone: profile.timezone,
@@ -140,6 +150,25 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       setTestingProxy(false);
     }
   };
+  const handlePrepareBrowser = async () => {
+    if (!profile) return;
+    setBrowserPreparing(true);
+    setBrowserMessage(null);
+    setBrowserError(null);
+    try {
+      await onSave(form);
+      const result = await api.downloadProfileBrowser(profile.id);
+      setBrowserMessage(
+        `${result.tier === "licensed" ? "Licensed" : "Keyless"} browser ${result.version ?? "external"} is ready.`,
+      );
+      onBrowserPrepared?.();
+    } catch (err) {
+      setBrowserError(err instanceof Error ? err.message : "Failed to prepare browser");
+    } finally {
+      setBrowserPreparing(false);
+    }
+  };
+
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -371,6 +400,86 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             </div>
           </div>
         </section>
+        {/* Browser */}
+        <section>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Browser</h3>
+          <div className="space-y-3">
+            <div>
+              <label className="label">CloakBrowser license key</label>
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1 font-mono"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={typeof form.license_key === "string" ? form.license_key : ""}
+                  onChange={(event) => set("license_key", event.target.value || undefined)}
+                  placeholder={
+                    profile?.license_key_set && form.license_key !== null
+                      ? `Current: ${profile.license_key_masked ?? "set"} — type to replace`
+                      : "Leave empty for the legacy keyless browser"
+                  }
+                />
+                {profile?.license_key_set && form.license_key !== null && (
+                  <button type="button" className="btn-secondary text-xs" onClick={() => set("license_key", null)}>
+                    Remove key
+                  </button>
+                )}
+              </div>
+              {form.license_key === null && profile?.license_key_set && (
+                <p className="mt-1 text-xs text-amber-400">The saved license key will be removed.</p>
+              )}
+              <p className="mt-1 text-xs text-gray-500">
+                The key belongs only to this profile. Keyless profiles default to legacy Chromium 145.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="label">Release channel</label>
+                <select
+                  className="input"
+                  value={form.release_channel ?? "stable"}
+                  onChange={(event) => set("release_channel", event.target.value as "stable" | "preview")}
+                >
+                  <option value="stable">Stable</option>
+                  <option value="preview">Preview</option>
+                </select>
+              </div>
+              <div>
+                <label className="label">Browser version</label>
+                <input
+                  className="input font-mono"
+                  value={form.browser_version ?? ""}
+                  onChange={(event) => set("browser_version", event.target.value || null)}
+                  placeholder={form.license_key || profile?.license_key_set ? "Latest" : "145.0.7632.109.2"}
+                  pattern="[0-9]+(\.[0-9]+){3,4}"
+                  title="Use a full numeric Chromium version"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-gray-500">
+              Leave empty for automatic selection. Exact pins work for paid or keyless profiles; free keys always use the latest licensed build.
+            </p>
+
+            {isEdit && (
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handlePrepareBrowser}
+                  disabled={browserPreparing}
+                  className="btn-secondary flex items-center gap-1.5"
+                >
+                  {browserPreparing && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  {browserPreparing ? "Preparing browser..." : "Save and download/update now"}
+                </button>
+                {browserMessage && <span className="text-xs text-emerald-400">{browserMessage}</span>}
+                {browserError && <span className="text-xs text-red-400">{browserError}</span>}
+              </div>
+            )}
+          </div>
+        </section>
+
 
         {/* Network */}
         <section>
