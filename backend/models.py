@@ -7,12 +7,16 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .runtime import HostOS, RuntimeMode, ViewerMode
+from .binary_cache import normalize_version
 
 
 class ProfileCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    license_key: str | None = None
+    release_channel: Literal["stable", "preview"] = "stable"
+    browser_version: str | None = None
     fingerprint_seed: int | None = None
     proxy: str | None = None
     timezone: str | None = None
@@ -36,12 +40,28 @@ class ProfileCreate(BaseModel):
     portable_cookies: bool = False
     notes: str | None = None
     tags: list[TagCreate] | None = None
+    @field_validator("license_key", mode="before")
+    @classmethod
+    def normalize_optional_license_key(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("browser_version", mode="before")
+    @classmethod
+    def validate_browser_version(cls, value: object) -> object:
+        return normalize_version(value)
+
 
 
 class ProfileUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
+    license_key: str | None = Field(default=None)
+    release_channel: Literal["stable", "preview"] | None = None
+    browser_version: str | None = Field(default=None)
     fingerprint_seed: int | None = None
     proxy: str | None = Field(default=None)
     timezone: str | None = Field(default=None)
@@ -65,6 +85,26 @@ class ProfileUpdate(BaseModel):
     portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
+    @field_validator("license_key", mode="before")
+    @classmethod
+    def normalize_optional_license_update(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("browser_version", mode="before")
+    @classmethod
+    def validate_browser_version_update(cls, value: object) -> object:
+        return normalize_version(value)
+
+    @field_validator("release_channel", mode="before")
+    @classmethod
+    def reject_null_release_channel(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("release_channel cannot be null")
+        return value
+
 
     @field_validator("gpu_family", mode="before")
     @classmethod
@@ -115,6 +155,10 @@ class ReorderRequest(BaseModel):
 class ProfileResponse(BaseModel):
     id: str
     name: str
+    license_key_set: bool = False
+    license_key_masked: str | None = None
+    release_channel: Literal["stable", "preview"] = "stable"
+    browser_version: str | None = None
     fingerprint_seed: int
     proxy: str | None = None
     timezone: str | None = None
@@ -170,8 +214,8 @@ class LaunchResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     running_count: int
-    binary_version: str
-    license_tier: str = "none"
+    installed_binary_count: int
+    binary_cache_dir: str
     profiles_total: int
     host_os: HostOS
     runtime_mode: RuntimeMode
@@ -192,16 +236,30 @@ class RuntimeConfigResponse(BaseModel):
     sidebar_width: str
 
 
-class SettingsResponse(BaseModel):
-    license_key_set: bool
-    license_key_masked: str | None = None
-    release_channel: str = "stable"
+class BrowserBinaryResponse(BaseModel):
+    version: str
+    tier: Literal["licensed", "keyless"]
+    path: str
+    size_bytes: int
+    profile_count: int = 0
+    running_count: int = 0
+    in_use: bool = False
 
 
-class SettingsUpdate(BaseModel):
-    # None = leave unchanged; "" = clear the license key.
-    license_key: str | None = None
-    release_channel: str | None = None
+class BrowserBinaryListResponse(BaseModel):
+    cache_dir: str
+    binaries: list[BrowserBinaryResponse] = Field(default_factory=list)
+
+
+class BrowserDownloadResponse(BaseModel):
+    version: str | None = None
+    tier: Literal["licensed", "keyless"]
+    binary_path: str
+
+
+class BrowserCleanupResponse(BaseModel):
+    removed: list[BrowserBinaryResponse] = Field(default_factory=list)
+    reclaimed_bytes: int = 0
 
 
 class ProfileStatusResponse(BaseModel):

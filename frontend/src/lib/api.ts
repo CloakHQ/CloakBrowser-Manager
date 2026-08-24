@@ -22,6 +22,10 @@ export interface ProfileFile {
 export interface Profile {
   id: string;
   name: string;
+  license_key_set: boolean;
+  license_key_masked: string | null;
+  release_channel: "stable" | "preview";
+  browser_version: string | null;
   fingerprint_seed: number;
   proxy: string | null;
   timezone: string | null;
@@ -67,6 +71,9 @@ export interface LaunchDenial {
 
 export interface ProfileCreateData {
   name: string;
+  license_key?: string | null;
+  release_channel?: "stable" | "preview";
+  browser_version?: string | null;
   fingerprint_seed?: number | null;
   proxy?: string | null;
   timezone?: string | null;
@@ -114,8 +121,8 @@ export interface ProxyTestResult {
 
 export interface SystemStatus {
   running_count: number;
-  binary_version: string;
-  license_tier: string; // "pro" | "free" | "none"
+  installed_binary_count: number;
+  binary_cache_dir: string;
   profiles_total: number;
   host_os: HostOS;
   runtime_mode: RuntimeMode;
@@ -136,15 +143,30 @@ export interface RuntimeConfig {
   sidebar_width: string;
 }
 
-export interface ManagerSettings {
-  license_key_set: boolean;
-  license_key_masked: string | null;
-  release_channel: string; // "stable" | "preview"
+export interface BrowserBinary {
+  version: string;
+  tier: "licensed" | "keyless";
+  path: string;
+  size_bytes: number;
+  profile_count: number;
+  running_count: number;
+  in_use: boolean;
 }
 
-export interface SettingsUpdate {
-  license_key?: string | null; // omit = unchanged; "" = clear
-  release_channel?: string | null;
+export interface BrowserBinaryList {
+  cache_dir: string;
+  binaries: BrowserBinary[];
+}
+
+export interface BrowserDownloadResult {
+  version: string | null;
+  tier: "licensed" | "keyless";
+  binary_path: string;
+}
+
+export interface BrowserCleanupResult {
+  removed: BrowserBinary[];
+  reclaimed_bytes: number;
 }
 
 export class ApiError extends Error {
@@ -301,12 +323,14 @@ export const api = {
   shutdown: () =>
     request<{ ok: boolean; message?: string }>("/api/shutdown", { method: "POST" }),
 
-  getSettings: () => request<ManagerSettings>("/api/settings"),
+  listBrowsers: () => request<BrowserBinaryList>("/api/browsers"),
 
-  updateSettings: (data: SettingsUpdate) =>
-    request<SystemStatus>("/api/settings", {
-      method: "PUT",
-      body: JSON.stringify(data),
+  cleanupUnusedBrowsers: () =>
+    request<BrowserCleanupResult>("/api/browsers/unused", { method: "DELETE" }),
+
+  downloadProfileBrowser: (id: string) =>
+    request<BrowserDownloadResult>(`/api/profiles/${id}/browser/download`, {
+      method: "POST",
     }),
 
   setClipboard: (id: string, text: string) =>

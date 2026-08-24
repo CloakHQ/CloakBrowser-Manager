@@ -273,7 +273,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
       {settingsOpen && (
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}
-          onSaved={setSystemStatus}
+          onChanged={() => api.getStatus().then(setSystemStatus).catch(() => undefined)}
         />
       )}
       {updateInfo?.update_available && !updateDismissed && (
@@ -364,48 +364,31 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto overscroll-contain">
-          {view === "empty" &&
-            ((systemStatus?.license_tier ?? "none") === "none" ? (
-              <div className="flex items-center justify-center h-full px-6">
-                <div className="max-w-sm text-center">
-                  <p className="text-sm font-medium text-gray-200">No license key set</p>
-                  <p className="mt-1.5 text-sm text-gray-500">
-                    Profiles need a key to launch. A free key takes one email and
-                    runs the latest build.
-                  </p>
-                  <div className="mt-5 flex flex-col items-center gap-2">
-                    <button
-                      onClick={() => setSettingsOpen(true)}
-                      className="btn-primary w-56"
-                    >
-                      Enter a key in Settings
-                    </button>
-                    <a
-                      href="https://cloakbrowser.dev/free"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-secondary w-56"
-                    >
-                      Get a free key
-                    </a>
-                    <a
-                      href="https://cloakbrowser.dev/#pricing"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-gray-500 hover:text-gray-300"
-                    >
-                      See Pro plans &rarr;
-                    </a>
-                  </div>
+          {view === "empty" && (
+            <div className="flex items-center justify-center h-full px-6">
+              <div className="max-w-sm text-center">
+                <p className="text-sm font-medium text-gray-200">Select or create a profile</p>
+                <p className="mt-1.5 text-sm text-gray-500">
+                  Each profile owns its license key, release channel, and browser version.
+                  A profile launches only with its own key; a free key takes one email and
+                  runs the latest build.
+                </p>
+                <div className="mt-5 flex flex-col items-center gap-2">
+                  <button onClick={handleNew} className="btn-primary w-56">
+                    Create profile
+                  </button>
+                  <a
+                    href="https://cloakbrowser.dev/free"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn-secondary w-56"
+                  >
+                    Get a free key
+                  </a>
                 </div>
               </div>
-            ) : (
-              <div className="flex items-center justify-center h-full">
-                <div className="text-center">
-                  <p className="text-gray-500 text-sm">Select a profile or create a new one</p>
-                </div>
-              </div>
-            ))}
+            </div>
+          )}
 
           {view === "create" && (
             <ProfileForm
@@ -424,6 +407,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleUpdate}
               onDelete={handleDelete}
+              onBrowserPrepared={() => api.getStatus().then(setSystemStatus).catch(() => undefined)}
               onReset={handleReset}
               onDuplicate={handleDuplicate}
               onCancel={() => {

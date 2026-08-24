@@ -31,6 +31,9 @@ def test_profile_create_minimal():
     assert p.human_preset == "default"
     assert p.extension_paths == []
     assert p.allow_3p_cookies is True
+    assert p.license_key is None
+    assert p.release_channel == "stable"
+    assert p.browser_version is None
 
 
 def test_profile_create_all_fields():
@@ -87,6 +90,28 @@ def test_profile_create_invalid_human_preset():
 def test_profile_create_invalid_color_scheme():
     with pytest.raises(ValidationError):
         ProfileCreate(name="Bad", color_scheme="auto")
+
+
+def test_profile_browser_version_validation():
+    profile = ProfileCreate(
+        name="Pinned",
+        license_key=" cb_test ",
+        release_channel="preview",
+        browser_version="148.0.7778.215.2",
+    )
+    assert profile.license_key == "cb_test"
+    assert profile.browser_version == "148.0.7778.215.2"
+
+    with pytest.raises(ValidationError):
+        ProfileCreate(name="Bad", browser_version="latest")
+
+
+def test_profile_update_can_explicitly_clear_browser_credentials():
+    update = ProfileUpdate(license_key=None, browser_version=None)
+    assert update.model_dump(exclude_unset=True) == {
+        "license_key": None,
+        "browser_version": None,
+    }
 
 
 # ── ProfileUpdate ────────────────────────────────────────────────────────────
