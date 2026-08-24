@@ -30,11 +30,21 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .env_file import load_env_file
 
-# Populate os.environ from the manager-root .env before anything reads it
-# (database.resolve_runtime, AUTH_TOKEN, the license config below).
+# Load the legacy deployment settings once, then remove them before importing
+# cloakbrowser. Explicit per-profile arguments must be the only license source.
 load_env_file()
+_LEGACY_ENV_LICENSE_KEY = os.environ.pop("CLOAKBROWSER_LICENSE_KEY", None)
+_LEGACY_ENV_RELEASE_CHANNEL = os.environ.pop("CLOAKBROWSER_RELEASE_CHANNEL", None)
+os.environ.pop("CLOAKBROWSER_VERSION", None)
+os.environ.pop("CLOAKBROWSER_BINARY_PATH", None)
 
 from . import database as db
+
+# Persist downloaded binaries with Manager data unless an external cache mount
+# was explicitly configured.
+if not os.environ.get("CLOAKBROWSER_CACHE_DIR"):
+    os.environ["CLOAKBROWSER_CACHE_DIR"] = str(db.DATA_DIR / "binaries")
+
 from cloakbrowser.license import CloakBrowserLicenseError
 
 from .browser_manager import (
@@ -45,6 +55,9 @@ from .browser_manager import (
     test_proxy,
 )
 from .models import (
+    BrowserBinaryListResponse,
+    BrowserCleanupResponse,
+    BrowserDownloadResponse,
     ClipboardRequest,
     LaunchResponse,
     LoginRequest,
@@ -55,13 +68,17 @@ from .models import (
     ProxyTestRequest,
     ProxyTestResponse,
     ReorderRequest,
-    SettingsResponse,
-    SettingsUpdate,
     StatusResponse,
     TagResponse,
     UpdateCheckResponse,
 )
 from .runtime import bundle_dir
+from .binary_cache import (
+    assert_no_global_license_file,
+    cache_dir as browser_cache_dir,
+    cleanup_unused_binaries,
+    list_installed_binaries,
+)
 from .settings_store import load_settings, save_settings
 
 logger = logging.getLogger("cloakbrowser.manager")
@@ -108,23 +125,14 @@ diagnostics.install_stderr_tee()
 # token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
-# App-wide CloakBrowser Pro license. One key per Manager instance — the
-# concurrency-seat pool is per-license, so every launched profile shares it.
-# Release channel picks Stable vs Preview builds.
-#
-# Precedence: environment (incl. values load_env_file pulled from a .env) wins,
-# then the in-app Settings (settings.json). Native users have no .env and set
-# the key in the Settings UI; Docker/CI keep overriding via env vars.
 _STORED_SETTINGS = load_settings()
-
-
-def _resolve_setting(env_key: str, settings_key: str) -> str | None:
-    return os.environ.get(env_key) or _STORED_SETTINGS.get(settings_key) or None
-
-
-LICENSE_KEY: str | None = _resolve_setting("CLOAKBROWSER_LICENSE_KEY", "license_key")
-RELEASE_CHANNEL: str | None = _resolve_setting(
-    "CLOAKBROWSER_RELEASE_CHANNEL", "release_channel"
+_LEGACY_LICENSE_KEY = (
+    _LEGACY_ENV_LICENSE_KEY or _STORED_SETTINGS.get("license_key") or None
+)
+_LEGACY_RELEASE_CHANNEL = (
+    _LEGACY_ENV_RELEASE_CHANNEL
+    or _STORED_SETTINGS.get("release_channel")
+    or "stable"
 )
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
@@ -283,7 +291,7 @@ class AuthMiddleware:
 
 
 # Singleton browser manager
-browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CHANNEL)
+browser_mgr = BrowserManager()
 
 # Frontend build directory (React production build). bundle_dir() resolves to
 # the PyInstaller extraction root when frozen, else the manager repo root.
@@ -486,10 +494,17 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    migrated = db.migrate_legacy_browser_settings(
+        _LEGACY_LICENSE_KEY,
+        _LEGACY_RELEASE_CHANNEL,
+    )
+    migrated_settings = dict(_STORED_SETTINGS)
+    migrated_settings.pop("license_key", None)
+    migrated_settings.pop("release_channel", None)
+    if migrated_settings != _STORED_SETTINGS:
+        save_settings(migrated_settings)
+    assert_no_global_license_file()
     await browser_mgr.cleanup_stale()
-    # Resolve tier + pre-download the (Pro) binary before serving launches, so the
-    # download never blocks a launch or auto-launch's 60s timeout.
-    await asyncio.to_thread(browser_mgr.resolve_binary_status)
     diagnostics.install_asyncio_handler(asyncio.get_running_loop(), logger)
     logger.info(diagnostics.startup_line(browser_mgr))
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
@@ -552,7 +567,11 @@ async def auth_logout(request: Request, response: Response):
 
 
 def _profile_response(profile: dict) -> ProfileResponse:
+    license_key = profile.get("license_key")
     payload = {**profile, **browser_mgr.get_status(profile["id"])}
+    payload.pop("license_key", None)
+    payload["license_key_set"] = bool(license_key)
+    payload["license_key_masked"] = _mask_key(license_key)
     payload["tags"] = [TagResponse(**tag) for tag in profile.get("tags", [])]
     return ProfileResponse(**payload)
 
@@ -797,27 +816,19 @@ def _windows_font_health() -> tuple[int | None, int | None, bool | None]:
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    # Prefer the version/tier resolved at startup (reflects the actual Pro build
-    # in use). Fall back to the keyless constant before startup resolution runs.
-    binary_version = browser_mgr.binary_version
-    if not binary_version:
-        try:
-            from cloakbrowser.config import get_chromium_version
-
-            binary_version = get_chromium_version()
-        except ImportError:
-            from cloakbrowser.config import CHROMIUM_VERSION
-
-            binary_version = CHROMIUM_VERSION
-
     profiles = db.list_profiles()
+    installed = await asyncio.to_thread(
+        list_installed_binaries,
+        profiles,
+        list(browser_mgr.running.values()),
+    )
     fonts_present, fonts_required, fonts_complete = await asyncio.to_thread(
         _windows_font_health
     )
     return StatusResponse(
         running_count=len(browser_mgr.running),
-        binary_version=binary_version,
-        license_tier=browser_mgr.license_tier,
+        installed_binary_count=len(installed),
+        binary_cache_dir=str(browser_cache_dir()),
         profiles_total=len(profiles),
         host_os=browser_mgr.runtime.host_os,
         runtime_mode=browser_mgr.runtime.runtime_mode,
@@ -927,12 +938,6 @@ def _mask_key(key: str | None) -> str | None:
     return f"{key[:5]}…{key[-4:]}"
 
 
-def _settings_response() -> SettingsResponse:
-    return SettingsResponse(
-        license_key_set=bool(browser_mgr.license_key),
-        license_key_masked=_mask_key(browser_mgr.license_key),
-        release_channel=(browser_mgr.release_channel or "stable"),
-    )
 
 
 @app.post("/api/shutdown")
@@ -966,43 +971,65 @@ async def shutdown_manager(request: Request):
     return {"ok": True, "message": "CloakBrowser Manager is shutting down"}
 
 
-@app.get("/api/settings", response_model=SettingsResponse)
-async def get_settings():
-    return _settings_response()
+@app.get("/api/browsers", response_model=BrowserBinaryListResponse)
+async def list_browsers():
+    profiles = db.list_profiles()
+    async with browser_mgr._binary_lock:
+        binaries = await asyncio.to_thread(
+            list_installed_binaries,
+            profiles,
+            list(browser_mgr.running.values()),
+        )
+    return BrowserBinaryListResponse(
+        cache_dir=str(browser_cache_dir()),
+        binaries=binaries,
+    )
 
 
-@app.put("/api/settings", response_model=StatusResponse)
-async def update_settings(payload: SettingsUpdate):
-    """Persist license key / release channel and hot-apply without a restart.
+@app.delete("/api/browsers/unused", response_model=BrowserCleanupResponse)
+async def cleanup_browsers():
+    profiles = db.list_profiles()
+    async with browser_mgr._binary_lock:
+        removed, reclaimed = await asyncio.to_thread(
+            cleanup_unused_binaries,
+            profiles,
+            list(browser_mgr.running.values()),
+        )
+    return BrowserCleanupResponse(removed=removed, reclaimed_bytes=reclaimed)
 
-    Returns the refreshed system status (tier + resolved binary version) so the
-    top-bar badge updates immediately. Re-resolving may download the Pro build,
-    so it runs off the event loop; the request completes when it's ready.
-    """
-    stored = load_settings()
 
-    if payload.license_key is not None:
-        key = payload.license_key.strip()
-        if key:
-            stored["license_key"] = key
-            browser_mgr.license_key = key
-        else:  # empty string = clear the key (back to keyless)
-            stored.pop("license_key", None)
-            browser_mgr.license_key = None
+@app.post(
+    "/api/profiles/{profile_id}/browser/download",
+    response_model=BrowserDownloadResponse,
+)
+async def download_profile_browser(profile_id: str):
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if profile_id in browser_mgr.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the profile before updating its browser binary",
+        )
+    try:
+        prepared = await browser_mgr.prepare_binary(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(
+            "Failed to prepare browser for profile %s: %s",
+            profile_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=502, detail="Failed to download browser binary")
+    return BrowserDownloadResponse(
+        version=prepared.version,
+        tier=prepared.tier,
+        binary_path=prepared.binary_path,
+    )
 
-    if payload.release_channel is not None:
-        channel = payload.release_channel.strip().lower()
-        if channel not in {"stable", "preview"}:
-            raise HTTPException(
-                status_code=400,
-                detail="release_channel must be 'stable' or 'preview'",
-            )
-        stored["release_channel"] = channel
-        browser_mgr.release_channel = channel
 
-    save_settings(stored)
-    await asyncio.to_thread(browser_mgr.resolve_binary_status)
-    return await get_system_status()
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────

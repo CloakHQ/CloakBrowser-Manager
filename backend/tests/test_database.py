@@ -80,6 +80,34 @@ def test_create_profile_minimal(tmp_db: Path):
     assert p["updated_at"] is not None
 
 
+def test_profile_browser_settings_roundtrip(tmp_db: Path):
+    profile = db.create_profile(
+        "Licensed",
+        license_key="cb_test",
+        release_channel="preview",
+        browser_version="148.0.7778.215.2",
+    )
+
+    assert profile["license_key"] == "cb_test"
+    assert profile["release_channel"] == "preview"
+    assert profile["browser_version"] == "148.0.7778.215.2"
+
+
+def test_legacy_browser_settings_migrate_existing_profiles_once(tmp_db: Path):
+    existing = db.create_profile("Existing")
+
+    migrated = db.migrate_legacy_browser_settings("cb_legacy", "preview")
+    first = db.get_profile(existing["id"])
+    db.create_profile("New")
+    repeated = db.migrate_legacy_browser_settings("cb_other", "stable")
+
+    assert migrated == 1
+    assert first["license_key"] == "cb_legacy"
+    assert first["release_channel"] == "preview"
+    assert repeated == 0
+    assert db.list_profiles()[0]["license_key"] is None
+
+
 def test_create_profile_with_seed(tmp_db: Path):
     p = db.create_profile("Seeded", fingerprint_seed=42)
     assert p["fingerprint_seed"] == 42

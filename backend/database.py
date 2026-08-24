@@ -18,9 +18,10 @@ DATA_DIR = RUNTIME.data_dir
 DB_PATH = DATA_DIR / "profiles.db"
 
 _PROFILE_COLUMNS = (
-    "id", "name", "fingerprint_seed", "proxy", "timezone", "locale",
-    "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
-    "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
+    "id", "name", "license_key", "release_channel", "browser_version",
+    "fingerprint_seed", "proxy", "timezone", "locale", "screen_width",
+    "screen_height", "gpu_family", "humanize", "human_preset", "geoip",
+    "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
     "restore_session", "notes", "user_data_dir", "created_at", "updated_at", "sort_order",
 )
@@ -29,6 +30,9 @@ _PROFILE_SCHEMA = """
 CREATE TABLE profiles (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    license_key TEXT,
+    release_channel TEXT NOT NULL DEFAULT 'stable',
+    browser_version TEXT,
     fingerprint_seed INTEGER NOT NULL,
     proxy TEXT,
     timezone TEXT,
@@ -78,6 +82,15 @@ def _create_tags_table(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (profile_id, tag)
         )
     """)
+def _create_metadata_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS manager_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+
+
 
 
 def _rebuild_profiles(conn: sqlite3.Connection, old_columns: set[str]) -> None:
@@ -145,18 +158,56 @@ def _rebuild_profiles(conn: sqlite3.Connection, old_columns: set[str]) -> None:
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_db() as conn:
-        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='profiles'").fetchone()
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='profiles'"
+        ).fetchone()
         if not exists:
             conn.execute(_PROFILE_SCHEMA)
             _create_tags_table(conn)
+            _create_metadata_table(conn)
             conn.commit()
             return
-        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+        old_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
+        }
         if old_columns != set(_PROFILE_COLUMNS):
             _rebuild_profiles(conn, old_columns)
         else:
             _create_tags_table(conn)
-            conn.commit()
+        _create_metadata_table(conn)
+        conn.commit()
+
+
+def migrate_legacy_browser_settings(
+    license_key: str | None,
+    release_channel: str | None,
+) -> int:
+    """Copy the former global browser settings to existing profiles once."""
+    migration_key = "profile_browser_settings_v1"
+    with get_db() as conn:
+        migrated = conn.execute(
+            "SELECT 1 FROM manager_metadata WHERE key = ?", (migration_key,)
+        ).fetchone()
+        if migrated:
+            return 0
+
+        key = (license_key or "").strip() or None
+        channel = (release_channel or "stable").strip().lower()
+        if channel not in {"stable", "preview"}:
+            channel = "stable"
+        cursor = conn.execute(
+            """
+            UPDATE profiles
+            SET license_key = ?, release_channel = ?, updated_at = ?
+            """,
+            (key, channel, _now()),
+        )
+        conn.execute(
+            "INSERT INTO manager_metadata (key, value) VALUES (?, ?)",
+            (migration_key, _now()),
+        )
+        conn.commit()
+        return cursor.rowcount
 
 
 def _now() -> str:
@@ -179,6 +230,9 @@ def create_profile(name: str, fingerprint_seed: int | None = None, **fields: Any
     tags = fields.pop("tags", None) or []
     values = {
         "id": profile_id, "name": name, "fingerprint_seed": seed,
+        "license_key": fields.get("license_key"),
+        "release_channel": fields.get("release_channel", "stable"),
+        "browser_version": fields.get("browser_version"),
         "proxy": fields.get("proxy"), "timezone": fields.get("timezone"), "locale": fields.get("locale"),
         "screen_width": fields.get("screen_width", 1920), "screen_height": fields.get("screen_height", 1080),
         "gpu_family": fields.get("gpu_family", "auto"), "humanize": fields.get("humanize", False),

@@ -21,6 +21,7 @@ from cloakbrowser.license import (
 )
 
 from .runtime import RuntimeConfig, resolve_runtime
+from .binary_cache import PreparedBinary, ensure_profile_binary, profile_binary_request
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
@@ -315,24 +316,16 @@ class RunningProfile:
     # context_async on the returned context). Read on close to tell a seat/
     # license denial apart from a real crash or a user-initiated close.
     denial_path: str | None = None
+    browser_version: str | None = None
+    binary_tier: str = "keyless"
 
 
 class BrowserManager:
     def __init__(
         self,
         runtime_config: RuntimeConfig | None = None,
-        license_key: str | None = None,
-        release_channel: str | None = None,
     ):
         self.runtime = runtime_config or resolve_runtime()
-        # App-wide license: passed to every launch so the wrapper downloads the
-        # Pro build and injects the key the Pro binary needs to boot + take a seat.
-        self.license_key = license_key
-        self.release_channel = release_channel
-        # Resolved at startup by resolve_binary_status(); read by GET /api/status.
-        self.license_tier = "keyless"
-        self.license_plan: str | None = None
-        self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
         # Last launch failure per profile, surfaced on the status poll and cleared
         # on the next launch. Holds post-handshake denials (out of seats, bad key)
@@ -346,60 +339,12 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
+        self._binary_lock = asyncio.Lock()
 
-    def resolve_binary_status(self) -> None:
-        """Resolve the license tier + binary version and pre-download the binary.
-
-        Blocking — called once at startup (via a thread) so the multi-hundred-MB
-        Pro download stays out of the launch path and auto-launch's 60s timeout.
-        Never raises: on any failure the keyless baked-in binary remains usable.
-        """
-        from cloakbrowser.config import CHROMIUM_VERSION, get_chromium_version
-        from cloakbrowser.download import ensure_binary
-        from cloakbrowser.license import (
-            get_pro_latest_version,
-            resolve_license_key,
-            validate_license,
-        )
-
-        try:
-            keyless_version = get_chromium_version()
-        except Exception:
-            keyless_version = CHROMIUM_VERSION
-
-        tier = "keyless"
-        version = keyless_version
-
-        key = resolve_license_key(self.license_key)
-        if key:
-            try:
-                info = validate_license(key)
-            except Exception as exc:
-                info = None
-                logger.warning("License validation failed: %s", exc)
-            if info and info.valid:
-                tier = "free" if info.plan == "free" else "pro"
-                self.license_plan = info.plan
-                try:
-                    version = get_pro_latest_version(self.release_channel) or keyless_version
-                except Exception as exc:
-                    logger.warning("Could not resolve Pro version: %s", exc)
-
-        self.license_tier = tier
-        self.binary_version = version
-
-        try:
-            ensure_binary(
-                license_key=self.license_key,
-                release_channel=self.release_channel,
-            )
-            logger.info("Binary ready: tier=%s version=%s", tier, version)
-        except Exception as exc:
-            logger.error(
-                "Binary pre-download failed (keyless fallback remains): %s",
-                exc,
-                exc_info=True,
-            )
+    async def prepare_binary(self, profile: dict[str, Any]) -> PreparedBinary:
+        """Resolve and download one profile's browser binary on demand."""
+        async with self._binary_lock:
+            return await asyncio.to_thread(ensure_profile_binary, profile)
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
@@ -409,13 +354,14 @@ class BrowserManager:
         # produced it. Proxy credentials are redacted; never log the key.
         from . import diagnostics
 
+        request = profile_binary_request(profile)
         logger.info(
-            "Launching profile %s: seed=%s proxy=%s tier=%s plan=%s runtime=%s",
+            "Launching profile %s: seed=%s proxy=%s browser=%s channel=%s runtime=%s",
             profile_id,
             profile.get("fingerprint_seed"),
             diagnostics.redact_proxy(profile.get("proxy")),
-            self.license_tier,
-            self.license_plan or "-",
+            request.browser_version or ("latest" if request.license_key else "platform-default"),
+            request.release_channel,
             self.runtime.runtime_mode,
         )
 
@@ -431,7 +377,9 @@ class BrowserManager:
         ws_port: int | None = None
         cdp_port: int | None = None
         context: Any | None = None
+        prepared: PreparedBinary | None = None
         try:
+            prepared = await self.prepare_binary(profile)
             if self.runtime.viewer_mode == "vnc":
                 display, ws_port = await self.vnc.allocate()
 
@@ -450,7 +398,7 @@ class BrowserManager:
             # reports "initializing" via get_status while it works (one short
             # headless launch). Never fatal.
             if profile.get("set_google_default", True):
-                await self._ensure_search_engine(profile_id, user_data_dir)
+                await self._ensure_search_engine(profile, user_data_dir)
 
             if display is not None and ws_port is not None:
                 await self.vnc.start_vnc(
@@ -496,8 +444,9 @@ class BrowserManager:
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
                 "extension_paths": profile.get("extension_paths") or [],
-                "license_key": self.license_key,
-                "release_channel": self.release_channel,
+                "license_key": request.license_key,
+                "browser_version": request.browser_version,
+                "release_channel": request.release_channel,
             }
             if display is not None:
                 launch_options["viewport"] = {
@@ -599,6 +548,8 @@ class BrowserManager:
                 user_data_dir=user_data_dir,
                 capture_preview=bool(profile.get("capture_preview", True)),
                 denial_path=getattr(context, "_cloak_denial_path", None),
+                browser_version=prepared.version if prepared else request.browser_version,
+                binary_tier=prepared.tier if prepared else request.tier,
             )
             context.on(
                 "close",
@@ -640,7 +591,7 @@ class BrowserManager:
             raise
 
     async def _ensure_search_engine(
-        self, profile_id: str, user_data_dir: Path
+        self, profile: dict[str, Any], user_data_dir: Path
     ) -> None:
         """Make Google the default search engine, once per profile.
 
@@ -653,6 +604,7 @@ class BrowserManager:
         so a persistently-failing profile doesn't pay an extra headless launch
         (~5s) on every single launch, silently, forever.
         """
+        profile_id = profile["id"]
         marker = user_data_dir / SEARCH_ENGINE_MARKER
         state = marker.read_text().strip() if marker.exists() else ""
         if state == "google":
@@ -668,7 +620,7 @@ class BrowserManager:
 
         self._initializing.add(profile_id)
         try:
-            await self._setup_google_default(user_data_dir)
+            await self._setup_google_default(profile, user_data_dir)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("google\n")
             logger.info(
@@ -697,7 +649,9 @@ class BrowserManager:
         finally:
             self._initializing.discard(profile_id)
 
-    async def _setup_google_default(self, user_data_dir: Path) -> None:
+    async def _setup_google_default(
+        self, profile: dict[str, Any], user_data_dir: Path
+    ) -> None:
         """Add Google via the settings UI, then commit it as the default.
 
         Single headless launch, no file seeding. A plain Preferences write can't
@@ -708,7 +662,7 @@ class BrowserManager:
         dialog — Chrome creates the row with a valid hash — then "Make default".
         Every later launch then carries Google via the profile's own files.
         """
-        ctx = await self._headless_launch(user_data_dir)
+        ctx = await self._headless_launch(profile, user_data_dir)
         try:
             page = await ctx.new_page()
             await page.goto("chrome://settings/searchEngines")
@@ -749,15 +703,19 @@ class BrowserManager:
             await self._close_context(ctx, "search-init")
         await asyncio.sleep(0.5)
 
-    async def _headless_launch(self, user_data_dir: Path) -> Any:
+    async def _headless_launch(
+        self, profile: dict[str, Any], user_data_dir: Path
+    ) -> Any:
         """Short headless launch used only by the one-time search-engine setup."""
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             (user_data_dir / lock_file).unlink(missing_ok=True)
+        request = profile_binary_request(profile)
         return await launch_persistent_context_async(
             user_data_dir=str(user_data_dir),
             headless=True,
-            license_key=self.license_key,
-            release_channel=self.release_channel,
+            license_key=request.license_key,
+            browser_version=request.browser_version,
+            release_channel=request.release_channel,
         )
 
     async def _capture_screenshot(self, running: RunningProfile) -> None:
@@ -944,7 +902,7 @@ class BrowserManager:
         logger.info("Auto-launching %d profile(s)...", len(auto_profiles))
         for profile in auto_profiles:
             try:
-                await asyncio.wait_for(self.launch(profile), timeout=60)
+                await self.launch(profile)
                 logger.info("Auto-launched profile %s (%s)", profile["name"], profile["id"])
             except Exception as exc:
                 logger.error(

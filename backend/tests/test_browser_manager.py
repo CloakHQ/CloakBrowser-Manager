@@ -320,9 +320,7 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
 
     context = MagicMock(pages=[])
     context.add_init_script = AsyncMock()
-    manager = BrowserManager(
-        NATIVE_RUNTIME, license_key="cb_test", release_channel="preview"
-    )
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
     launch = AsyncMock(return_value=context)
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
@@ -330,11 +328,15 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
     profile = _launch_profile(tmp_path)
     profile["extension_paths"] = ["/tmp/extension"]
     profile["launch_args"] = ["--raw-flag"]
+    profile["license_key"] = "cb_test"
+    profile["release_channel"] = "preview"
+    profile["browser_version"] = "148.0.7778.215.2"
     await manager.launch(profile)
 
     options = launch.await_args.kwargs
     assert options["license_key"] == "cb_test"
     assert options["release_channel"] == "preview"
+    assert options["browser_version"] == "148.0.7778.215.2"
     assert options["extension_paths"] == ["/tmp/extension"]
     assert options["args"].index("--raw-flag") > options["args"].index("--fingerprint-platform=windows")
 

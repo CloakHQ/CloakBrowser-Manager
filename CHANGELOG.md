@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Per-profile license keys and browser versions.** Every profile now owns its CloakBrowser key, Stable/Preview channel, and optional exact Chromium version pin. Keyless profiles default to the public 145 build, while licensed profiles can track their channel or roll back to an exact version.
+- **Persistent multi-version browser cache.** Browser binaries download on demand when a profile starts, default to the Manager data directory, can use an external `CLOAKBROWSER_CACHE_DIR` mount, and can be inspected or cleaned from the gear panel.
+
+### Changed
+- **Removed global browser licensing.** `CLOAKBROWSER_LICENSE_KEY` and `CLOAKBROWSER_RELEASE_CHANNEL` are no longer runtime settings. Existing values migrate once to existing profiles, and new profiles start keyless. Docker images no longer download a browser during build.
+
 ### Fixed
 - **Linux Docker font identity now matches the Windows persona more closely.** The image includes the recommended emoji and CJK baseline fonts, replaces the incomplete XP-era core-font download with a private licensed-font mount, refreshes that mount at startup, and enables CloakBrowser's Windows font-metrics profile for Linux sessions.
 

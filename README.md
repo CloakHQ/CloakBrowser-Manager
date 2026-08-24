@@ -39,9 +39,9 @@ Download the installer from the [latest release](https://github.com/CloakHQ/Cloa
 - **macOS** — open the `.dmg` and drag **CloakBrowser Manager** into Applications. (Unsigned during early access — on first launch, run `xattr -rc "/Applications/CloakBrowser Manager.app"` in Terminal, or approve it under **System Settings → Privacy & Security → Open Anyway**.)
 - **Windows** — run the setup `.exe`. (Unsigned during early access — if SmartScreen warns, click **More info → Run anyway**.)
 
-No Python, Node, or git required. The Manager starts on `127.0.0.1:8080` and opens in your default browser. On first launch it downloads the CloakBrowser engine. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
+No Python, Node, or git required. The Manager starts on `127.0.0.1:8080` and opens in your default browser. A profile downloads its selected CloakBrowser engine only when it is first launched. Profiles and downloaded browser versions are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
 
-Open **Settings** (gear icon, top right) to add your license key and pick the Stable or Preview channel.
+Set the license key, Stable/Preview channel, and optional exact browser version in each profile.
 
 #### Run from source (developers)
 
@@ -71,29 +71,18 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues) and attach the log so we can help. On Windows/macOS it's `logs/manager.log` in the data folder (`%LOCALAPPDATA%\CloakBrowser Manager` / `~/Library/Application Support/CloakBrowser Manager`); on Linux/Docker use `docker logs <container>`.
 
-## CloakBrowser license key
+## Profile browser versions and license keys
 
-The Manager runs on the CloakBrowser engine, so it needs a key.<br>
-[Get a free one with GitHub](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
-[Paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time, from a handful to thousands.
+Browser selection belongs to the profile, not the Manager deployment. Each profile can use a different CloakBrowser license key, release channel, and exact Chromium version.
 
-Add your key once and every profile uses it.
+- Leave the license key empty to use the public legacy Chromium `145.0.7632.109.2` build by default. Linux ARM64 uses the wrapper's platform keyless build because no public 145 ARM64 asset exists.
+- Add a free or paid key to use the licensed build selected by the Stable or Preview channel.
+- Leave **Browser version** empty for automatic selection, or enter a full version such as `148.0.7778.215.2` to pin or roll back a paid or keyless profile. CloakBrowser free keys always resolve to the latest licensed build.
+- Click **Save and download/update now** to prepare a stopped profile immediately. Otherwise the Manager checks and downloads the binary when the profile launches.
 
-**Native app (Windows/macOS):** open **Settings** (gear icon, top right), paste your key, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
+The API never returns the raw key after it is saved; profile responses expose only whether a key exists and a masked value. Existing installations migrate the former global key and channel to every existing profile once. New profiles remain keyless until configured.
 
-**Docker or run-from-source:** set it in a manager-root `.env` instead:
-
-```bash
-cp .env.example .env
-```
-
-```bash
-# .env
-CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
-CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
-```
-
-The file is loaded automatically at startup. Restart the Manager after changing it. With Docker, you can also pass the key with `-e CLOAKBROWSER_LICENSE_KEY=...`. An environment variable overrides the in-app setting.
+The gear panel lists installed versions and can delete versions not referenced by any profile or running session.
 
 ## Why Not a Cloud Anti-Detect Browser?
 
@@ -115,6 +104,8 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 
 - **Unlimited profiles, no per-profile tax** — create as many identities as you want. You pay only for how many run at the same time, not how many you keep. Dormant accounts cost nothing.
 - **Each profile is a different machine** — its own fingerprint seed, GPU family, screen, cookies, localStorage, cache, and history, persistent across restarts
+- **Per-profile browser selection** — assign a different license key, Stable/Preview channel, and exact CloakBrowser version to every profile, or run keyless on the legacy 145 build
+- **Persistent multi-version cache** — binaries download on first use, survive container recreation, and unused versions can be cleaned from the gear panel
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
@@ -124,7 +115,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
 - **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
 - **Clipboard sync** — copy and paste between the Manager and Linux VNC browser profiles
-- **License and system status** — see the active tier, binary version, and Windows font health in the top bar
+- **System status** — see the number and location of cached browser versions and Windows font health in the top bar
 - **Optional authentication** — protect the web UI and API with a single token, or run locally without authentication
 - **Powered by CloakBrowser** — the identities don't just look different, they hold up: a source-level C++ patched Chromium engine tested against Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS, and BrowserScan
 
@@ -173,6 +164,21 @@ services:
       - /srv/cloakbrowser-manager/fonts/windows:/usr/local/share/fonts/windows:ro
 ```
 
+Downloaded browsers default to the Manager data directory (`/data/binaries` in Docker), so the existing `/data` mount preserves them across container recreation. To use a separate host path or named volume, set `CLOAKBROWSER_CACHE_DIR` to the mounted container path:
+
+```yaml
+services:
+  manager:
+    environment:
+      CLOAKBROWSER_CACHE_DIR: /browser-cache
+    volumes:
+      - ~/.cloakbrowser-manager:/data
+      - cloakbrowser-binaries:/browser-cache
+
+volumes:
+  cloakbrowser-binaries:
+```
+
 The container refreshes the mounted directory's Fontconfig cache at startup.
 After recreating it, `/api/status` and the top-bar badge report whether all
 required Windows persona font families are available.
@@ -210,7 +216,7 @@ docker rm <container-id>
 docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
 ```
 
-Profiles and session data remain in the native application-data directory or the `cloakprofiles` Docker volume across updates.
+Profiles, session data, and downloaded browser versions remain in the native application-data directory or the `/data` Docker volume across updates.
 
 ## Automation API
 

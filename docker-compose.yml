@@ -8,5 +8,4 @@ services:
     environment:
       # Values come from the manager-root .env (compose reads it automatically).
       - AUTH_TOKEN=${AUTH_TOKEN:-}
-      - CLOAKBROWSER_LICENSE_KEY=${CLOAKBROWSER_LICENSE_KEY:-}
-      - CLOAKBROWSER_RELEASE_CHANNEL=${CLOAKBROWSER_RELEASE_CHANNEL:-stable}
+      - CLOAKBROWSER_CACHE_DIR=${CLOAKBROWSER_CACHE_DIR:-/data/binaries}

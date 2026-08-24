@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,10 +23,16 @@ _mock_cloakbrowser.launch_persistent_context_async = AsyncMock()  # type: ignore
 _mock_config = types.ModuleType("cloakbrowser.config")
 _mock_config.CHROMIUM_VERSION = "0.0.0-test"  # type: ignore[attr-defined]
 _mock_config.get_chromium_version = lambda: "0.0.0-test"  # type: ignore[attr-defined]
+_mock_config.get_platform_tag = lambda: "linux-x64"  # type: ignore[attr-defined]
+_mock_config.get_cache_dir = lambda: Path(  # type: ignore[attr-defined]
+    os.environ.get("CLOAKBROWSER_CACHE_DIR", "/tmp/cloakbrowser-test-cache")
+)
+_mock_config.get_effective_version = lambda **kwargs: None  # type: ignore[attr-defined]
 
-# BrowserManager.resolve_binary_status() (run in the lifespan) imports these.
 _mock_download = types.ModuleType("cloakbrowser.download")
-_mock_download.ensure_binary = MagicMock()  # type: ignore[attr-defined]
+_mock_download.ensure_binary = MagicMock(  # type: ignore[attr-defined]
+    return_value="/tmp/cloakbrowser-test-cache/chromium-145.0.7632.109.2/chrome"
+)
 
 _mock_license = types.ModuleType("cloakbrowser.license")
 _mock_license.resolve_license_key = lambda key=None: key  # type: ignore[attr-defined]
