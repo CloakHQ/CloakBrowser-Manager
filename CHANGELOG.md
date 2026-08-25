@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Memory leak when a browser closed on its own.** If a browser exited outside the Stop button (a crash, or closing Chrome from inside the profile window), a helper process was left running and holding around 130 MB. These built up over time on a long-running manager. The manager now releases it on that path as well.
 
 ### Added
+- **License and seat limits now surface in a banner.** When a profile fails to launch because the plan's concurrent-session limit is reached or the license key is invalid, the Manager shows a dismissible top banner with an Upgrade link instead of failing silently.
 - **Automated multi-architecture Docker releases.** Version tags now build Linux AMD64 and ARM64 images on native GitHub-hosted runners, combine them under one Docker tag, and publish both the release version and `latest` alongside the Windows and macOS installers.
 
 ### Changed
