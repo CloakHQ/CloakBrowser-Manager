@@ -228,6 +228,45 @@ def test_stop_not_running(app_client: TestClient):
     assert resp.status_code == 404
 
 
+# ── Runtime UI Config ────────────────────────────────────────────────────────
+
+
+def test_runtime_config_default_sidebar_width(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("SIDEBAR_WIDTH", raising=False)
+
+    resp = app_client.get("/api/config")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"sidebar_width": "16rem"}
+
+
+def test_runtime_config_sidebar_width_from_env(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SIDEBAR_WIDTH", "20rem")
+
+    resp = app_client.get("/api/config")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"sidebar_width": "20rem"}
+
+
+def test_runtime_config_invalid_sidebar_width_falls_back(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SIDEBAR_WIDTH", "calc(100vw - 1rem)")
+
+    resp = app_client.get("/api/config")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"sidebar_width": "16rem"}
+
+
 # ── System Status ────────────────────────────────────────────────────────────
 
 

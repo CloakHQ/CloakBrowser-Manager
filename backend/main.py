@@ -10,6 +10,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 import signal
 import struct
 import shutil
@@ -55,6 +56,7 @@ from .models import (
     ProxyTestRequest,
     ProxyTestResponse,
     ReorderRequest,
+    RuntimeConfigResponse,
     SettingsResponse,
     SettingsUpdate,
     StatusResponse,
@@ -107,6 +109,8 @@ diagnostics.install_stderr_tee()
 # (except /api/auth/status, /api/auth/login and /api/health) require Bearer
 # token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
+DEFAULT_SIDEBAR_WIDTH = "16rem"
+_SIDEBAR_WIDTH_RE = re.compile(r"^\d+(?:\.\d+)?(?:px|rem|em|vw)$")
 
 # App-wide CloakBrowser Pro license. One key per Manager instance — the
 # concurrency-seat pool is per-license, so every launched profile shares it.
@@ -288,6 +292,17 @@ browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CH
 # Frontend build directory (React production build). bundle_dir() resolves to
 # the PyInstaller extraction root when frozen, else the manager repo root.
 FRONTEND_DIR = bundle_dir() / "frontend" / "dist"
+
+
+def get_sidebar_width() -> str:
+    """Return a validated CSS length for the profile sidebar."""
+    value = os.environ.get("SIDEBAR_WIDTH", "").strip()
+    if not value:
+        return DEFAULT_SIDEBAR_WIDTH
+    if _SIDEBAR_WIDTH_RE.fullmatch(value):
+        return value
+    logger.warning("Ignoring invalid SIDEBAR_WIDTH=%r", value)
+    return DEFAULT_SIDEBAR_WIDTH
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +534,12 @@ async def auth_status(request: starlette.requests.Request):
     if AUTH_TOKEN:
         authenticated = _check_auth(request.scope)
     return {"auth_required": AUTH_TOKEN is not None, "authenticated": authenticated}
+
+
+@app.get("/api/config", response_model=RuntimeConfigResponse)
+async def runtime_config():
+    """Return read-only UI configuration resolved from the environment."""
+    return RuntimeConfigResponse(sidebar_width=get_sidebar_width())
 
 
 @app.post("/api/auth/login")

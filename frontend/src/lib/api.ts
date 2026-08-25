@@ -115,6 +115,10 @@ export interface UpdateInfo {
   release_url: string | null;
 }
 
+export interface RuntimeConfig {
+  sidebar_width: string;
+}
+
 export interface ManagerSettings {
   license_key_set: boolean;
   license_key_masked: string | null;
@@ -232,6 +236,8 @@ export const api = {
     request<{ ok: boolean }>(`/api/profiles/${id}/stop`, { method: "POST" }),
 
   getStatus: () => request<SystemStatus>("/api/status"),
+
+  getConfig: () => request<RuntimeConfig>("/api/config"),
 
   checkUpdate: () => request<UpdateInfo>("/api/update-check"),
 
