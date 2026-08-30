@@ -4,6 +4,11 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-08-30
+
+### Fixed
+- **Profiles failed to launch on some Windows systems with a "Failed to launch browser" error.** On a Windows console using a non-Unicode (legacy) codepage, a status message printed while fetching the stealth binary could abort every launch. This build bundles the updated CloakBrowser engine (0.5.10), which makes that output safe so the launch always proceeds.
+
 ## [0.1.4] - 2026-08-21
 
 ### Fixed
