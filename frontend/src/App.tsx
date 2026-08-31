@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { Lock, PanelLeftClose, PanelLeft, Settings, Power } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
-import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial } from "./lib/api";
+import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial, type RuntimeConfig } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -16,6 +16,10 @@ import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
 type View = "empty" | "create" | "edit" | "view";
+
+const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
+  sidebar_width: "16rem",
+};
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -104,6 +108,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [launchError, setLaunchError] = useState<LaunchDenial | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [stopped, setStopped] = useState(false);
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig>(DEFAULT_RUNTIME_CONFIG);
 
   const handleQuit = useCallback(async () => {
     if (!window.confirm("Quit CloakBrowser Manager? This stops the server and closes all running profiles.")) {
@@ -120,6 +125,24 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   useEffect(() => {
     api.getStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
     api.checkUpdate().then(setUpdateInfo).catch(() => setUpdateInfo(null));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    api.getConfig()
+      .then((config) => {
+        if (!cancelled) {
+          setRuntimeConfig({ ...DEFAULT_RUNTIME_CONFIG, ...config });
+        }
+      })
+      .catch((err) => {
+        console.warn("[config] failed to load runtime config:", err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
@@ -262,7 +285,11 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
       <div className="flex-1 flex min-h-0">
       {/* Sidebar */}
       {sidebarOpen && (
-        <div className="w-64 border-r border-border bg-surface-1 flex-shrink-0">
+        <div
+          aria-label="Profile sidebar"
+          className="border-r border-border bg-surface-1 flex-shrink-0"
+          style={{ width: runtimeConfig.sidebar_width }}
+        >
           <ProfileList
             profiles={profiles}
             selectedId={selectedId}

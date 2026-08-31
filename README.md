@@ -265,6 +265,23 @@ When `AUTH_TOKEN` is set:
 
 > **Note**: The auth token is transmitted in cleartext over HTTP. If you expose the Manager to the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, Traefik).
 
+## Runtime UI configuration
+
+The profile sidebar defaults to `16rem`. To use a wider or narrower sidebar without changing the frontend build, set `SIDEBAR_WIDTH` to a CSS length:
+
+```bash
+docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data -e SIDEBAR_WIDTH=20rem cloakhq/cloakbrowser-manager
+```
+
+Or in `docker-compose.yml`:
+
+```yaml
+environment:
+  - SIDEBAR_WIDTH=20rem
+```
+
+Supported units are `px`, `rem`, `em`, and `vw`. Invalid values fall back to `16rem`.
+
 ## License
 
 - **This application** (GUI source code) — MIT. See [LICENSE](LICENSE).

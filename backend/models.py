@@ -158,6 +158,10 @@ class UpdateCheckResponse(BaseModel):
     release_url: str | None = None
 
 
+class RuntimeConfigResponse(BaseModel):
+    sidebar_width: str
+
+
 class SettingsResponse(BaseModel):
     license_key_set: bool
     license_key_masked: str | None = None
