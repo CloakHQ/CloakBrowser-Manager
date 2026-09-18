@@ -44,6 +44,10 @@ class DownloadTracker:
         # GUIDs are remembered until a terminal event lets us clear the staged bytes.
         self._refused: set[str] = set()
 
+    def bind_cancel(self, cancel: Callable[[str], None] | None) -> None:
+        """Point cancellation at the current capture socket: the tracker outlives sockets."""
+        self._cancel = cancel
+
     def begin(self, guid: str | None, suggested_filename: str | None) -> str | None:
         """Record a started download as a pending artifact. Returns its id, or None if refused."""
         if not guid:
@@ -327,14 +331,16 @@ async def _capture_session(
     staging: Path,
     rearm: asyncio.Event | None = None,
     on_armed: Callable[[], None] | None = None,
+    tracker: DownloadTracker | None = None,
 ) -> None:
     """One CDP connection's worth of capture. Returns when the socket closes cleanly."""
     import websockets
 
+    tracker = tracker or DownloadTracker(profile_id)
     url = await _browser_websocket_url(cdp_port)
     async with websockets.connect(url, max_size=None, ping_interval=None) as ws:
         session = _Session(ws, profile_id)
-        tracker = DownloadTracker(profile_id, cancel=_cancel_via(session, profile_id))
+        tracker.bind_cancel(_cancel_via(session, profile_id))
         session.on_event = lambda message: handle_event(tracker, message)
         await _run_capture(session, staging, rearm, profile_id, on_armed)
 
@@ -360,6 +366,10 @@ async def watch(
         stranded = reconcile_interrupted(profile_id)
         if stranded:
             logger.info("Profile %s: failed %d download(s) interrupted by a restart", profile_id, stranded)
+        # One tracker for the browser's lifetime, not per socket: a socket can drop while a
+        # transfer is in flight and Chromium carries on, and the completion event then arrives
+        # on the next socket. A fresh tracker would not know the download and leave it pending.
+        tracker = DownloadTracker(profile_id)
 
         budget: list[int] = []
 
@@ -373,7 +383,9 @@ async def watch(
             if still_running is not None and not still_running():
                 return
             try:
-                await _capture_session(profile_id, cdp_port, staging, rearm, on_armed=armed)
+                await _capture_session(
+                    profile_id, cdp_port, staging, rearm, on_armed=armed, tracker=tracker
+                )
                 return  # closed cleanly — the browser is going away
             except asyncio.CancelledError:
                 raise

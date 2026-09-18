@@ -341,6 +341,7 @@ def test_a_pending_download_can_be_cleared_once_the_browser_is_gone(
 
 
 _CLOSED = object()
+_DROPPED = object()
 
 
 class FakeSocket:
@@ -350,6 +351,12 @@ class FakeSocket:
         self.sent: list[dict] = []
         self._incoming: asyncio.Queue = asyncio.Queue()
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
     async def send(self, raw: str) -> None:
         self.sent.append(json.loads(raw))
 
@@ -358,7 +365,12 @@ class FakeSocket:
         self._incoming.put_nowait(json.dumps(message))
 
     def close(self) -> None:
+        """The browser closes the socket cleanly."""
         self._incoming.put_nowait(_CLOSED)
+
+    def drop(self) -> None:
+        """The socket dies mid-stream, the browser still running."""
+        self._incoming.put_nowait(_DROPPED)
 
     def __aiter__(self):
         return self
@@ -367,6 +379,8 @@ class FakeSocket:
         raw = await self._incoming.get()
         if raw is _CLOSED:
             raise StopAsyncIteration
+        if raw is _DROPPED:
+            raise ConnectionError("socket dropped")
         return raw
 
 
@@ -510,7 +524,7 @@ async def test_a_session_that_armed_earns_a_fresh_reconnect_budget(profile: dict
     monkeypatch.setattr(downloads, "_RECONNECT_DELAYS", (0, 0))
     attempts: list[int] = []
 
-    async def session(profile_id, cdp_port, staging, rearm=None, on_armed=None):
+    async def session(profile_id, cdp_port, staging, rearm=None, on_armed=None, tracker=None):
         attempts.append(len(attempts) + 1)
         n = attempts[-1]
         if n == 3:
@@ -524,3 +538,44 @@ async def test_a_session_that_armed_earns_a_fresh_reconnect_budget(profile: dict
     await downloads.watch(profile["id"], 9222)
     # Without the reset, the two-slot budget would have been spent by attempt 3.
     assert attempts == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_download_tracking_survives_a_capture_reconnect(profile: dict, monkeypatch):
+    """The capture socket drops mid-transfer while Chromium keeps downloading; the completion
+    event arrives on the reconnected socket and must still publish the file."""
+    import websockets
+
+    first, second = FakeSocket(), FakeSocket()
+    sockets = iter([first, second])
+
+    async def fake_url(cdp_port: int) -> str:
+        return "ws://fake"
+
+    monkeypatch.setattr(downloads, "_RECONNECT_DELAYS", (0,))
+    monkeypatch.setattr(downloads, "_browser_websocket_url", fake_url)
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: next(sockets))
+    run = asyncio.ensure_future(downloads.watch(profile["id"], 9222))
+
+    await _until(lambda: len(first.sent) == 1)
+    first.feed({"id": first.sent[0]["id"], "result": {}})
+    first.feed({
+        "method": "Browser.downloadWillBegin",
+        "params": {"guid": "g", "suggestedFilename": "report.csv", "url": "https://x/y"},
+    })
+    await _until(lambda: db.list_artifacts(profile["id"]))
+    first.drop()  # the socket dies; Chromium carries on
+
+    await _until(lambda: len(second.sent) == 1)
+    second.feed({"id": second.sent[0]["id"], "result": {}})
+    _stage(profile["id"], "g", b"a,b\n")
+    second.feed({
+        "method": "Browser.downloadProgress",
+        "params": {"guid": "g", "state": "completed", "receivedBytes": 4, "totalBytes": 4},
+    })
+    await _until(lambda: db.list_artifacts(profile["id"])[0]["state"] != "pending")
+    second.close()
+    await run
+
+    row = db.list_artifacts(profile["id"])[0]
+    assert (row["state"], row["name"], row["size"]) == ("ready", "report.csv", 4)
