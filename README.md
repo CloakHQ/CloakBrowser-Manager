@@ -62,6 +62,20 @@ Native profiles launch through `~/.local/bin/cloak-bitwarden-profile`. Override
 that path with `NATIVE_CLOAK_LAUNCHER`. Chromium data remains under
 `~/.cloakbrowser/profiles`; Manager never copies it into Git or `/data`.
 
+Before each native launch, Manager restores only the Bitwarden extension
+registration metadata from the authenticated `bitwarden-auth-seed` profile.
+This clears stale Chromium disable flags while keeping each profile's cookies,
+site sessions, and browser data isolated. The launcher then syncs Bitwarden's
+extension state so every profile starts with the extension authenticated.
+
+Optional overrides:
+
+```bash
+export CLOAK_NATIVE_PROFILES_ROOT="$HOME/.cloakbrowser/profiles"
+export BITWARDEN_SEED_PROFILE="bitwarden-auth-seed"
+export BITWARDEN_EXTENSION_ID="ecblnbbmmimjhikjdpekghmjhmnboiff"
+```
+
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues).
 
 ## Why Not Just Use a VPN?

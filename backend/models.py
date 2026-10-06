@@ -124,6 +124,7 @@ class ProfileStatusResponse(BaseModel):
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None
+    direct_cdp_url: str | None = None
 
 
 class ClipboardRequest(BaseModel):

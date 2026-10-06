@@ -11,9 +11,12 @@ import socket
 
 from backend.browser_manager import (
     BASE_CDP_PORT,
+    BITWARDEN_EXTENSION_ID,
     CDP_PORT_RANGE,
     _init_profile_defaults,
     _normalize_proxy,
+    _native_profile_running,
+    _repair_native_extension_registration,
     _validate_proxy,
     BrowserManager,
 )
@@ -174,6 +177,34 @@ def test_launch_args_none_no_effect():
     base_count = len(args)
     args += profile.get("launch_args") or []
     assert len(args) == base_count
+
+
+def test_repair_native_extension_registration_clears_disabled_state(tmp_path, monkeypatch):
+    profiles = tmp_path / "profiles"
+    seed = profiles / "bitwarden-auth-seed" / "Default"
+    target = profiles / "outlook-out-003" / "Default"
+    seed.mkdir(parents=True)
+    target.mkdir(parents=True)
+    extension_id = BITWARDEN_EXTENSION_ID
+    seed_registration = {"disable_reasons": [], "location": 8, "path": "/extensions/bitwarden"}
+    (seed / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {extension_id: seed_registration}}}))
+    (target / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {extension_id: {"disable_reasons": [16777216]}}}}))
+    monkeypatch.setenv("CLOAK_NATIVE_PROFILES_ROOT", str(profiles))
+
+    assert _repair_native_extension_registration("outlook-out-003") is True
+
+    repaired = json.loads((target / "Secure Preferences").read_text())
+    assert repaired["extensions"]["settings"][extension_id] == seed_registration
+
+
+def test_native_profile_running_matches_only_exact_profile_path(monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/Users/test")))
+    processes = "\n".join([
+        "Chromium --user-data-dir=/Users/test/.cloakbrowser/profiles/linkedin-001",
+        "Chromium --user-data-dir=/Users/test/.cloakbrowser/profiles/linkedin-001-old",
+    ])
+    assert _native_profile_running(processes, "linkedin-001") is True
+    assert _native_profile_running(processes, "linkedin-002") is False
 
 
 # ── _allocate_cdp_port ───────────────────────────────────────────────────────

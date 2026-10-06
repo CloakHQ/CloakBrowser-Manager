@@ -17,6 +17,9 @@ from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
+BITWARDEN_EXTENSION_ID = "ecblnbbmmimjhikjdpekghmjhmnboiff"
+BITWARDEN_SEED_PROFILE = "bitwarden-auth-seed"
+
 
 def _normalize_proxy(raw: str) -> str:
     """Convert common proxy formats to http://user:pass@host:port.
@@ -50,6 +53,39 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+def _repair_native_extension_registration(profile_name: str) -> bool:
+    """Restore Bitwarden's enabled registration from the authenticated seed profile."""
+    seed_name = os.getenv("BITWARDEN_SEED_PROFILE", BITWARDEN_SEED_PROFILE)
+    if profile_name == seed_name:
+        return False
+
+    profiles_root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", Path.home() / ".cloakbrowser/profiles"))
+    extension_id = os.getenv("BITWARDEN_EXTENSION_ID", BITWARDEN_EXTENSION_ID)
+    seed_preferences = profiles_root / seed_name / "Default" / "Secure Preferences"
+    target_preferences = profiles_root / profile_name / "Default" / "Secure Preferences"
+    if not seed_preferences.exists() or not target_preferences.exists():
+        return False
+
+    seed = json.loads(seed_preferences.read_text())
+    target = json.loads(target_preferences.read_text())
+    registration = seed.get("extensions", {}).get("settings", {}).get(extension_id)
+    if not registration:
+        return False
+
+    target.setdefault("extensions", {}).setdefault("settings", {})[extension_id] = registration
+    temporary = target_preferences.with_suffix(".tmp")
+    temporary.write_text(json.dumps(target, separators=(",", ":")))
+    temporary.chmod(target_preferences.stat().st_mode & 0o777)
+    temporary.replace(target_preferences)
+    return True
+
+
+def _native_profile_running(processes: str, profile_name: str) -> bool:
+    profile_path = Path.home() / ".cloakbrowser" / "profiles" / profile_name
+    needle = f"--user-data-dir={profile_path}"
+    return any(needle in line for line in processes.splitlines())
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
@@ -176,7 +212,14 @@ class BrowserManager:
 
         native_profile = self._native_profile_name(profile)
         if native_profile:
-            return await self._launch_native(profile_id, native_profile, self._start_urls(profile))
+            try:
+                return await self._launch_native(
+                    profile_id, native_profile, self._start_urls(profile)
+                )
+            except BaseException:
+                async with self._lock:
+                    self._launching.discard(profile_id)
+                raise
 
         try:
             from cloakbrowser import launch_persistent_context_async
@@ -339,11 +382,15 @@ class BrowserManager:
         profile_name: str,
         start_urls: list[str],
     ) -> RunningProfile:
+        await self._wait_for_native_profile_exit(profile_name)
         launcher = os.getenv(
             "NATIVE_CLOAK_LAUNCHER",
             str(Path.home() / ".local/bin/cloak-bitwarden-profile"),
         )
         cdp_port = self._native_cdp_port(profile_name)
+        repaired_extension = _repair_native_extension_registration(profile_name)
+        if repaired_extension:
+            logger.info("Restored Bitwarden extension registration for %s", profile_name)
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -376,6 +423,30 @@ class BrowserManager:
             raise
 
     @staticmethod
+    async def _wait_for_native_profile_exit(
+        profile_name: str,
+        timeout: float = 10,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            process = await asyncio.create_subprocess_exec(
+                "/bin/ps",
+                "ax",
+                "-o",
+                "command=",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            if not _native_profile_running(stdout.decode(errors="replace"), profile_name):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"Native profile processes did not exit: {profile_name}"
+                )
+            await asyncio.sleep(0.25)
+
+    @staticmethod
     async def _wait_for_port(
         port: int,
         process: asyncio.subprocess.Process,
@@ -394,7 +465,14 @@ class BrowserManager:
             except OSError:
                 await asyncio.sleep(0.25)
         process.terminate()
-        raise TimeoutError(f"Native profile CDP port {port} did not open")
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            _, stderr = await process.communicate()
+        detail = stderr.decode(errors="replace").strip()
+        suffix = f": {detail[-2000:]}" if detail else ""
+        raise TimeoutError(f"Native profile CDP port {port} did not open{suffix}")
 
     async def _watch_native(
         self,
@@ -455,8 +533,15 @@ class BrowserManager:
                 "vnc_ws_port": running.ws_port,
                 "display": "native-macos" if running.native else f":{running.display}",
                 "cdp_url": f"/api/profiles/{profile_id}/cdp",
+                "direct_cdp_url": f"http://127.0.0.1:{running.cdp_port}",
             }
-        return {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
+        return {
+            "status": "stopped",
+            "vnc_ws_port": None,
+            "display": None,
+            "cdp_url": None,
+            "direct_cdp_url": None,
+        }
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown."""
