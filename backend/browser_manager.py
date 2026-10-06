@@ -320,7 +320,10 @@ class BrowserManager:
     def _native_cdp_port(profile_name: str) -> int:
         """The profile's own port, saved in its cloak.json record; the hash only as a fallback."""
         root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", Path.home() / ".cloakbrowser/profiles"))
+        # profiles/<group>/<name> (group = first word of the name), or the older flat layout
         record = root / profile_name / "cloak.json"
+        if not record.exists():
+            record = root / profile_name.split("-")[0] / profile_name / "cloak.json"
         try:
             port = json.loads(record.read_text()).get("cdpPort")
             if isinstance(port, int):

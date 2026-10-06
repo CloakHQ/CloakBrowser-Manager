@@ -188,6 +188,12 @@ def sync_native_profiles(path: Path | None = None) -> int:
         if arg.startswith("--native-profile=")
     }
 
+    # Profiles renamed or removed from the registry leave the list too.
+    wanted = {entry["native_profile"] for entry in entries}
+    for native_name, profile in by_native_name.items():
+        if native_name not in wanted:
+            delete_profile(profile["id"])
+
     for entry in entries:
         native_name = entry["native_profile"]
         fields = {
