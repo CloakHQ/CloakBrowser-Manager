@@ -200,6 +200,10 @@ def sync_native_profiles(path: Path | None = None) -> int:
             "platform": "macos",
             "clipboard_sync": False,
         }
+        # Browser settings the profile record owns. Fields left out keep their Manager value.
+        for key in ("timezone", "locale", "fingerprint_seed", "humanize", "human_preset"):
+            if key in entry:
+                fields[key] = entry[key]
         current = by_native_name.get(native_name)
         if current:
             update_profile(current["id"], name=entry["name"], **fields)

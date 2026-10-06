@@ -469,6 +469,12 @@ async def create_profile(req: ProfileCreate):
     return ProfileResponse(**profile)
 
 
+@app.post("/api/native/sync")
+async def sync_native():
+    """Reload native profiles from the registry (built by `cloak registry`). No restart needed."""
+    return {"synced": db.sync_native_profiles()}
+
+
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)
 async def get_profile(profile_id: str):
     profile = db.get_profile(profile_id)
