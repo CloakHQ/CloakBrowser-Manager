@@ -1,0 +1,82 @@
+# Changelog
+
+All notable changes to CloakBrowser Manager are documented here.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- **Duplicate a profile together with its browser state.** `POST /api/profiles/{id}/duplicate` now accepts `{"include_browser_state": true}`, which copies the source profile's cookies, logged-in sessions, history and local storage into the clone alongside its settings and fingerprint — so the copy launches as the same identity *and* the same session. The source is held stopped for the whole copy — a launch, reset or delete of it is refused with 409 until the copy finishes, and a source that is still launching or closing is refused too — and the clone only appears in the list once its directory is complete, so a half-built clone can never be launched or deleted. Chromium's single-instance lock files and the source's preview frame are left behind; a failed copy leaves nothing behind. Reset and Delete now also refuse (409) a profile whose browser is still launching or closing, instead of touching a directory Chrome is using, and Launch refuses (409) a profile whose previous browser is still closing instead of starting a second Chrome on the same directory. In the profile editor, **Duplicate** becomes a split button: the button itself still makes a config-only copy, and its menu offers **With browser state** (disabled until the profile is stopped). Without the flag the endpoint behaves exactly as before.
+
+## [0.1.5] - 2026-08-30
+
+### Fixed
+- **Profiles failed to launch on some Windows systems with a "Failed to launch browser" error.** On a Windows console using a non-Unicode (legacy) codepage, a status message printed while fetching the stealth binary could abort every launch. This build bundles the updated CloakBrowser engine (0.5.10), which makes that output safe so the launch always proceeds.
+
+## [0.1.4] - 2026-08-21
+
+### Fixed
+- **Memory leak when a browser closed on its own.** If a browser exited outside the Stop button (a crash, or closing Chrome from inside the profile window), a helper process was left running and holding around 130 MB. These built up over time on a long-running manager. The manager now releases it on that path as well.
+
+### Added
+- **License and seat limits now surface in a banner.** When a profile fails to launch because the plan's concurrent-session limit is reached or the license key is invalid, the Manager shows a dismissible top banner with an Upgrade link instead of failing silently.
+- **Automated multi-architecture Docker releases.** Version tags now build Linux AMD64 and ARM64 images on native GitHub-hosted runners, combine them under one Docker tag, and publish both the release version and `latest` alongside the Windows and macOS installers.
+
+### Changed
+- **Safer release validation.** Docker architecture digests, provenance, and the combined manifest are validated before publication, and `latest` is promoted only from a complete verified release. Release tags are validated as canonical semantic versions, and workflow dependencies are pinned to immutable revisions.
+
+## [0.1.3] - 2026-08-19
+
+### Fixed
+- **macOS app failed to launch profiles on a fresh machine.** On a Mac that had never run CloakBrowser before, launching a profile with a license key set could fail with an internal library-loading error while the app fetched the stealth binary. The macOS build now bundles a self-contained TLS library, so the download works on a clean machine and profiles launch as expected. (Intel and Apple Silicon.)
+
+### Changed
+- **Dropped a redundant browser launch flag.** The Manager no longer passes an extra Chromium flag at launch; the CloakBrowser engine already handles that behavior internally, so the flag added nothing.
+
+## [0.1.2] - 2026-08-19
+
+### Fixed
+- **First launch on a fresh Windows machine no longer fails.** The packaged app has no console, so a status message printed during the first stealth-binary download could abort the launch on some systems. Startup output is now handled safely and the launch proceeds.
+
+### Added
+- **Update notification.** When a newer Manager release is available, a dismissible banner appears at the top of the app; clicking Download opens the release page in your default browser. The check is fail-soft and cached, so it never delays or interferes with normal use.
+- **Richer diagnostics in `manager.log`.** Startup now records a one-line environment fingerprint (app version, OS, architecture, packaged-vs-source, license tier/plan, binary version, data directory). Uncaught errors from any background thread or task, and each profile launch's context (with proxy credentials redacted), are now logged with full detail, and output from the underlying CloakBrowser engine is mirrored into the log. This makes crash reports diagnosable from the log alone.
+
+## [0.1.1] - 2026-08-19
+
+### Added
+- **Restore previous tabs on launch.** Each profile can reopen the tabs that were open when it was last stopped. Enabled by default; toggle it off per profile in the Behavior section.
+- **Clone / duplicate a profile.** Copy an existing profile's full configuration and fingerprint into a fresh profile with its own `user_data_dir`, ready to launch independently.
+- **Proxy test button.** Test a profile's proxy from the form and see the exit IP, geolocation, and latency before launching.
+- **Last-browser-screenshot preview.** The profile shows a preview image captured from its last browser session.
+- **Drag-and-drop reordering** of the profile list.
+- **Profile reset.** Wipe a profile's browser state and re-roll its fingerprint in one action.
+- **Transient confirmation on form buttons.** Save and Reset now show an inline "Saved" / "Reset done" confirmation.
+
+### Changed
+- README: restored the "Browser Profile Manager" headline and tightened the tagline.
+
+## [0.1.0] - 2026-08-19
+
+### Added
+- **Native desktop app for macOS and Windows.** Installers bundle the Manager and stealth Chromium binary into a single application, so end users no longer need Python, Node, git, or a build step. Runs the browser directly on the host while the existing Linux Docker/KasmVNC server mode is preserved. Run-from-source (`run.py`) stays available for developers. The builds are unsigned for now — on first launch macOS needs a one-time Gatekeeper approval and Windows a SmartScreen click-through (see the README).
+- **Standalone application window.** The native app now opens in its own dedicated window (WKWebView on macOS, WebView2 on Windows) carrying the app icon, instead of a tab in your default browser. The window remembers its size and position between launches, and closing it cleanly stops the server and all running browsers. Relaunching the app focuses the existing window instead of starting a second copy. Both the packaged app and `run.py` share the same window code path.
+- **In-app Settings panel.** A gear-icon panel lets you set the CloakBrowser Pro license key and release channel from inside the app; changes are hot-applied with no restart.
+- **CloakBrowser Pro licensing wired app-wide.** A license key and release channel configured once (native Settings, or a `.env` for server mode) are passed to every profile launch so the Pro stealth binary is used. The binary is resolved and pre-downloaded at startup, keeping it off the launch path.
+- **License tier and binary-version status badge** in the top bar, reporting the active tier and the real Chromium binary version.
+- **Keyless empty-state prompt.** When no license key is set, the empty view shows a "No license key set" call-to-action with links to enter a key, get a free key, or view Pro plans, instead of the generic "Select a profile" text.
+- **Quit / Power control.** A Power button cleanly stops the server and all running browsers and exits; the shutdown endpoint is same-origin (CSRF) guarded so no website can trigger it.
+- **Unauthenticated `/api/health` probe** returning only `{"status": "ok"}` with no system details, for health checks.
+- **Third-party cookie compatibility control** per profile (defaults on for new profiles).
+- **Google set as the default search engine** for new profiles on first launch, with an opt-out toggle.
+- GeoIP enabled by default for new profiles.
+
+### Changed
+- **`/api/status` now requires authentication.** It previously leaked running-session count, binary version, and profile totals to unauthenticated scanners; health checks now use the new `/api/health` probe instead.
+- **Simplified profile configuration.** Removed obsolete override fields and moved unrestricted Chromium arguments under an Advanced section. Existing profiles are migrated automatically to the new schema.
+- **Clipboard sync is now limited to the Linux VNC mode.** Clipboard controls are hidden and injection is skipped in the native macOS and Windows apps.
+- Per-profile clipboard preferences are now persisted.
+
+### Fixed
+- Native launcher readiness poll now targets `/api/health`, fixing a startup hang where the app never opened the browser when an auth token was set.

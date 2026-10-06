@@ -10,9 +10,13 @@ import asyncio
 import hmac
 import logging
 import os
+import signal
 import struct
 import shutil
+import time
+import webbrowser
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,38 +28,116 @@ from fastapi.staticfiles import StaticFiles
 import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .env_file import load_env_file
+
+# Populate os.environ from the manager-root .env before anything reads it
+# (database.resolve_runtime, AUTH_TOKEN, the license config below).
+load_env_file()
+
 from . import database as db
-from .browser_manager import BrowserManager
+from cloakbrowser.license import CloakBrowserLicenseError
+
+from .browser_manager import (
+    BrowserManager,
+    ProfileBusyError,
+    SCREENSHOT_FILENAME,
+    is_seat_limit_error,
+    license_error_detail,
+    test_proxy,
+)
 from .models import (
     ClipboardRequest,
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
+    ProfileDuplicateRequest,
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ProxyTestRequest,
+    ProxyTestResponse,
+    ReorderRequest,
+    SettingsResponse,
+    SettingsUpdate,
     StatusResponse,
     TagResponse,
+    UpdateCheckResponse,
 )
+from .runtime import bundle_dir
+from .settings_store import load_settings, save_settings
 
 logger = logging.getLogger("cloakbrowser.manager")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+# Log to the console AND to a rotating file in the data dir. The native frozen
+# app has no visible terminal, so the file is the only way a user (or we, for
+# support) can see what happened. db.DATA_DIR is resolved at the import above.
+_LOG_HANDLERS: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    _log_dir = db.DATA_DIR / "logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _LOG_HANDLERS.append(
+        RotatingFileHandler(
+            _log_dir / "manager.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+    )
+except OSError as exc:  # read-only data dir etc. — keep console logging
+    logger.warning("Could not open log file, console only: %s", exc)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    handlers=_LOG_HANDLERS,
+)
 logging.getLogger("websockets").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
+# Diagnostics: snapshot the raw stream encoding (before app_entry reconfigures
+# it), route uncaught exceptions from every thread to the file log with a full
+# traceback, and mirror the wrapper's direct-to-stderr output into the log. This
+# runs at import so it covers both the native (app_entry) and Docker (uvicorn)
+# entry paths; the startup fingerprint + asyncio handler are added in lifespan.
+from . import diagnostics  # noqa: E402
+
+diagnostics.capture_stream_state()
+diagnostics.install_crash_hooks(logger)
+diagnostics.install_stderr_tee()
+
 # Optional authentication via AUTH_TOKEN env var.
 # If not set, all routes are open (local dev). If set, all /api/* routes
-# (except /api/auth/* and /api/status) require Bearer token or cookie.
+# (except /api/auth/status, /api/auth/login and /api/health) require Bearer
+# token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
+# App-wide CloakBrowser Pro license. One key per Manager instance — the
+# concurrency-seat pool is per-license, so every launched profile shares it.
+# Release channel picks Stable vs Preview builds.
+#
+# Precedence: environment (incl. values load_env_file pulled from a .env) wins,
+# then the in-app Settings (settings.json). Native users have no .env and set
+# the key in the Settings UI; Docker/CI keep overriding via env vars.
+_STORED_SETTINGS = load_settings()
+
+
+def _resolve_setting(env_key: str, settings_key: str) -> str | None:
+    return os.environ.get(env_key) or _STORED_SETTINGS.get(settings_key) or None
+
+
+LICENSE_KEY: str | None = _resolve_setting("CLOAKBROWSER_LICENSE_KEY", "license_key")
+RELEASE_CHANNEL: str | None = _resolve_setting(
+    "CLOAKBROWSER_RELEASE_CHANNEL", "release_channel"
+)
+
 # Paths that bypass authentication even when AUTH_TOKEN is set
-_AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
+_AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/health"})
 
 
 def _check_auth(scope: Scope) -> bool:
     """Check if the request has a valid auth token (header or cookie)."""
+    if AUTH_TOKEN is None:
+        return True
+
     # Check Authorization: Bearer <token> header
     for key, val in scope.get("headers", []):
         if key == b"authorization":
@@ -136,6 +218,35 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
     return False
 
 
+def _same_origin_request(request: Request) -> bool:
+    """CSRF guard for state-changing simple POSTs (HTTP mirror of
+    _check_websocket_origin). A POST with no body/custom headers is a CORS
+    "simple request" (no preflight), so any website the user visits could hit a
+    localhost endpoint. If a browser Origin header is present it must match Host;
+    non-browser clients (curl, no Origin) are allowed.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = request.headers.get("host")
+    if not host:
+        return True
+    try:
+        parsed = urlparse(origin)
+        origin_host = parsed.hostname or ""
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    if origin_port and origin_port not in (80, 443):
+        origin_netloc = f"{origin_host}:{origin_port}"
+    else:
+        origin_netloc = origin_host
+    host_normalized = host
+    if host.endswith(":80") or host.endswith(":443"):
+        host_normalized = host.rsplit(":", 1)[0]
+    return origin_netloc == host_normalized
+
+
 class AuthMiddleware:
     """Raw ASGI middleware for optional token auth.
 
@@ -174,10 +285,11 @@ class AuthMiddleware:
 
 
 # Singleton browser manager
-browser_mgr = BrowserManager()
+browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CHANNEL)
 
-# Frontend build directory (React production build)
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+# Frontend build directory (React production build). bundle_dir() resolves to
+# the PyInstaller extraction root when frozen, else the manager repo root.
+FRONTEND_DIR = bundle_dir() / "frontend" / "dist"
 
 
 # ---------------------------------------------------------------------------
@@ -374,11 +486,17 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    browser_mgr.vnc.validate_available()
     db.init_db()
     synced = db.sync_native_profiles()
     if synced:
         logger.info("Synced %d native profiles", synced)
     await browser_mgr.cleanup_stale()
+    # Resolve tier + pre-download the (Pro) binary before serving launches, so the
+    # download never blocks a launch or auto-launch's 60s timeout.
+    await asyncio.to_thread(browser_mgr.resolve_binary_status)
+    diagnostics.install_asyncio_handler(asyncio.get_running_loop(), logger)
+    logger.info(diagnostics.startup_line(browser_mgr))
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
     logger.info("CloakBrowser Manager started")
     yield
@@ -438,18 +556,24 @@ async def auth_logout(request: Request, response: Response):
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 
+def _profile_response(profile: dict) -> ProfileResponse:
+    payload = {**profile, **browser_mgr.get_status(profile["id"])}
+    payload["tags"] = [TagResponse(**tag) for tag in profile.get("tags", [])]
+    return ProfileResponse(**payload)
+
+
 @app.get("/api/profiles", response_model=list[ProfileResponse])
 async def list_profiles():
-    profiles = db.list_profiles()
-    result = []
-    for p in profiles:
-        status = browser_mgr.get_status(p["id"])
-        p["status"] = status["status"]
-        p["vnc_ws_port"] = status["vnc_ws_port"]
-        p["cdp_url"] = status["cdp_url"]
-        p["tags"] = [TagResponse(**t) for t in p.get("tags", [])]
-        result.append(ProfileResponse(**p))
-    return result
+    return [_profile_response(profile) for profile in db.list_profiles()]
+
+
+@app.post("/api/profiles/test-proxy", response_model=ProxyTestResponse)
+async def test_proxy_endpoint(req: ProxyTestRequest):
+    """Connect through a proxy and report exit IP + geo + latency."""
+    try:
+        return await test_proxy(req.proxy)
+    except ValueError as exc:  # bad proxy format from _validate_proxy
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
@@ -460,13 +584,13 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
-    profile = db.create_profile(**data)
-    status = browser_mgr.get_status(profile["id"])
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(db.create_profile(**data))
+
+
+@app.post("/api/profiles/reorder")
+async def reorder_profiles(req: ReorderRequest):
+    db.reorder_profiles(req.ordered_ids)
+    return {"ok": True}
 
 
 @app.post("/api/native/sync")
@@ -480,12 +604,7 @@ async def get_profile(profile_id: str):
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -498,12 +617,7 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    status = browser_mgr.get_status(profile_id)
-    profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
-    profile["cdp_url"] = status["cdp_url"]
-    profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
-    return ProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @app.delete("/api/profiles/{profile_id}")
@@ -518,14 +632,191 @@ async def delete_profile(profile_id: str):
 
     user_data_dir = Path(profile["user_data_dir"])
 
-    # DB first — if this fails, filesystem is untouched
-    db.delete_profile(profile_id)
-
-    # Then clean up disk
-    if user_data_dir.exists():
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            # DB first — if this fails, filesystem is untouched
+            db.delete_profile(profile_id)
+            # Then clean up disk
+            if user_data_dir.exists():
+                shutil.rmtree(user_data_dir, ignore_errors=True)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {"ok": True}
+
+
+# Browser state wiped on reset (inside the profile's Default/ dir). Bookmarks,
+# Preferences, Secure Preferences and Web Data are deliberately preserved so the
+# profile keeps its default search engine (the Google keyword row lives in Web
+# Data, the default pointer in Secure Preferences) and bookmarks across a reset —
+# no fragile search-engine rebuild is needed.
+_RESET_STATE_FILES = [
+    "Cookies", "Cookies-journal",
+    "History", "History-journal", "History Provider Cache",
+    "Login Data", "Login Data-journal",
+    "Favicons", "Favicons-journal",
+    "Shortcuts", "Shortcuts-journal",
+    "Top Sites", "Top Sites-journal",
+    "Visited Links",
+    "Network Action Predictor", "Network Action Predictor-journal",
+    "TransportSecurity",
+    "Current Session", "Current Tabs",
+    "Last Session", "Last Tabs",
+    "affiliation_db", "coupon_db",
+    "DownloadMetadata",
+]
+_RESET_STATE_DIRS = [
+    "Cache", "Code Cache", "GPUCache",
+    "Service Worker", "Service Worker/CacheStorage",
+    "Local Storage", "Session Storage",
+    "IndexedDB", "databases",
+    "blob_storage",
+    "File System",
+    "GCM Store",
+    "Extension Rules", "Extension Scripts", "Extension State",
+    "Platform Notifications",
+]
+
+
+@app.post("/api/profiles/{profile_id}/reset", response_model=ProfileResponse)
+async def reset_profile(profile_id: str):
+    """Reset a profile: stop browser, wipe state files, re-roll fingerprint seed.
+
+    Preserves bookmarks, preferences and all profile settings (name, proxy, tags,
+    etc.). Returns the updated (stopped) profile — the frontend re-launches it.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    if profile_id in browser_mgr.running:
+        await browser_mgr.stop(profile_id)
+
+    user_data_dir = Path(profile["user_data_dir"])
+    default_dir = user_data_dir / "Default"
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            if default_dir.exists():
+                for fname in _RESET_STATE_FILES:
+                    (default_dir / fname).unlink(missing_ok=True)
+                for dname in _RESET_STATE_DIRS:
+                    shutil.rmtree(default_dir / dname, ignore_errors=True)
+            updated = db.reset_profile(profile_id)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to reset profile")
+    return _profile_response(updated)
+
+
+# Never travels with a copy: Chromium's single-instance lock (SingletonLock is
+# a dangling symlink; a copy would make the clone think another Chrome owns its
+# dir) and the manager's preview frame, which shows the source, not the clone.
+_DUPLICATE_SKIP_FILES = frozenset({
+    "SingletonLock", "SingletonCookie", "SingletonSocket", SCREENSHOT_FILENAME,
+})
+
+
+def _copy_browser_state(src_dir: Path, dst_dir: Path) -> None:
+    """Copy a stopped profile's user_data_dir into a clone's, minus the skip list."""
+    shutil.copytree(
+        src_dir,
+        dst_dir,
+        symlinks=True,  # keep links as links; never follow one out of the dir
+        dirs_exist_ok=True,
+        ignore=lambda _dir, names: [n for n in names if n in _DUPLICATE_SKIP_FILES],
+    )
+
+
+async def _copy_browser_state_to_completion(src_dir: Path, dst_dir: Path) -> None:
+    """Run the copy in a worker thread and never return while it is running.
+
+    A thread cannot be interrupted, so a cancelled request would otherwise
+    release the source's hold and remove the clone directory while the worker
+    is still writing into it. Cancellation is absorbed until the worker is done,
+    then re-raised; a worker error propagates as-is.
+    """
+    worker = asyncio.ensure_future(asyncio.to_thread(_copy_browser_state, src_dir, dst_dir))
+    cancelled: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:
+            pass  # the worker finished with an error; reported below
+    if cancelled is not None:
+        if not worker.cancelled():
+            worker.exception()  # retrieved; the cancellation is the outcome reported
+        raise cancelled
+    worker.result()
+
+
+@app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
+async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None = None):
+    """Clone a profile into a new profile (name suffixed ' (copy)').
+
+    Settings, tags, notes and the same fingerprint seed are always copied. With
+    ``include_browser_state`` the source's user_data_dir (cookies, logged-in
+    sessions, history) is copied too, so the clone launches as the same identity
+    and the same session. Without it (the default) the clone gets a fresh, empty
+    user_data_dir.
+
+    The state copy is a consistent snapshot: the source is held stopped for the
+    whole copy (launch / reset / delete of it are refused meanwhile), and the
+    clone's row is written only after its directory is complete, so a half-built
+    clone is never listed, launched or deleted.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    include_state = bool(req and req.include_browser_state)
+
+    if not include_state:
+        clone = db.duplicate_profile(profile_id)
+        if not clone:
+            raise HTTPException(status_code=500, detail="Failed to duplicate profile")
+        return _profile_response(clone)
+
+    if browser_mgr.is_active(profile_id):
+        raise HTTPException(
+            status_code=409, detail="Stop the profile before duplicating its browser state"
+        )
+
+    # Mint the clone's id up front so its directory can be filled BEFORE the row
+    # exists: nothing can list, launch, reset or delete a profile the DB has not
+    # heard of, so an unfinished clone is unreachable.
+    clone_id = db.new_profile_id()
+    src_dir = Path(profile["user_data_dir"])
+    dst_dir = Path(db.user_data_dir_for(clone_id))
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            if src_dir.is_dir():
+                # Off the event loop: a profile with a fat cache takes seconds to copy.
+                await _copy_browser_state_to_completion(src_dir, dst_dir)
+            clone = db.duplicate_profile(profile_id, new_id=clone_id)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        # The worker has finished by now (the copy never returns while it runs)
+        # and no row was written, so the unpublished directory is safe to drop.
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        raise
+    except Exception as exc:
+        # No row to roll back — it is only written after a good copy — but the
+        # directory must not outlive a failed attempt.
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        logger.exception("Failed to duplicate browser state of %s", profile_id)
+        detail = (
+            f"Failed to copy browser state: {exc}"
+            if isinstance(exc, OSError)
+            else "Failed to duplicate profile"
+        )
+        raise HTTPException(status_code=500, detail=detail) from exc
+    if not clone:
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="Failed to duplicate profile")
+    return _profile_response(clone)
 
 
 # ── Launch / Stop ─────────────────────────────────────────────────────────────
@@ -541,17 +832,34 @@ async def launch_profile(profile_id: str):
 
     try:
         running = await browser_mgr.launch(profile)
+    except CloakBrowserLicenseError as exc:
+        # Out of seats / bad key / expired / server unreachable — surface the real
+        # reason instead of a flat "failed to launch". 402 for the seat case (with
+        # an upgrade CTA), 403 for the other license problems.
+        logger.warning("License denial launching profile %s: %s", profile_id, exc)
+        detail = license_error_detail(exc)
+        raise HTTPException(status_code=402 if is_seat_limit_error(exc) else 403, detail=detail)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        logger.error("Failed to launch profile %s: %s", profile_id, exc)
+        logger.error(
+            "Failed to launch profile %s: %s", profile_id, exc, exc_info=True
+        )
         raise HTTPException(status_code=500, detail="Failed to launch browser")
 
     return LaunchResponse(
         profile_id=profile_id,
         status="running",
+        runtime_mode=browser_mgr.runtime.runtime_mode,
+        viewer_mode=browser_mgr.runtime.viewer_mode,
         vnc_ws_port=running.ws_port,
-        display="native-macos" if running.native else f":{running.display}",
+        display=(
+            "native-macos" if running.native
+            else f":{running.display}" if running.display is not None
+            else None
+        ),
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -576,19 +884,243 @@ async def get_profile_status(profile_id: str):
 # ── System Status ─────────────────────────────────────────────────────────────
 
 
+@app.get("/api/health")
+async def health_check():
+    """Unauthenticated liveness probe for the Docker healthcheck.
+
+    Intentionally returns no system details; see /api/status (auth-gated)
+    for running counts and versions.
+    """
+    return {"status": "ok"}
+
+
+def _windows_font_health() -> tuple[int | None, int | None, bool | None]:
+    """Report Windows persona font coverage only where that persona is emulated."""
+    if not (
+        browser_mgr.runtime.runtime_mode == "docker"
+        and browser_mgr.runtime.host_os == "linux"
+    ):
+        return None, None, None
+    try:
+        # Delayed import keeps API tests usable when cloakbrowser is mocked.
+        from cloakbrowser.browser import _WINDOWS_FONT_TELLS, _count_fonts_present
+
+        present = _count_fonts_present(_WINDOWS_FONT_TELLS)
+        required = len(_WINDOWS_FONT_TELLS)
+        return present, required, None if present is None else present == required
+    except Exception as exc:
+        logger.warning("Could not inspect Windows font health: %s", exc)
+        return None, None, None
+
+
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    try:
-        from cloakbrowser.config import CHROMIUM_VERSION
-    except ModuleNotFoundError:
-        CHROMIUM_VERSION = "native-launcher"
+    # Prefer the version/tier resolved at startup (reflects the actual Pro build
+    # in use). Fall back to the keyless constant before startup resolution runs.
+    binary_version = browser_mgr.binary_version
+    if not binary_version:
+        try:
+            from cloakbrowser.config import get_chromium_version
+
+            binary_version = get_chromium_version()
+        except ImportError:
+            from cloakbrowser.config import CHROMIUM_VERSION
+
+            binary_version = CHROMIUM_VERSION
 
     profiles = db.list_profiles()
+    fonts_present, fonts_required, fonts_complete = await asyncio.to_thread(
+        _windows_font_health
+    )
     return StatusResponse(
         running_count=len(browser_mgr.running),
-        binary_version=CHROMIUM_VERSION,
+        binary_version=binary_version,
+        license_tier=browser_mgr.license_tier,
         profiles_total=len(profiles),
+        host_os=browser_mgr.runtime.host_os,
+        runtime_mode=browser_mgr.runtime.runtime_mode,
+        viewer_mode=browser_mgr.runtime.viewer_mode,
+        windows_fonts_present=fonts_present,
+        windows_fonts_required=fonts_required,
+        windows_fonts_complete=fonts_complete,
     )
+
+
+# ── Update check ─────────────────────────────────────────────────────────────
+
+# Latest Manager release on the public GitHub repo. No auth needed; anonymous
+# GitHub API allows 60 req/hr/IP, so the result is cached to fetch at most once
+# per TTL regardless of how many clients/reloads hit the endpoint.
+_GITHUB_LATEST_RELEASE_URL = (
+    "https://api.github.com/repos/CloakHQ/CloakBrowser-Manager/releases/latest"
+)
+_UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60
+_update_cache: tuple[float, UpdateCheckResponse] | None = None
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    """Normalise 'v0.1.1-1-g367823f' / '0.1.1' → (0, 1, 1). None if unparseable."""
+    core = text.strip().lstrip("v").split("-", 1)[0]
+    if not core:
+        return None
+    try:
+        return tuple(int(part) for part in core.split("."))
+    except ValueError:
+        return None
+
+
+def _version_gt(latest: str, current: str) -> bool:
+    """True if `latest` is a strictly newer semver than `current`."""
+    a, b = _parse_version(latest), _parse_version(current)
+    if a is None or b is None:
+        return False
+    length = max(len(a), len(b))
+    a += (0,) * (length - len(a))
+    b += (0,) * (length - len(b))
+    return a > b
+
+
+async def _fetch_update_status() -> UpdateCheckResponse:
+    current = diagnostics.app_version()
+    result = UpdateCheckResponse(current=current)
+    if current == "unknown":
+        # Dev checkout with no git, or unresolvable build — nothing to compare.
+        return result
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                _GITHUB_LATEST_RELEASE_URL,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        latest = (data.get("tag_name") or "").strip()
+        if latest:
+            result.latest = latest
+            result.release_url = data.get("html_url")
+            result.update_available = _version_gt(latest, current)
+    except Exception as exc:  # network, rate-limit, parse — never fail the request
+        logger.info("Update check skipped (%s)", exc)
+    return result
+
+
+@app.post("/api/open-external")
+async def open_external(payload: dict):
+    """Open an http(s) URL in the host's default browser. The native app runs
+    inside a pywebview/WKWebView window where JS `window.open` is a no-op, so the
+    frontend routes external links through here. The server is local in native
+    mode, so this launches the user's own browser."""
+    url = (payload or {}).get("url", "")
+    if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only http(s) URLs allowed")
+    opened = await asyncio.to_thread(webbrowser.open, url)
+    return {"ok": bool(opened)}
+
+
+@app.get("/api/update-check", response_model=UpdateCheckResponse)
+async def check_for_update():
+    """Report whether a newer Manager release exists on GitHub. Fail-soft +
+    cached (6h) so it never hammers GitHub or errors the caller."""
+    global _update_cache
+    now = time.monotonic()
+    if _update_cache is not None and now - _update_cache[0] < _UPDATE_CACHE_TTL_SECONDS:
+        return _update_cache[1]
+    result = await _fetch_update_status()
+    # Only cache a result that actually reached GitHub — otherwise a transient
+    # outage would pin update_available=false for the full TTL.
+    if result.latest is not None or result.current == "unknown":
+        _update_cache = (now, result)
+    return result
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+
+def _mask_key(key: str | None) -> str | None:
+    """Show enough of a license key to recognise it, never the whole thing."""
+    if not key:
+        return None
+    if len(key) <= 9:
+        return "…"
+    return f"{key[:5]}…{key[-4:]}"
+
+
+def _settings_response() -> SettingsResponse:
+    return SettingsResponse(
+        license_key_set=bool(browser_mgr.license_key),
+        license_key_masked=_mask_key(browser_mgr.license_key),
+        release_channel=(browser_mgr.release_channel or "stable"),
+    )
+
+
+@app.post("/api/shutdown")
+async def shutdown_manager(request: Request):
+    """Stop the Manager: graceful uvicorn shutdown → lifespan closes every
+    running browser (cleanup_all) → the process exits. Lets the user quit from
+    the UI so no orphaned server is left behind.
+
+    CSRF-guarded: a bodyless POST is a CORS simple request (no preflight), so
+    without this any site the user visits could kill the Manager via a no-cors
+    fetch. Reject when a browser Origin is present and doesn't match Host.
+    """
+    if not _same_origin_request(request):
+        logger.warning(
+            "Rejected cross-origin shutdown (origin=%s)", request.headers.get("origin")
+        )
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+    logger.info("Shutdown requested via UI — stopping server")
+    server = getattr(app.state, "uvicorn_server", None)
+    if server is not None:
+        # Frozen/native path (app_entry holds the Server): flip the flag, uvicorn
+        # exits its serve loop gracefully. Cross-platform, no signals.
+        server.should_exit = True
+    else:
+        # Dev path (run.py spawns `uvicorn backend.main:app`): signal ourselves.
+        async def _signal_self():
+            await asyncio.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        asyncio.create_task(_signal_self())
+    return {"ok": True, "message": "CloakBrowser Manager is shutting down"}
+
+
+@app.get("/api/settings", response_model=SettingsResponse)
+async def get_settings():
+    return _settings_response()
+
+
+@app.put("/api/settings", response_model=StatusResponse)
+async def update_settings(payload: SettingsUpdate):
+    """Persist license key / release channel and hot-apply without a restart.
+
+    Returns the refreshed system status (tier + resolved binary version) so the
+    top-bar badge updates immediately. Re-resolving may download the Pro build,
+    so it runs off the event loop; the request completes when it's ready.
+    """
+    stored = load_settings()
+
+    if payload.license_key is not None:
+        key = payload.license_key.strip()
+        if key:
+            stored["license_key"] = key
+            browser_mgr.license_key = key
+        else:  # empty string = clear the key (back to keyless)
+            stored.pop("license_key", None)
+            browser_mgr.license_key = None
+
+    if payload.release_channel is not None:
+        channel = payload.release_channel.strip().lower()
+        if channel not in {"stable", "preview"}:
+            raise HTTPException(
+                status_code=400,
+                detail="release_channel must be 'stable' or 'preview'",
+            )
+        stored["release_channel"] = channel
+        browser_mgr.release_channel = channel
+
+    save_settings(stored)
+    await asyncio.to_thread(browser_mgr.resolve_binary_status)
+    return await get_system_status()
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────
@@ -605,6 +1137,11 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+    if browser_mgr.runtime.viewer_mode != "vnc" or running.display is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Clipboard relay is available only in Docker/VNC mode",
+        )
 
     import os
 
@@ -641,6 +1178,11 @@ async def get_clipboard(profile_id: str):
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+    if browser_mgr.runtime.viewer_mode != "vnc" or running.display is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Clipboard relay is available only in Docker/VNC mode",
+        )
 
     # Read Chrome's current text selection via Playwright.
     # Chrome's native copy (via VNC Ctrl+C) doesn't write to X11 clipboard
@@ -696,8 +1238,12 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
         return
-    if running.ws_port is None:
-        await websocket.close(code=4004, reason="Native profile has no VNC session")
+    if (
+        browser_mgr.runtime.viewer_mode != "vnc"
+        or running.display is None
+        or running.ws_port is None
+    ):
+        await websocket.close(code=4005, reason="VNC unavailable in native-window mode")
         return
 
     # Accept with client's requested subprotocol (if any) — RFC 6455 requires
@@ -868,6 +1414,20 @@ async def cdp_info(profile_id: str):
         "usage": "playwright.chromium.connect_over_cdp('http://<host>/api/profiles/"
         + profile_id + "/cdp')",
     }
+
+
+@app.get("/api/profiles/{profile_id}/screenshot")
+async def profile_screenshot(profile_id: str):
+    """Serve the last captured browser preview (JPEG). 404 when none exists yet."""
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    path = Path(profile["user_data_dir"]) / SCREENSHOT_FILENAME
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No screenshot")
+    return FileResponse(
+        path, media_type="image/jpeg", headers={"Cache-Control": "no-store"}
+    )
 
 
 @app.get("/api/profiles/{profile_id}/cdp/json/version/")

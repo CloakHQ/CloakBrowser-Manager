@@ -9,8 +9,10 @@ vi.mock("../lib/api", () => ({
     createProfile: vi.fn(),
     updateProfile: vi.fn(),
     deleteProfile: vi.fn(),
+    reorderProfiles: vi.fn(),
     launchProfile: vi.fn(),
     stopProfile: vi.fn(),
+    duplicateProfile: vi.fn(),
   },
 }));
 
@@ -21,8 +23,10 @@ const mockApi = api as {
   createProfile: ReturnType<typeof vi.fn>;
   updateProfile: ReturnType<typeof vi.fn>;
   deleteProfile: ReturnType<typeof vi.fn>;
+  reorderProfiles: ReturnType<typeof vi.fn>;
   launchProfile: ReturnType<typeof vi.fn>;
   stopProfile: ReturnType<typeof vi.fn>;
+  duplicateProfile: ReturnType<typeof vi.fn>;
 };
 
 const fakeProfile = {
@@ -32,25 +36,27 @@ const fakeProfile = {
   proxy: null,
   timezone: null,
   locale: null,
-  platform: "windows",
-  user_agent: null,
   screen_width: 1920,
   screen_height: 1080,
-  gpu_vendor: null,
-  gpu_renderer: null,
-  hardware_concurrency: null,
+  gpu_family: "auto" as const,
   humanize: false,
   human_preset: "default",
-  headless: false,
-  geoip: false,
+  geoip: true,
   clipboard_sync: true,
+  auto_launch: false,
   color_scheme: null,
+  launch_args: [],
+  extension_paths: [],
+  allow_3p_cookies: false,
   notes: null,
   user_data_dir: "/data/profiles/abc-123",
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
+  sort_order: 0,
   tags: [],
   status: "stopped" as const,
+  runtime_mode: "docker" as const,
+  viewer_mode: "vnc" as const,
   vnc_ws_port: null,
   cdp_url: null,
 };
@@ -117,6 +123,59 @@ describe("useProfiles", () => {
     });
 
     expect(result.current.profiles).toHaveLength(0);
+  });
+
+  it("reorder optimistically updates order then persists", async () => {
+    const p2 = { ...fakeProfile, id: "xyz-789", name: "Second" };
+    mockApi.listProfiles.mockResolvedValue([fakeProfile, p2]);
+    mockApi.reorderProfiles.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useProfiles());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.profiles.map((p) => p.id)).toEqual(["abc-123", "xyz-789"]);
+
+    await act(async () => {
+      await result.current.reorder(["xyz-789", "abc-123"]);
+    });
+
+    expect(result.current.profiles.map((p) => p.id)).toEqual(["xyz-789", "abc-123"]);
+    expect(mockApi.reorderProfiles).toHaveBeenCalledWith(["xyz-789", "abc-123"]);
+  });
+
+  it("reorder reverts (refreshes) on API failure", async () => {
+    const p2 = { ...fakeProfile, id: "xyz-789", name: "Second" };
+    // initial fetch + the refresh after failure both return the server order
+    mockApi.listProfiles.mockResolvedValue([fakeProfile, p2]);
+    mockApi.reorderProfiles.mockRejectedValue(new Error("boom"));
+
+    const { result } = renderHook(() => useProfiles());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.reorder(["xyz-789", "abc-123"]);
+    });
+
+    // The failed persist triggers refresh(), which re-applies the server order.
+    // (refresh clears the transient error, matching launch/stop behavior.)
+    expect(mockApi.reorderProfiles).toHaveBeenCalled();
+    expect(result.current.profiles.map((p) => p.id)).toEqual(["abc-123", "xyz-789"]);
+  });
+
+  it("duplicate prepends the clone and forwards includeBrowserState", async () => {
+    mockApi.listProfiles.mockResolvedValue([fakeProfile]);
+    const clone = { ...fakeProfile, id: "clone-1", name: "Test (copy)" };
+    mockApi.duplicateProfile.mockResolvedValue(clone);
+    const { result } = renderHook(() => useProfiles());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    let returned: unknown;
+    await act(async () => {
+      returned = await result.current.duplicate("abc-123", true);
+    });
+
+    expect(mockApi.duplicateProfile).toHaveBeenCalledWith("abc-123", true);
+    expect(returned).toEqual(clone);
+    expect(result.current.profiles.map((p) => p.id)).toEqual(["clone-1", "abc-123"]);
   });
 
   it("sets error on fetch failure", async () => {

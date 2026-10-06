@@ -1,25 +1,34 @@
 import { useEffect, useRef, useState } from "react";
-import { ClipboardCopy, Code2, Maximize2, Minimize2 } from "lucide-react";
+import { ClipboardCopy, Maximize2, Minimize2 } from "lucide-react";
 import { api } from "../lib/api";
+import { CdpEndpointButton } from "./CdpEndpointButton";
 
 interface ProfileViewerProps {
   profileId: string;
   cdpUrl: string | null;
   clipboardSync: boolean;
+  onClipboardSyncChange: (enabled: boolean) => Promise<void>;
   onDisconnect: () => void;
 }
 
 // X11 keysym for V key (Ctrl is already held in VNC by the time we intercept)
 const XK_v = 0x0076;
 
-export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboardSync, onDisconnect }: ProfileViewerProps) {
+export function ProfileViewer({
+  profileId,
+  cdpUrl,
+  clipboardSync: initialClipboardSync,
+  onClipboardSyncChange,
+  onDisconnect,
+}: ProfileViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<any>(null);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [clipboardSync, setClipboardSync] = useState(initialClipboardSync);
-  const [cdpCopied, setCdpCopied] = useState(false);
+
+  useEffect(() => setClipboardSync(initialClipboardSync), [initialClipboardSync]);
 
   useEffect(() => {
     let rfb: any = null;
@@ -197,6 +206,18 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     };
   }, [profileId, clipboardSync, connected]);
 
+  const toggleClipboardSync = async () => {
+    const previous = clipboardSync;
+    const next = !previous;
+    setClipboardSync(next);
+    try {
+      await onClipboardSyncChange(next);
+    } catch (err) {
+      console.warn("[clipboard] failed to persist preference:", err);
+      setClipboardSync(previous);
+    }
+  };
+
   const toggleFullscreen = () => {
     if (!containerRef.current) return;
     if (!document.fullscreenElement) {
@@ -250,26 +271,11 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
           </span>
         </div>
         <div className="flex items-center gap-1">
-          {cdpUrl && (
-            <button
-              onClick={() => {
-                const base = `${window.location.protocol}//${window.location.host}${cdpUrl}`;
-                navigator.clipboard?.writeText(base).then(() => {
-                  setCdpCopied(true);
-                  setTimeout(() => setCdpCopied(false), 2000);
-                }).catch((err) => console.warn("[cdp] copy failed:", err));
-              }}
-              className={`p-1 ${cdpCopied ? "text-emerald-400" : "text-gray-500 hover:text-gray-300"}`}
-              title={cdpCopied ? "Copied!" : "Copy CDP endpoint URL"}
-            >
-              <Code2 className="h-3.5 w-3.5" />
-            </button>
-          )}
+          <CdpEndpointButton cdpUrl={cdpUrl} />
           <button
-            onClick={() => { console.log("[clipboard] toggle:", !clipboardSync); setClipboardSync(!clipboardSync); }}
+            onClick={toggleClipboardSync}
             className={`p-1 ${clipboardSync ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}
             title={clipboardSync ? "Disable clipboard sync" : "Enable clipboard sync"}
-            disabled={!connected}
           >
             <ClipboardCopy className="h-3.5 w-3.5" />
           </button>

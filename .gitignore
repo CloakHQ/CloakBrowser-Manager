@@ -8,12 +8,21 @@ __pycache__/
 node_modules/
 frontend/dist/
 
+# Native packaging build output
+dist_native/
+build_native/
+dist_arm/
+.venv-build/
+
 # IDE
 .vscode/
 .idea/
 
 # OS
 .DS_Store
+
+# Secrets (license key, auth token) — keep .env.example, never .env
+.env
 
 # Deploy
 deploy.sh
@@ -24,3 +33,5 @@ CLAUDE.md
 publish-docker.sh
 .beads
 debug
+backend/version.txt
+.plans

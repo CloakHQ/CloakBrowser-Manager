@@ -22,12 +22,25 @@ class VNCManager:
     BASE_DISPLAY = 100
     BASE_WS_PORT = 6100
 
-    def __init__(self):
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
         self._allocated: dict[int, VNCInstance] = {}
         self._lock = asyncio.Lock()
 
+    def _require_enabled(self) -> None:
+        if not self.enabled:
+            raise RuntimeError("KasmVNC is available only in the Linux Docker runtime")
+
+    def validate_available(self) -> None:
+        """Fail early when Linux is started without the Docker KasmVNC runtime."""
+        if self.enabled and shutil.which("Xvnc") is None:
+            raise RuntimeError(
+                "Linux Manager requires the Docker image with KasmVNC installed"
+            )
+
     async def allocate(self) -> tuple[int, int]:
-        """Returns (display_number, ws_port) for a new profile."""
+        """Returns (display_number, ws_port) for a new Docker profile."""
+        self._require_enabled()
         async with self._lock:
             display = self.BASE_DISPLAY
             while display in self._allocated:
@@ -44,6 +57,7 @@ class VNCManager:
         height: int = 1080,
     ) -> subprocess.Popen:
         """Start Xvnc (KasmVNC) on the given display."""
+        self._require_enabled()
         xvnc_bin = shutil.which("Xvnc") or "Xvnc"
 
         # KasmVNC requires -httpd to enable the WebSocket handler on the websocket port.

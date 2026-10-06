@@ -71,6 +71,32 @@ describe("api.deleteProfile", () => {
   });
 });
 
+// ── duplicateProfile ────────────────────────────────────────────────────────
+
+describe("api.duplicateProfile", () => {
+  it("defaults to a config-only clone", async () => {
+    const clone = { id: "3", name: "Test (copy)" };
+    mockFetch.mockResolvedValueOnce(jsonResponse(clone));
+    const result = await api.duplicateProfile("1");
+    expect(result).toEqual(clone);
+    expect(mockFetch).toHaveBeenCalledWith("/api/profiles/1/duplicate", {
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({ include_browser_state: false }),
+    });
+  });
+
+  it("asks for the browser state to be copied when requested", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "3" }));
+    await api.duplicateProfile("1", true);
+    expect(mockFetch).toHaveBeenCalledWith("/api/profiles/1/duplicate", {
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({ include_browser_state: true }),
+    });
+  });
+});
+
 // ── launchProfile ───────────────────────────────────────────────────────────
 
 describe("api.launchProfile", () => {

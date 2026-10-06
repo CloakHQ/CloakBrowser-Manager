@@ -3,22 +3,64 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
 import os
 import socket
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cloakbrowser import launch_persistent_context_async
+from cloakbrowser.license import (
+    CloakBrowserLicenseError,
+    license_error_for_code,
+    read_denial_file,
+)
+
+from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
 BITWARDEN_EXTENSION_ID = "ecblnbbmmimjhikjdpekghmjhmnboiff"
 BITWARDEN_SEED_PROFILE = "bitwarden-auth-seed"
+
+
+UPGRADE_URL = "https://cloakbrowser.dev/#pricing"
+
+
+def is_seat_limit_error(exc: BaseException) -> bool:
+    """True if a license error is specifically the concurrency-seat denial (76).
+
+    The wrapper turns exit code 76 into a message containing "session limit
+    reached"; the other license codes (invalid/expired key, server unreachable,
+    local config) carry different text. Used to attach the upgrade CTA only to
+    the out-of-seats case.
+    """
+    return "session limit reached" in str(exc).lower()
+
+
+def license_error_detail(exc: BaseException) -> dict[str, str]:
+    """Build the structured launch-error payload the frontend renders.
+
+    ``{message, reason, upgrade_url?}`` — reason is "seat_limit" (out of seats,
+    with an upgrade CTA) or "license" (bad/expired/revoked key, server
+    unreachable, local config). Shared by the synchronous launch-raises path
+    (main.py) and the post-handshake close path (_on_browser_closed).
+    """
+    seat = is_seat_limit_error(exc)
+    detail: dict[str, str] = {
+        "message": str(exc),
+        "reason": "seat_limit" if seat else "license",
+    }
+    if seat:
+        detail["upgrade_url"] = UPGRADE_URL
+    return detail
 
 
 def _normalize_proxy(raw: str) -> str:
@@ -86,6 +128,49 @@ def _native_profile_running(processes: str, profile_name: str) -> bool:
     profile_path = Path.home() / ".cloakbrowser" / "profiles" / profile_name
     needle = f"--user-data-dir={profile_path}"
     return any(needle in line for line in processes.splitlines())
+
+
+async def test_proxy(raw_proxy: str) -> dict[str, Any]:
+    """Connect through a proxy, return exit IP + geo + latency (or an error).
+
+    Reuses the same normalize/validate as launch, then resolves the exit IP
+    via cloakbrowser's geoip echo services. Blocking work runs off-thread.
+    """
+    proxy = _normalize_proxy(raw_proxy)
+    _validate_proxy(proxy)  # raises ValueError on bad format -> 400 in the route
+    return await asyncio.to_thread(_test_proxy_sync, proxy)
+
+
+def _test_proxy_sync(proxy: str) -> dict[str, Any]:
+    from cloakbrowser.geoip import _ensure_geoip_db, resolve_proxy_exit_ip
+
+    t0 = time.monotonic()
+    try:
+        ip = resolve_proxy_exit_ip(proxy)
+    except Exception as exc:  # SOCKS w/o socksio, connection refused, etc.
+        logger.warning("Proxy test failed: %s", exc)
+        return {"ok": False, "error": "Could not connect through proxy"}
+    latency_ms = round((time.monotonic() - t0) * 1000)
+    if not ip:
+        return {"ok": False, "error": "Proxy did not return an exit IP (timeout or blocked)"}
+    country = city = timezone = None
+    try:  # geo is best-effort; never fails the test
+        import geoip2.database
+
+        with geoip2.database.Reader(_ensure_geoip_db()) as reader:
+            resp = reader.city(ip)
+            country, city = resp.country.iso_code, resp.city.name
+            timezone = resp.location.time_zone
+    except Exception as exc:
+        logger.debug("Proxy test geo lookup failed for %s: %s", ip, exc)
+    return {
+        "ok": True,
+        "ip": ip,
+        "country": country,
+        "city": city,
+        "timezone": timezone,
+        "latency_ms": latency_ms,
+    }
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
@@ -156,59 +241,251 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
         bookmarks_path.write_text(json.dumps(bookmarks, indent=2))
         logger.info("Created default bookmarks for %s", user_data_dir.name)
 
-    # --- DuckDuckGo as default search engine ---
-    prefs_path = default_dir / "Preferences"
-    if not prefs_path.exists():
-        prefs = {
-            "default_search_provider_data": {
-                "template_url_data": {
-                    "keyword": "duckduckgo.com",
-                    "short_name": "DuckDuckGo",
-                    "url": "https://duckduckgo.com/?q={searchTerms}",
-                    "suggestions_url": "https://duckduckgo.com/ac/?q={searchTerms}&type=list",
-                    "favicon_url": "https://duckduckgo.com/favicon.ico",
-                }
-            },
-            "default_search_provider": {
-                "enabled": True,
-            },
-        }
-        prefs_path.write_text(json.dumps(prefs, indent=2))
-        logger.info("Set DuckDuckGo as default search for %s", user_data_dir.name)
+    # NOTE: the default search engine is NOT set here. The binary is built
+    # de-Googled (prepopulated default is "No Search"), and writing
+    # default_search_provider_data into Default/Preferences does NOT take — the
+    # authoritative value lives in the MAC-protected Default/Secure Preferences,
+    # rebuilt from the prepopulated set on every startup. Setting Google as the
+    # default requires a live TemplateURLService commit, done once per profile in
+    # BrowserManager._ensure_search_engine() (see that method).
 
 
-BASE_CDP_PORT = 5100
-CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
+CDP_START_ATTEMPTS = 3
+CDP_READY_TIMEOUT = 10.0
+
+# Periodic browser preview capture (shown in the edit view of a stopped profile).
+# Captured every interval while running + once on stop; written to the profile's
+# own user_data_dir so it's removed with the profile.
+SCREENSHOT_FILENAME = "last_screenshot.jpg"
+SCREENSHOT_INTERVAL = 30.0
+SCREENSHOT_JPEG_QUALITY = 55
+
+# One-time default-search-engine setup (see _ensure_search_engine).
+SEARCH_ENGINE_MARKER = ".cloak_search_engine"
+SEARCH_ENGINE_MAX_ATTEMPTS = 3
+SEARCH_ENGINE_NAME = "Google"
+SEARCH_ENGINE_KEYWORD = "google.com"
+SEARCH_ENGINE_URL = "https://www.google.com/search?q=%s"
+
+# Read the live default search engine straight from the settings WebUI backend.
+_ACTIVE_DEFAULT_JS = """async () => {
+  const cr = await import('chrome://resources/js/cr.js');
+  const l = await cr.sendWithPromise('getSearchEnginesList');
+  const a = (l.defaults || []).find(e => e.default);
+  return a ? {name: a.name, keyword: a.keyword} : null;
+}"""
+# Click the "Add" button that opens the add-search-engine dialog. We can't seed a
+# search engine by writing files: a hand-written Web Data row carries an invalid
+# url_hash (an HMAC we can't forge) and Chrome deletes it on load (strictly so on
+# Windows). Only Chrome may create the row, so we drive the real Add dialog.
+_CLICK_ADD_JS = """() => {
+  let clicked = false;
+  const walk = (root) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.tagName === 'CR-BUTTON'
+        && /^Add$/i.test((el.textContent || '').trim())
+        && /Add Site Search/i.test(el.getAttribute('aria-label') || '')) {
+      el.click(); clicked = true;
+    }
+  });
+  walk(document);
+  return clicked;
+}"""
+# Whether the dialog's Add action button is enabled (all fields validated).
+_ADD_ENABLED_JS = """() => {
+  let enabled = false;
+  const walk = (root) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.tagName === 'CR-BUTTON'
+        && /^Add$/i.test((el.textContent || '').trim())
+        && el.closest('cr-dialog')) enabled = !el.disabled;
+  });
+  walk(document);
+  return enabled;
+}"""
+# Click the (enabled) dialog Add button to commit the new engine.
+_SUBMIT_ADD_JS = """() => {
+  let clicked = false;
+  const walk = (root) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.tagName === 'CR-BUTTON'
+        && /^Add$/i.test((el.textContent || '').trim())
+        && el.closest('cr-dialog') && !el.disabled) { el.click(); clicked = true; }
+  });
+  walk(document);
+  return clicked;
+}"""
+# Open Google's "More actions" menu, then click "Make default". Exact aria-label
+# match so we don't hit the "Google AI Mode" starter-pack entry. Playwright
+# locators don't pierce this page's nested shadow DOM reliably, so we walk it.
+_MAKE_GOOGLE_DEFAULT_JS = """() => {
+  const walk = (root, fn) => root.querySelectorAll('*').forEach(el => {
+    if (el.shadowRoot) walk(el.shadowRoot, fn);
+    fn(el);
+  });
+  walk(document, el => {
+    const label = ((el.getAttribute && el.getAttribute('aria-label')) || '').trim();
+    if (el.tagName === 'CR-ICON-BUTTON' && label === 'More actions for Google') el.click();
+  });
+  return new Promise(resolve => setTimeout(() => {
+    let clicked = false;
+    walk(document, el => {
+      if (el.tagName === 'BUTTON'
+          && /^Make default$/i.test((el.textContent || '').trim())
+          && !el.disabled) { el.click(); clicked = true; }
+    });
+    resolve(clicked);
+  }, 400));
+}"""
+
+
+class ProfileBusyError(RuntimeError):
+    """The profile's browser or on-disk state is in use by another operation."""
 
 
 @dataclass
 class RunningProfile:
     profile_id: str
-    context: Any | None
-    display: int | None
-    ws_port: int | None
+    context: Any | None  # Playwright BrowserContext; None for registry-launched profiles
     cdp_port: int
+    display: int | None = None
+    ws_port: int | None = None
     process: asyncio.subprocess.Process | None = None
     native: bool = False
+    user_data_dir: Path | None = None
+    screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
+    capture_preview: bool = True
+    # Path to the wrapper's per-launch denial file (set by launch_persistent_
+    # context_async on the returned context). Read on close to tell a seat/
+    # license denial apart from a real crash or a user-initiated close.
+    denial_path: str | None = None
 
 
 class BrowserManager:
-    def __init__(self):
+    def __init__(
+        self,
+        runtime_config: RuntimeConfig | None = None,
+        license_key: str | None = None,
+        release_channel: str | None = None,
+    ):
+        self.runtime = runtime_config or resolve_runtime()
+        # App-wide license: passed to every launch so the wrapper downloads the
+        # Pro build and injects the key the Pro binary needs to boot + take a seat.
+        self.license_key = license_key
+        self.release_channel = release_channel
+        # Resolved at startup by resolve_binary_status(); read by GET /api/status.
+        self.license_tier = "keyless"
+        self.license_plan: str | None = None
+        self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
+        # Last launch failure per profile, surfaced on the status poll and cleared
+        # on the next launch. Holds post-handshake denials (out of seats, bad key)
+        # that land AFTER launch() already returned 200 — the browser boots, gets
+        # denied ~1s later, and self-closes, so there's no HTTP response to carry
+        # the reason. get_status() returns this so the frontend can show it.
+        self._last_errors: dict[str, dict[str, str]] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
-        self.vnc = VNCManager()
+        # Reservations held while a context is closing (stop(), a self-exit, a
+        # failed launch's cleanup). Counted per reservation so one operation's
+        # cleanup can never release another's; see _reserve_stopping().
+        self._stopping: dict[str, int] = {}
+        # Profiles whose user_data_dir is reserved by a filesystem operation
+        # (duplicate / reset / delete). launch() refuses these; see hold_stopped().
+        self._held: set[str] = set()
+        self._initializing: set[str] = set()  # profile IDs in one-time first-launch setup
+        self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
-        self._next_cdp_port = BASE_CDP_PORT
+        self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
 
+    def resolve_binary_status(self) -> None:
+        """Resolve the license tier + binary version and pre-download the binary.
+
+        Blocking — called once at startup (via a thread) so the multi-hundred-MB
+        Pro download stays out of the launch path and auto-launch's 60s timeout.
+        Never raises: on any failure the keyless baked-in binary remains usable.
+        """
+        from cloakbrowser.config import CHROMIUM_VERSION, get_chromium_version
+        from cloakbrowser.download import ensure_binary
+        from cloakbrowser.license import (
+            get_pro_latest_version,
+            resolve_license_key,
+            validate_license,
+        )
+
+        try:
+            keyless_version = get_chromium_version()
+        except Exception:
+            keyless_version = CHROMIUM_VERSION
+
+        tier = "keyless"
+        version = keyless_version
+
+        key = resolve_license_key(self.license_key)
+        if key:
+            try:
+                info = validate_license(key)
+            except Exception as exc:
+                info = None
+                logger.warning("License validation failed: %s", exc)
+            if info and info.valid:
+                tier = "free" if info.plan == "free" else "pro"
+                self.license_plan = info.plan
+                try:
+                    version = get_pro_latest_version(self.release_channel) or keyless_version
+                except Exception as exc:
+                    logger.warning("Could not resolve Pro version: %s", exc)
+
+        self.license_tier = tier
+        self.binary_version = version
+
+        try:
+            ensure_binary(
+                license_key=self.license_key,
+                release_channel=self.release_channel,
+            )
+            logger.info("Binary ready: tier=%s version=%s", tier, version)
+        except Exception as exc:
+            logger.error(
+                "Binary pre-download failed (keyless fallback remains): %s",
+                exc,
+                exc_info=True,
+            )
+
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
-        """Launch a browser instance for the given profile."""
+        """Launch a browser instance using the configured host runtime."""
         profile_id = profile["id"]
 
+        # Per-launch context so any launch failure carries the inputs that
+        # produced it. Proxy credentials are redacted; never log the key.
+        from . import diagnostics
+
+        logger.info(
+            "Launching profile %s: seed=%s proxy=%s tier=%s plan=%s runtime=%s",
+            profile_id,
+            profile.get("fingerprint_seed"),
+            diagnostics.redact_proxy(profile.get("proxy")),
+            self.license_tier,
+            self.license_plan or "-",
+            self.runtime.runtime_mode,
+        )
+
         async with self._lock:
+            if profile_id in self._held:
+                raise ProfileBusyError(
+                    f"Profile {profile_id} is busy: its browser state is being copied or reset"
+                )
+            if profile_id in self._stopping:
+                # The previous browser is still closing. Starting another Chrome
+                # on the same directory now would fight it for the profile — and
+                # in Docker mode the launch would even delete its Singleton lock.
+                raise ProfileBusyError(f"Profile {profile_id} is still closing; retry shortly")
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
+            # Fresh attempt — drop any stale denial from a previous launch so the
+            # status poll doesn't keep showing an old "out of seats" message.
+            self._last_errors.pop(profile_id, None)
 
         native_profile = self._native_profile_name(profile)
         if native_profile:
@@ -221,127 +498,223 @@ class BrowserManager:
                     self._launching.discard(profile_id)
                 raise
 
+        display: int | None = None
+        ws_port: int | None = None
+        cdp_port: int | None = None
+        context: Any | None = None
         try:
-            from cloakbrowser import launch_persistent_context_async
-        except BaseException:
-            async with self._lock:
-                self._launching.discard(profile_id)
-            raise
+            if self.runtime.viewer_mode == "vnc":
+                display, ws_port = await self.vnc.allocate()
 
-        display, ws_port = await self.vnc.allocate()
+            user_data_dir = Path(profile["user_data_dir"])
 
-        try:
-            cdp_port = self._allocate_cdp_port()
-        except ValueError:
-            async with self._lock:
-                self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
-            raise
+            # Docker can leave stale locks after an unclean container exit. Native
+            # mode must let Chromium arbitrate profile ownership itself.
+            if self.runtime.runtime_mode == "docker":
+                for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                    (user_data_dir / lock_file).unlink(missing_ok=True)
 
-        # Clean stale Chromium lock files (left by previous container crashes)
-        user_data_dir = Path(profile["user_data_dir"])
-        for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            lock_path = user_data_dir / lock_file
-            lock_path.unlink(missing_ok=True)
+            _init_profile_defaults(user_data_dir)
 
-        # Set up bookmarks and search engine on first launch
-        _init_profile_defaults(user_data_dir)
+            # One-time per profile (opt-out via set_google_default): make Google
+            # the default search engine. Runs before the user-facing launch;
+            # reports "initializing" via get_status while it works (one short
+            # headless launch). Never fatal.
+            if profile.get("set_google_default", True):
+                await self._ensure_search_engine(profile_id, user_data_dir)
 
-        try:
-            # Start KasmVNC on the allocated display
-            await self.vnc.start_vnc(
-                display,
-                ws_port,
-                width=profile.get("screen_width", 1920),
-                height=profile.get("screen_height", 1080),
-            )
+            if display is not None and ws_port is not None:
+                await self.vnc.start_vnc(
+                    display,
+                    ws_port,
+                    width=profile.get("screen_width", 1920),
+                    height=profile.get("screen_height", 1080),
+                )
 
-            # Build fingerprint args from profile settings
-            extra_args = self._build_fingerprint_args(profile)
-            extra_args += [
-                arg for arg in profile.get("launch_args") or []
-                if not arg.startswith(("--native-profile=", "--start-url="))
+            user_launch_args = profile.get("launch_args") or []
+            conflicting_debug_args = [
+                arg for arg in user_launch_args
+                if arg.startswith(("--remote-debugging-port", "--remote-debugging-address"))
             ]
-            extra_args.append(f"--remote-debugging-port={cdp_port}")
+            if conflicting_debug_args:
+                raise ValueError(
+                    "Manager owns remote debugging configuration; remove: "
+                    + ", ".join(conflicting_debug_args)
+                )
 
-            # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
+            extra_args = self._build_fingerprint_args(profile)
+            extra_args += user_launch_args
+            extra_args.append("--remote-debugging-address=127.0.0.1")
+            # Reopen the tabs the user had open when the profile was last stopped.
+            # Chrome's persistent session is saved on disk but only restored when told to.
+            if profile.get("restore_session", True):
+                extra_args.append("--restore-last-session")
+
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
                 _validate_proxy(proxy)
 
-            # Launch CloakBrowser on that display
-            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation
-            context = await launch_persistent_context_async(
-                user_data_dir=profile["user_data_dir"],
-                headless=bool(profile.get("headless", False)),
-                proxy=proxy,
-                args=extra_args,
-                timezone=profile.get("timezone") or None,
-                locale=profile.get("locale") or None,
-                humanize=bool(profile.get("humanize", False)),
-                human_preset=profile.get("human_preset", "default"),
-                geoip=bool(profile.get("geoip", False)),
-                color_scheme=profile.get("color_scheme") or None,
-                user_agent=profile.get("user_agent") or None,
-                viewport={
+            launch_options: dict[str, Any] = {
+                "user_data_dir": profile["user_data_dir"],
+                "headless": False,
+                "proxy": proxy,
+                "args": extra_args,
+                "timezone": profile.get("timezone") or None,
+                "locale": profile.get("locale") or None,
+                "humanize": bool(profile.get("humanize", False)),
+                "human_preset": profile.get("human_preset", "default"),
+                "geoip": bool(profile.get("geoip", False)),
+                "color_scheme": profile.get("color_scheme") or None,
+                "extension_paths": profile.get("extension_paths") or [],
+                "license_key": self.license_key,
+                "release_channel": self.release_channel,
+            }
+            if display is not None:
+                launch_options["viewport"] = {
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
-                },
-                env={**os.environ, "DISPLAY": f":{display}"},
-            )
+                }
+                launch_options["env"] = {**os.environ, "DISPLAY": f":{display}"}
 
-            # Inject clipboard listener: captures copied text on every page
-            # so the GET /clipboard endpoint can read it via page.evaluate()
-            _clipboard_init_js = """
-                window.__clipboardText = '';
-                document.addEventListener('copy', () => {
-                    const sel = window.getSelection();
-                    if (sel) window.__clipboardText = sel.toString();
-                });
-                document.addEventListener('keydown', (e) => {
-                    if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.altKey && !e.shiftKey) {
-                        const sel = window.getSelection();
-                        if (sel && sel.toString()) window.__clipboardText = sel.toString();
-                    }
-                });
-            """
-            await context.add_init_script(_clipboard_init_js)
-            # Also inject into already-open pages (about:blank created before init_script)
-            for p in context.pages:
+            last_cdp_error: Exception | None = None
+            for attempt in range(1, CDP_START_ATTEMPTS + 1):
+                cdp_port = self._reserve_cdp_port()
+                launch_options["args"] = [
+                    *extra_args,
+                    f"--remote-debugging-port={cdp_port}",
+                ]
                 try:
-                    await p.evaluate(_clipboard_init_js)
+                    context = await launch_persistent_context_async(**launch_options)
+                    # An over-cap/denied seat leaves the browser booting but never
+                    # serving a usable CDP endpoint — so waiting on CDP would just
+                    # time out (or worse). The wrapper wrote the reason to a denial
+                    # file; check it immediately and each CDP poll so a denial bails
+                    # in ~1s instead of waiting out CDP that will never come.
+                    denial_path = getattr(context, "_cloak_denial_path", None)
+                    lic = self._denial_error(denial_path)
+                    if lic is not None:
+                        raise lic
+                    await self._wait_for_cdp(cdp_port, denial_path=denial_path)
+                    break
+                except asyncio.CancelledError:
+                    if context is not None:
+                        await self._close_context(context, profile_id)
+                    self._release_cdp_port(cdp_port)
+                    context = None
+                    cdp_port = None
+                    raise
                 except Exception as exc:
-                    logger.debug("Clipboard init failed on existing page: %s", exc)
+                    last_cdp_error = exc
+                    # Grab the denial path before dropping the context: a denial
+                    # that lands during _wait_for_cdp surfaces as a TimeoutError,
+                    # not the license exception, so check the file explicitly.
+                    dp = getattr(context, "_cloak_denial_path", None) if context is not None else None
+                    if context is not None:
+                        await self._close_context(context, profile_id)
+                    self._release_cdp_port(cdp_port)
+                    context = None
+                    cdp_port = None
+                    # A license denial (out of seats, bad/expired key, server
+                    # unreachable, local config) is deterministic — retrying just
+                    # wastes ~10s and re-denies. Fail fast with the real reason,
+                    # whether it raised as the license exception or as a timeout.
+                    if isinstance(exc, CloakBrowserLicenseError):
+                        raise
+                    lic = self._denial_error(dp)
+                    if lic is not None:
+                        raise lic from exc
+                    logger.warning(
+                        "Browser/CDP startup attempt %d/%d failed for %s: %s",
+                        attempt,
+                        CDP_START_ATTEMPTS,
+                        profile_id,
+                        exc,
+                    )
+            else:
+                raise RuntimeError(
+                    f"Unable to start verified CDP for profile {profile_id}"
+                ) from last_cdp_error
+
+            if context is None or cdp_port is None:
+                raise RuntimeError(f"Browser startup did not complete for profile {profile_id}")
+
+            if self.runtime.viewer_mode == "vnc":
+                # Capture copied text so the Manager clipboard endpoint can read it.
+                clipboard_init_js = """
+                    window.__clipboardText = '';
+                    document.addEventListener('copy', () => {
+                        const sel = window.getSelection();
+                        if (sel) window.__clipboardText = sel.toString();
+                    });
+                    document.addEventListener('keydown', (e) => {
+                        if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.altKey && !e.shiftKey) {
+                            const sel = window.getSelection();
+                            if (sel && sel.toString()) window.__clipboardText = sel.toString();
+                        }
+                    });
+                """
+                await context.add_init_script(clipboard_init_js)
+                for page in context.pages:
+                    try:
+                        await page.evaluate(clipboard_init_js)
+                    except Exception as exc:
+                        logger.debug("Clipboard init failed on existing page: %s", exc)
 
             running = RunningProfile(
                 profile_id=profile_id,
                 context=context,
+                cdp_port=cdp_port,
                 display=display,
                 ws_port=ws_port,
-                cdp_port=cdp_port,
+                user_data_dir=user_data_dir,
+                capture_preview=bool(profile.get("capture_preview", True)),
+                denial_path=getattr(context, "_cloak_denial_path", None),
             )
-
-            # Auto-cleanup if browser crashes or user closes Chrome via VNC
-            context.on("close", lambda: asyncio.ensure_future(
-                self._on_browser_closed(profile_id)
-            ))
+            context.on(
+                "close",
+                lambda *_: asyncio.ensure_future(self._on_browser_closed(running)),
+            )
 
             async with self._lock:
                 self.running[profile_id] = running
                 self._launching.discard(profile_id)
 
-            logger.info(
-                "Launched profile %s on display :%d (ws_port=%d, cdp_port=%d)",
-                profile_id, display, ws_port, cdp_port,
-            )
+            # Periodically snapshot the page so the edit view (and the native
+            # running view) can show the last frame. Runs even when the browser
+            # is closed from inside VNC, where an on-close capture is impossible.
+            # Per-profile opt-out via capture_preview.
+            if running.capture_preview:
+                running.screenshot_task = asyncio.ensure_future(
+                    self._screenshot_loop(profile_id)
+                )
 
+            logger.info(
+                "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
+                profile_id,
+                self.runtime.runtime_mode,
+                f":{display}" if display is not None else "native",
+                ws_port,
+                cdp_port,
+            )
             return running
 
         except BaseException:
+            # Stay "active" until the half-launched browser is really gone: swap
+            # _launching for _stopping under the lock so is_active() never sees a
+            # gap while a context may still be open, then clear it after cleanup.
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
+                self._reserve_stopping(profile_id)
+            try:
+                if context is not None:
+                    await self._close_context(context, profile_id)
+                if cdp_port is not None:
+                    self._release_cdp_port(cdp_port)
+                if display is not None:
+                    await self.vnc.stop_vnc(display)
+            finally:
+                self._release_stopping(profile_id)
             raise
 
     @staticmethod
@@ -405,8 +778,6 @@ class BrowserManager:
             running = RunningProfile(
                 profile_id=profile_id,
                 context=None,
-                display=None,
-                ws_port=None,
                 cdp_port=cdp_port,
                 process=process,
                 native=True,
@@ -485,63 +856,349 @@ class BrowserManager:
             if current and current.process is process:
                 self.running.pop(profile_id, None)
 
-    async def _on_browser_closed(self, profile_id: str):
-        """Called when browser exits (crash, user closed via VNC, or stop())."""
-        async with self._lock:
-            running = self.running.pop(profile_id, None)
+    async def _ensure_search_engine(
+        self, profile_id: str, user_data_dir: Path
+    ) -> None:
+        """Make Google the default search engine, once per profile.
 
-        if running:
-            logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            if running.display is not None:
-                await self.vnc.stop_vnc(running.display)
+        Marker-gated so it runs only on a profile's first launch. Reports
+        "initializing" via get_status while it works. Never fatal: on failure the
+        profile still launches (with the binary's de-Googled "No Search" default).
+
+        The marker records outcome: "google" = done (skip forever); "failed:N" =
+        N attempts spent. Retries up to SEARCH_ENGINE_MAX_ATTEMPTS, then gives up
+        so a persistently-failing profile doesn't pay an extra headless launch
+        (~5s) on every single launch, silently, forever.
+        """
+        marker = user_data_dir / SEARCH_ENGINE_MARKER
+        state = marker.read_text().strip() if marker.exists() else ""
+        if state == "google":
+            return
+        attempts = 0
+        if state.startswith("failed:"):
+            try:
+                attempts = int(state.split(":", 1)[1])
+            except ValueError:
+                attempts = 0
+            if attempts >= SEARCH_ENGINE_MAX_ATTEMPTS:
+                return  # gave up earlier — stop burning launches on every start
+
+        self._initializing.add(profile_id)
+        try:
+            await self._setup_google_default(user_data_dir)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("google\n")
+            logger.info(
+                "Set Google as default search engine for %s", user_data_dir.name
+            )
+        except CloakBrowserLicenseError:
+            # A license denial (out of seats, bad key, …) isn't a search-engine
+            # failure — don't burn a retry on the marker; abort the launch so the
+            # API surfaces the real reason.
+            raise
+        except Exception as exc:
+            attempts += 1
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(f"failed:{attempts}\n")
+            except OSError:
+                pass
+            log = logger.error if attempts >= SEARCH_ENGINE_MAX_ATTEMPTS else logger.warning
+            log(
+                "Default-search-engine setup failed for %s (attempt %d/%d, launching anyway): %s",
+                user_data_dir.name,
+                attempts,
+                SEARCH_ENGINE_MAX_ATTEMPTS,
+                exc,
+            )
+        finally:
+            self._initializing.discard(profile_id)
+
+    async def _setup_google_default(self, user_data_dir: Path) -> None:
+        """Add Google via the settings UI, then commit it as the default.
+
+        Single headless launch, no file seeding. A plain Preferences write can't
+        set the default (the authoritative value is MAC-protected in Secure
+        Preferences, rebuilt from the prepopulated set every startup), and a
+        hand-written Web Data keyword row is deleted on load for its invalid,
+        un-forgeable url_hash (strictly so on Windows). So we drive the real Add
+        dialog — Chrome creates the row with a valid hash — then "Make default".
+        Every later launch then carries Google via the profile's own files.
+        """
+        ctx = await self._headless_launch(user_data_dir)
+        try:
+            page = await ctx.new_page()
+            await page.goto("chrome://settings/searchEngines")
+            await asyncio.sleep(2)
+
+            if not await page.evaluate(_CLICK_ADD_JS):
+                raise RuntimeError("could not open the Add search engine dialog")
+            await asyncio.sleep(1.2)
+
+            # Real .fill() emits trusted events so the dialog's async field
+            # validation runs and enables the Add button; a synthetic value-set
+            # does not. Playwright pierces the cr-input's open shadow root.
+            await page.locator('cr-input[label="Name"] input').first.fill(SEARCH_ENGINE_NAME)
+            await page.locator('cr-input[label="Shortcut"] input').first.fill(SEARCH_ENGINE_KEYWORD)
+            await page.locator('cr-input[label^="URL"] input').first.fill(SEARCH_ENGINE_URL)
+
+            enabled = False
+            for _ in range(12):
+                await asyncio.sleep(0.25)
+                if await page.evaluate(_ADD_ENABLED_JS):
+                    enabled = True
+                    break
+            if not enabled:
+                raise RuntimeError("Add dialog stayed disabled after fill")
+
+            if not await page.evaluate(_SUBMIT_ADD_JS):
+                raise RuntimeError("could not submit the Add dialog")
+            await asyncio.sleep(1.2)
+
+            clicked = await page.evaluate(_MAKE_GOOGLE_DEFAULT_JS)
+            await asyncio.sleep(1)
+            active = await page.evaluate(_ACTIVE_DEFAULT_JS)
+            if not (active and active.get("keyword") == SEARCH_ENGINE_KEYWORD):
+                raise RuntimeError(
+                    f"make-default did not take (clicked={clicked}, active={active})"
+                )
+        finally:
+            await self._close_context(ctx, "search-init")
+        await asyncio.sleep(0.5)
+
+    async def _headless_launch(self, user_data_dir: Path) -> Any:
+        """Short headless launch used only by the one-time search-engine setup."""
+        for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            (user_data_dir / lock_file).unlink(missing_ok=True)
+        return await launch_persistent_context_async(
+            user_data_dir=str(user_data_dir),
+            headless=True,
+            license_key=self.license_key,
+            release_channel=self.release_channel,
+        )
+
+    async def _capture_screenshot(self, running: RunningProfile) -> None:
+        """Write a compressed JPEG of the profile's current page to disk.
+
+        Best-effort: a live page and user_data_dir are required. Written to a
+        temp file then atomically renamed so the endpoint never serves a
+        half-written image. Callers wrap this; it may raise on a dead/navigating
+        page.
+        """
+        if running.user_data_dir is None:
+            return
+        pages = list(running.context.pages)
+        if not pages:
+            return
+        page = pages[-1]  # most recently opened tab ≈ what the user is viewing
+        dest = running.user_data_dir / SCREENSHOT_FILENAME
+        tmp = running.user_data_dir / (SCREENSHOT_FILENAME + ".tmp")
+        await page.screenshot(
+            path=str(tmp), type="jpeg", quality=SCREENSHOT_JPEG_QUALITY
+        )
+        os.replace(tmp, dest)
+
+    async def _screenshot_loop(self, profile_id: str) -> None:
+        """Capture a preview every SCREENSHOT_INTERVAL while the profile runs."""
+        try:
+            while self.running.get(profile_id) is not None:
+                await asyncio.sleep(SCREENSHOT_INTERVAL)
+                running = self.running.get(profile_id)
+                if running is None:
+                    break
+                try:
+                    await self._capture_screenshot(running)
+                except Exception as exc:
+                    logger.debug(
+                        "Preview screenshot failed for %s: %s", profile_id, exc
+                    )
+        except asyncio.CancelledError:
+            pass
+
+    async def _close_context(self, context: Any, profile_id: str) -> None:
+        try:
+            await context.close()
+        except Exception as exc:
+            logger.warning("Error closing context for %s: %s", profile_id, exc)
+
+    async def _dispose_running(
+        self,
+        running: RunningProfile,
+        *,
+        close_context: bool,
+    ) -> None:
+        if running.screenshot_task is not None:
+            running.screenshot_task.cancel()
+        if close_context and running.context is not None:
+            await self._close_context(running.context, running.profile_id)
+        if running.display is not None:
+            await self.vnc.stop_vnc(running.display)
+        self._release_cdp_port(running.cdp_port)
+
+    async def _on_browser_closed(self, running: RunningProfile):
+        """Release resources after a browser crash or user-initiated close.
+
+        A post-handshake license denial (out of seats, bad/expired key) lands
+        HERE, not at launch: the browser boots, launch() returns 200, then the
+        binary self-exits ~1s later. It leaves the reason in a denial file the
+        wrapper minted; read it so the status poll can tell the user why the
+        profile just vanished instead of silently flipping back to stopped.
+
+        Takes the specific RunningProfile (not just its id): a late close event
+        from a superseded launch must not pop/dispose a healthy relaunch that now
+        owns the same profile_id, nor stamp a stale denial onto it.
+        """
+        profile_id = running.profile_id
+        async with self._lock:
+            if self.running.get(profile_id) is not running:
+                return  # superseded — a newer launch owns this profile now
+            # Record the denial and pop under the SAME lock so it can't race with
+            # a concurrent launch() clearing _last_errors at its start.
+            self._record_denial_if_any(profile_id, running.denial_path)
+            self.running.pop(profile_id, None)
+            # Same contract as stop(): active until the dispose is really done.
+            self._reserve_stopping(profile_id)
+
+        logger.info("Browser closed for profile %s, cleaning up", profile_id)
+        try:
+            await self._dispose_running(running, close_context=True)
+        finally:
+            self._release_stopping(profile_id)
+
+    def _denial_error(self, denial_path: str | None) -> CloakBrowserLicenseError | None:
+        """Read the wrapper's denial file → a license error, or None.
+
+        Destructive read (consumes the file) but cached in-process, so it's safe
+        even if the wrapper's guard already consumed it. Non-license closes (real
+        crash, user closed the tab) leave no file → None.
+        """
+        if not denial_path:
+            return None
+        try:
+            code = read_denial_file(denial_path)
+        except Exception as exc:  # never let cleanup fail on a read error
+            logger.debug("Denial-file read failed: %s", exc)
+            return None
+        return license_error_for_code(code) if code is not None else None
+
+    def _record_denial_if_any(self, profile_id: str, denial_path: str | None) -> None:
+        """If the close was a license denial, stash it for the status poll."""
+        lic = self._denial_error(denial_path)
+        if lic is None:
+            return
+        self._last_errors[profile_id] = license_error_detail(lic)
+        logger.warning("Profile %s closed on a license denial: %s", profile_id, lic)
 
     async def stop(self, profile_id: str):
-        """Stop a running browser instance."""
-        # Pop before close so _on_browser_closed() finds nothing to clean up
+        """Stop a running browser instance and release all owned resources."""
+        # Pop before close so the close event observes an already-clean state.
+        # _stopping keeps the profile "active" for is_active() until the context
+        # is really closed: Chrome is still flushing its profile dir in between.
         async with self._lock:
             running = self.running.pop(profile_id, None)
+            if running:
+                self._reserve_stopping(profile_id)
 
         if not running:
             return
 
         logger.info("Stopping profile %s", profile_id)
+        try:
+            if running.native and running.process:
+                running.process.terminate()
+                try:
+                    await asyncio.wait_for(running.process.wait(), timeout=10)
+                except TimeoutError:
+                    running.process.kill()
+                    await running.process.wait()
+                return
+            # Final preview capture while the context is still alive (the on-close
+            # path can't screenshot — the browser is already gone by then).
+            if running.capture_preview and running.context is not None:
+                try:
+                    await self._capture_screenshot(running)
+                except Exception as exc:
+                    logger.debug(
+                        "Final preview screenshot failed for %s: %s", profile_id, exc
+                    )
+            await self._dispose_running(running, close_context=True)
+        finally:
+            self._release_stopping(profile_id)
 
-        if running.native and running.process:
-            running.process.terminate()
-            try:
-                await asyncio.wait_for(running.process.wait(), timeout=10)
-            except TimeoutError:
-                running.process.kill()
-                await running.process.wait()
-            return
+    def _reserve_stopping(self, profile_id: str) -> None:
+        """Mark a context-close in progress for the profile (counted)."""
+        self._stopping[profile_id] = self._stopping.get(profile_id, 0) + 1
 
-        if running.context:
-            try:
-                await running.context.close()
-            except Exception as exc:
-                logger.warning("Error closing context for %s: %s", profile_id, exc)
+    def _release_stopping(self, profile_id: str) -> None:
+        """Release ONE close reservation; the profile stays active while others remain."""
+        left = self._stopping.get(profile_id, 0) - 1
+        if left > 0:
+            self._stopping[profile_id] = left
+        else:
+            self._stopping.pop(profile_id, None)
 
-        if running.display is not None:
-            await self.vnc.stop_vnc(running.display)
+    def is_active(self, profile_id: str) -> bool:
+        """True while a browser owns the profile dir: launching, running or still
+        closing. ``running`` alone is not enough — launch() registers there only
+        at the very end, and stop() pops it before the context is closed."""
+        return (
+            profile_id in self.running
+            or profile_id in self._launching
+            or profile_id in self._stopping
+        )
+
+    @asynccontextmanager
+    async def hold_stopped(self, profile_id: str):
+        """Exclusive access to a stopped profile's on-disk state for the block.
+
+        Refuses with ProfileBusyError if a browser is launching, running or
+        closing for the profile, or another hold is active. While held, launch()
+        refuses the profile. Every operation that reads or rewrites a
+        user_data_dir (duplicate, reset, delete) takes this, so a launch and a
+        filesystem operation can never interleave on the same directory.
+        """
+        async with self._lock:
+            if self.is_active(profile_id):
+                raise ProfileBusyError(f"Profile {profile_id} is running or changing state")
+            if profile_id in self._held:
+                raise ProfileBusyError(
+                    f"Profile {profile_id} is busy: its browser state is being copied or reset"
+                )
+            self._held.add(profile_id)
+        try:
+            yield
+        finally:
+            self._held.discard(profile_id)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
-        """Get running status for a profile."""
+        """Get running status and viewer capabilities for a profile."""
         running = self.running.get(profile_id)
         if running:
-            return {
-                "status": "running",
-                "vnc_ws_port": running.ws_port,
-                "display": "native-macos" if running.native else f":{running.display}",
-                "cdp_url": f"/api/profiles/{profile_id}/cdp",
-                "direct_cdp_url": f"http://127.0.0.1:{running.cdp_port}",
-            }
-        return {
-            "status": "stopped",
-            "vnc_ws_port": None,
-            "display": None,
-            "cdp_url": None,
-            "direct_cdp_url": None,
+            state = "running"
+        elif profile_id in self._initializing:
+            state = "initializing"
+        else:
+            state = "stopped"
+        status = {
+            "status": state,
+            "runtime_mode": self.runtime.runtime_mode,
+            "viewer_mode": self.runtime.viewer_mode,
+            "vnc_ws_port": running.ws_port if running else None,
+            "display": (
+                "native-macos" if running and running.native is True
+                else f":{running.display}" if running and running.display is not None
+                else None
+            ),
+            "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+            "direct_cdp_url": (
+                f"http://127.0.0.1:{running.cdp_port}" if running else None
+            ),
+            # Set when the last launch closed on a license denial (post-handshake
+            # out-of-seats / bad key). Only meaningful while stopped; cleared on
+            # the next launch. {message, reason, upgrade_url?} or None.
+            "last_error": None if running else self._last_errors.get(profile_id),
         }
+        return status
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown."""
@@ -551,11 +1208,13 @@ class BrowserManager:
         for pid in profile_ids:
             await self.stop(pid)
 
-        await self.vnc.cleanup_all()
+        if self.runtime.viewer_mode == "vnc":
+            await self.vnc.cleanup_all()
 
     async def cleanup_stale(self):
-        """Kill orphan processes from previous container runs."""
-        await self.vnc.cleanup_stale()
+        """Kill orphan display processes in the Docker runtime only."""
+        if self.runtime.viewer_mode == "vnc":
+            await self.vnc.cleanup_stale()
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
@@ -579,49 +1238,96 @@ class BrowserManager:
                 )
         logger.info("Auto-launch complete: %d running", len(self.running))
 
-    def _allocate_cdp_port(self) -> int:
-        """Find a free CDP port using a rotating counter to avoid TIME_WAIT collisions."""
-        for _ in range(CDP_PORT_RANGE):
-            port = self._next_cdp_port
-            self._next_cdp_port = BASE_CDP_PORT + (
-                (self._next_cdp_port + 1 - BASE_CDP_PORT) % CDP_PORT_RANGE
-            )
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    s.bind(("127.0.0.1", port))
-                    return port
-                except OSError:
-                    continue
-        raise ValueError("No free CDP ports available in range %d-%d" % (BASE_CDP_PORT, BASE_CDP_PORT + CDP_PORT_RANGE - 1))
+    def _reserve_cdp_port(self) -> int:
+        """Reserve an OS-selected loopback port for one managed browser."""
+        for _ in range(20):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = int(sock.getsockname()[1])
+            if port not in self._cdp_ports:
+                self._cdp_ports.add(port)
+                return port
+        raise RuntimeError("Unable to reserve a unique CDP port")
+
+    def _release_cdp_port(self, port: int) -> None:
+        self._cdp_ports.discard(port)
+
+    @staticmethod
+    async def _fetch_cdp_version(port: int) -> dict[str, Any]:
+        def fetch() -> dict[str, Any]:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version",
+                timeout=1,
+            ) as response:
+                payload = json.load(response)
+            if not isinstance(payload, dict):
+                raise RuntimeError("CDP version response is not an object")
+            return payload
+
+        return await asyncio.to_thread(fetch)
+
+    async def _wait_for_cdp(
+        self,
+        port: int,
+        timeout: float = CDP_READY_TIMEOUT,
+        denial_path: str | None = None,
+    ) -> None:
+        """Wait for and verify Chromium's debugger endpoint on the reserved port.
+
+        If ``denial_path`` is given, the wrapper's denial file is checked each
+        poll: a seat/license denial makes the browser never serve CDP, so bail
+        immediately with the real reason instead of waiting out ``timeout``.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            lic = self._denial_error(denial_path)
+            if lic is not None:
+                raise lic
+            try:
+                version = await self._fetch_cdp_version(port)
+                websocket_url = str(version.get("webSocketDebuggerUrl") or "")
+                if f":{port}/" not in websocket_url:
+                    raise RuntimeError(
+                        f"CDP endpoint returned an unexpected debugger URL: {websocket_url!r}"
+                    )
+                return
+            except CloakBrowserLicenseError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.1)
+        # One last check — the denial may have landed on the final poll.
+        lic = self._denial_error(denial_path)
+        if lic is not None:
+            raise lic
+        raise TimeoutError(f"CDP endpoint on 127.0.0.1:{port} was not ready") from last_error
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:
         """Build extra Chromium args from profile fingerprint settings."""
-        args: list[str] = [
-            "--disable-infobars",
-            "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
-            "--use-angle=swiftshader",  # software GL for VNC (no GPU in container)
-        ]
+        args: list[str] = []
+        if self.runtime.viewer_mode == "vnc":
+            args.append("--use-angle=swiftshader")
 
         seed = profile.get("fingerprint_seed")
         if seed is not None:
             args.append(f"--fingerprint={seed}")
 
-        p = profile.get("platform")
-        if p:
-            # Map our "macos" to binary's "macos"
-            args.append(f"--fingerprint-platform={p}")
+        # Persona is always determined by the runtime, not editable profile data.
+        platform = "macos" if self.runtime.host_os == "macos" else "windows"
+        args.append(f"--fingerprint-platform={platform}")
 
-        vendor = profile.get("gpu_vendor")
-        if vendor:
-            args.append(f"--fingerprint-gpu-vendor={vendor}")
+        # Apple GPU models are selected automatically by the seeded macOS
+        # persona. Windows vendor-family overrides are incoherent on macOS.
+        gpu_family = profile.get("gpu_family", "auto")
+        if self.runtime.host_os != "macos":
+            if gpu_family == "nvidia":
+                args.append("--fingerprint-gpu-vendor=NVIDIA")
+            elif gpu_family == "intel":
+                args.append("--fingerprint-gpu-vendor=Intel")
 
-        renderer = profile.get("gpu_renderer")
-        if renderer:
-            args.append(f"--fingerprint-gpu-renderer={renderer}")
-
-        hw = profile.get("hardware_concurrency")
-        if hw is not None:
-            args.append(f"--fingerprint-hardware-concurrency={hw}")
+        if profile.get("allow_3p_cookies", False):
+            args.append("--fingerprint-allow-3p-cookies")
 
         sw = profile.get("screen_width")
         sh = profile.get("screen_height")

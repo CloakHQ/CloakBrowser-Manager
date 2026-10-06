@@ -51,6 +51,26 @@ export function useProfiles() {
     [],
   );
 
+  // Persist a manual order. Optimistic so the UI updates instantly; the 3s poll
+  // then confirms the server order rather than reverting it. Resync on failure.
+  const reorder = useCallback(
+    async (orderedIds: string[]) => {
+      setProfiles((prev) => {
+        const byId = new Map(prev.map((p) => [p.id, p]));
+        return orderedIds
+          .map((id) => byId.get(id))
+          .filter((p): p is Profile => p !== undefined);
+      });
+      try {
+        await api.reorderProfiles(orderedIds);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to reorder profiles");
+        await refresh();
+      }
+    },
+    [refresh],
+  );
+
   const remove = useCallback(
     async (id: string) => {
       try {
@@ -65,13 +85,12 @@ export function useProfiles() {
 
   const launch = useCallback(
     async (id: string) => {
-      try {
-        const result = await api.launchProfile(id);
-        await refresh();
-        return result;
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to launch profile");
-      }
+      // Don't swallow: a launch denial (out of seats, bad/expired key) carries a
+      // structured reason + upgrade CTA that LaunchButton renders. Re-throw so it
+      // reaches the button's own catch instead of a flat hook-level banner.
+      const result = await api.launchProfile(id);
+      await refresh();
+      return result;
     },
     [refresh],
   );
@@ -88,5 +107,37 @@ export function useProfiles() {
     [refresh],
   );
 
-  return { profiles, loading, error, refresh, create, update, remove, launch, stop };
+  // Wipe browser state + re-roll fingerprint. Stays stopped — the profile keeps
+  // its config (proxy, locale, bookmarks, default search) and takes a fresh
+  // identity; the user launches it when ready.
+  const reset = useCallback(
+    async (id: string) => {
+      try {
+        await api.resetProfile(id);
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to reset profile");
+      }
+    },
+    [refresh],
+  );
+
+  // Clone a profile into a new profile (same settings + fingerprint). With
+  // includeBrowserState the source's cookies, logged-in sessions and history
+  // come along too, so the clone opens already signed in. Returns the clone so
+  // the caller can select it.
+  const duplicate = useCallback(
+    async (id: string, includeBrowserState = false): Promise<Profile | undefined> => {
+      try {
+        const profile = await api.duplicateProfile(id, includeBrowserState);
+        setProfiles((prev) => [profile, ...prev]);
+        return profile;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to duplicate profile");
+      }
+    },
+    [],
+  );
+
+  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, duplicate };
 }

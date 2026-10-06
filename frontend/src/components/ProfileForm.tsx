@@ -1,11 +1,22 @@
-import { Save, Trash2, X } from "lucide-react";
-import { useEffect, useState } from "react";
-import type { Profile, ProfileCreateData } from "../lib/api";
+import { Check, ChevronDown, Copy, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { api, ApiError } from "../lib/api";
+import type {
+  HostOS,
+  Profile,
+  ProfileCreateData,
+  ProxyTestResult,
+  ViewerMode,
+} from "../lib/api";
 
 interface ProfileFormProps {
   profile: Profile | null; // null = create mode
+  hostOs: HostOS | null;
+  viewerMode: ViewerMode | null;
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
+  onReset?: () => Promise<void>;
+  onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -29,51 +40,52 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-const GPU_PRESETS: Record<string, { vendor: string; renderer: string }> = {
-  "NVIDIA RTX 3070": {
-    vendor: "Google Inc. (NVIDIA)",
-    renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 vs_5_0 ps_5_0, D3D11)",
-  },
-  "NVIDIA RTX 4070": {
-    vendor: "Google Inc. (NVIDIA)",
-    renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 (0x00002786) Direct3D11 vs_5_0 ps_5_0, D3D11)",
-  },
-  "AMD RX 6800 XT": {
-    vendor: "Google Inc. (AMD)",
-    renderer: "ANGLE (AMD, AMD Radeon RX 6800 XT (0x000073BF) Direct3D11 vs_5_0 ps_5_0, D3D11)",
-  },
-  "Intel UHD 770": {
-    vendor: "Google Inc. (Intel)",
-    renderer: "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x00004680) Direct3D11 vs_5_0 ps_5_0, D3D11)",
-  },
-  "Apple M3 (macOS)": {
-    vendor: "Google Inc. (Apple)",
-    renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
-  },
-};
-
-export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onDuplicate, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
     name: "",
-    platform: "windows",
     screen_width: 1920,
     screen_height: 1080,
+    gpu_family: "auto",
     humanize: false,
     human_preset: "default",
-    headless: false,
-    geoip: false,
+    geoip: true,
     clipboard_sync: true,
     auto_launch: false,
+    allow_3p_cookies: true,
+    set_google_default: true,
+    capture_preview: true,
+    restore_session: true,
+    extension_paths: [],
     launch_args: [],
     tags: [],
   });
 
+  const [previewError, setPreviewError] = useState(false);
+  const [previewBuster, setPreviewBuster] = useState(0);
+
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [resetDone, setResetDone] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
+  const [duplicateMenuOpen, setDuplicateMenuOpen] = useState(false);
+  const duplicateMenuRef = useRef<HTMLDivElement>(null);
+  const duplicateTriggerRef = useRef<HTMLButtonElement>(null);
+  const [testingProxy, setTestingProxy] = useState(false);
+  const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => () => {
+    clearTimeout(savedTimer.current);
+    clearTimeout(resetTimer.current);
+  }, []);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
+  const [extensionPathInput, setExtensionPathInput] = useState("");
   const [launchArgInput, setLaunchArgInput] = useState("");
 
   useEffect(() => {
@@ -84,29 +96,52 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
         proxy: profile.proxy,
         timezone: profile.timezone,
         locale: profile.locale,
-        platform: profile.platform,
-        user_agent: profile.user_agent,
         screen_width: profile.screen_width,
         screen_height: profile.screen_height,
-        gpu_vendor: profile.gpu_vendor,
-        gpu_renderer: profile.gpu_renderer,
-        hardware_concurrency: profile.hardware_concurrency,
+        gpu_family: profile.gpu_family,
         humanize: profile.humanize,
         human_preset: profile.human_preset,
-        headless: profile.headless,
         geoip: profile.geoip,
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
-        color_scheme: profile.color_scheme,
+        extension_paths: profile.extension_paths ?? [],
+        allow_3p_cookies: profile.allow_3p_cookies,
+        set_google_default: profile.set_google_default,
+        capture_preview: profile.capture_preview,
+        restore_session: profile.restore_session,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
       });
     }
+    // Re-fetch the preview for the newly selected profile (bust the cache).
+    setPreviewError(false);
+    setPreviewBuster(Date.now());
   }, [profile?.id]);
+
+  useEffect(() => {
+    if (hostOs === "macos") {
+      setForm((previous) => ({ ...previous, gpu_family: "auto" }));
+    }
+  }, [hostOs]);
 
   const set = <K extends keyof ProfileCreateData>(key: K, value: ProfileCreateData[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleTestProxy = async () => {
+    if (!form.proxy) return;
+    setProxyTest(null);
+    setTestingProxy(true);
+    try {
+      setProxyTest(await api.testProxy(form.proxy));
+    } catch (err) {
+      const message =
+        err instanceof ApiError ? err.message : "Proxy test failed";
+      setProxyTest({ ok: false, error: message });
+    } finally {
+      setTestingProxy(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -115,6 +150,9 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     setSaving(true);
     try {
       await onSave(form);
+      setSaved(true);
+      clearTimeout(savedTimer.current);
+      savedTimer.current = setTimeout(() => setSaved(false), 1500);
     } finally {
       setSaving(false);
     }
@@ -131,11 +169,60 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     }
   };
 
-  const applyGpuPreset = (name: string) => {
-    const preset = GPU_PRESETS[name];
-    if (preset) {
-      set("gpu_vendor", preset.vendor);
-      set("gpu_renderer", preset.renderer);
+  const handleReset = async () => {
+    if (!onReset) return;
+    if (
+      !confirm(
+        "Reset this profile? Cookies, history and site data will be wiped and a " +
+          "new fingerprint generated. Bookmarks, settings and default search are kept.",
+      )
+    )
+      return;
+    setResetting(true);
+    try {
+      await onReset();
+      setResetDone(true);
+      clearTimeout(resetTimer.current);
+      resetTimer.current = setTimeout(() => setResetDone(false), 1500);
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!duplicateMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (!duplicateMenuRef.current?.contains(e.target as Node)) setDuplicateMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setDuplicateMenuOpen(false);
+      // A focused menu item is about to unmount; hand focus back to the trigger
+      // so keyboard users are not dropped onto the document body.
+      duplicateTriggerRef.current?.focus();
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [duplicateMenuOpen]);
+
+  const handleDuplicate = async (includeBrowserState: boolean) => {
+    setDuplicateMenuOpen(false);
+    if (!onDuplicate) return;
+    const message = includeBrowserState
+      ? "Duplicate this profile with its browser state? A new profile with the " +
+        "same settings, fingerprint, cookies and logged-in sessions is created."
+      : "Duplicate this profile? A new profile with the same settings and " +
+        "fingerprint is created. Browser state (cookies, history) is not copied.";
+    if (!confirm(message)) return;
+    setDuplicating(true);
+    try {
+      await onDuplicate(includeBrowserState);
+    } finally {
+      setDuplicating(false);
     }
   };
 
@@ -159,6 +246,17 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
     set("tags", (form.tags ?? []).filter((t) => t.tag !== tag));
   };
 
+  const addExtensionPath = () => {
+    const path = extensionPathInput.trim();
+    if (!path || (form.extension_paths ?? []).includes(path)) return;
+    set("extension_paths", [...(form.extension_paths ?? []), path]);
+    setExtensionPathInput("");
+  };
+
+  const removeExtensionPath = (index: number) => {
+    set("extension_paths", (form.extension_paths ?? []).filter((_, i) => i !== index));
+  };
+
   const addLaunchArg = () => {
     const arg = launchArgInput.trim();
     if (!arg) return;
@@ -172,12 +270,79 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
   };
 
   return (
-    <form onSubmit={handleSubmit} className="p-6 max-w-2xl mx-auto">
+    <form onSubmit={handleSubmit} className="p-6 max-w-3xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
+          {isEdit && onDuplicate && (
+            <div ref={duplicateMenuRef} className="relative flex items-stretch">
+              <button
+                type="button"
+                onClick={() => handleDuplicate(false)}
+                disabled={duplicating}
+                title="Duplicate settings and fingerprint only"
+                className="btn-secondary flex items-center gap-1.5 rounded-r-none"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
+              </button>
+              <button
+                ref={duplicateTriggerRef}
+                type="button"
+                onClick={() => setDuplicateMenuOpen((open) => !open)}
+                disabled={duplicating}
+                aria-haspopup="menu"
+                aria-expanded={duplicateMenuOpen}
+                aria-label="Duplicate options"
+                className="btn-secondary flex items-center rounded-l-none border-l border-border px-2"
+              >
+                <ChevronDown className="h-3.5 w-3.5" />
+              </button>
+              {duplicateMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute left-0 top-full z-20 mt-1 w-64 rounded-md border border-border bg-surface-2 py-1 shadow-lg"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => handleDuplicate(false)}
+                    className="w-full px-3 py-2 text-left hover:bg-surface-3"
+                  >
+                    <div className="text-sm text-gray-200">Settings and fingerprint only</div>
+                    <div className="text-xs text-gray-500">Starts with empty browser state</div>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={profile?.status !== "stopped"}
+                    onClick={() => handleDuplicate(true)}
+                    className="w-full px-3 py-2 text-left hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                  >
+                    <div className="text-sm text-gray-200">With browser state</div>
+                    <div className="text-xs text-gray-500">
+                      {profile?.status === "stopped"
+                        ? "Cookies, logged-in sessions and history"
+                        : "Stop the profile first"}
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          {isEdit && onReset && (
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={resetting || resetDone}
+              className="btn-secondary flex items-center gap-1.5"
+            >
+              {resetDone ? <Check className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" />}
+              <span>{resetDone ? "Reset done" : resetting ? "Resetting..." : "Reset"}</span>
+            </button>
+          )}
           {isEdit && onDelete && (
             <button
               type="button"
@@ -194,14 +359,27 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           <button type="button" onClick={onCancel} className="btn-secondary">
             Cancel
           </button>
-          <button type="submit" disabled={saving} className="btn-primary flex items-center gap-1.5">
-            <Save className="h-3.5 w-3.5" />
-            <span>{saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
+          <button type="submit" disabled={saving || saved} className="btn-primary flex items-center gap-1.5">
+            {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
+            <span>{saved ? "Saved" : saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
           </button>
         </div>
       </div>
 
       <div className="space-y-5">
+        {/* Last preview — the last frame captured before the browser stopped */}
+        {isEdit && !previewError && (
+          <section>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Last preview</h3>
+            <img
+              src={`/api/profiles/${profile!.id}/screenshot?t=${previewBuster}`}
+              onError={() => setPreviewError(true)}
+              alt="Last browser preview"
+              className="w-full rounded-md border border-border bg-surface-1 object-contain max-h-72"
+            />
+          </section>
+        )}
+
         {/* Basic */}
         <section>
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Basic</h3>
@@ -216,19 +394,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                 required
               />
             </div>
-            <div>
-              <label className="label">Platform</label>
-              <select
-                className="input"
-                value={form.platform}
-                onChange={(e) => set("platform", e.target.value)}
-              >
-                <option value="windows">Windows</option>
-                <option value="macos">macOS</option>
-                <option value="linux">Linux</option>
-              </select>
-            </div>
-            <div>
+            <div className="col-span-2">
               <label className="label">Fingerprint Seed</label>
               <div className="flex gap-2">
                 <input
@@ -280,12 +446,39 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           <div className="space-y-3">
             <div>
               <label className="label">Proxy</label>
-              <input
-                className="input"
-                value={form.proxy ?? ""}
-                onChange={(e) => set("proxy", e.target.value || null)}
-                placeholder="http://user:pass@host:port"
-              />
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1"
+                  value={form.proxy ?? ""}
+                  onChange={(e) => {
+                    set("proxy", e.target.value || null);
+                    setProxyTest(null);
+                  }}
+                  placeholder="http://user:pass@host:port"
+                />
+                <button
+                  type="button"
+                  className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                  onClick={handleTestProxy}
+                  disabled={!form.proxy || testingProxy}
+                >
+                  {testingProxy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Test
+                </button>
+              </div>
+              {proxyTest && !testingProxy && (
+                <p
+                  className={`text-xs mt-1 ${proxyTest.ok ? "text-emerald-400" : "text-red-400"}`}
+                >
+                  {proxyTest.ok
+                    ? `✓ ${proxyTest.ip}` +
+                      (proxyTest.city || proxyTest.country
+                        ? ` · ${[proxyTest.city, proxyTest.country].filter(Boolean).join(", ")}`
+                        : "") +
+                      (proxyTest.latency_ms != null ? ` · ${proxyTest.latency_ms}ms` : "")
+                    : proxyTest.error || "Proxy test failed"}
+                </p>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -314,7 +507,7 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                 onChange={(e) => set("geoip", e.target.checked)}
                 className="rounded border-border bg-surface-2"
               />
-              Auto-detect timezone/locale from proxy IP (GeoIP)
+              Auto-detect timezone/locale from the proxy exit, or host public IP without a proxy (GeoIP)
             </label>
           </div>
         </section>
@@ -365,47 +558,31 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               </div>
             )}
             <div>
-              <label className="label">Hardware Concurrency</label>
-              <input
-                className="input"
-                type="number"
-                value={form.hardware_concurrency ?? ""}
-                onChange={(e) => set("hardware_concurrency", e.target.value ? Number(e.target.value) : null)}
-                placeholder="Auto (from seed)"
-              />
-            </div>
-            <div>
-              <label className="label">GPU Preset</label>
-              <select
-                className="input"
-                value=""
-                onChange={(e) => {
-                  if (e.target.value) applyGpuPreset(e.target.value);
-                }}
-              >
-                <option value="">Select preset...</option>
-                {Object.keys(GPU_PRESETS).map((name) => (
-                  <option key={name} value={name}>{name}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="label">GPU Vendor</label>
-              <input
-                className="input"
-                value={form.gpu_vendor ?? ""}
-                onChange={(e) => set("gpu_vendor", e.target.value || null)}
-                placeholder="Auto (from seed)"
-              />
-            </div>
-            <div>
-              <label className="label">GPU Renderer</label>
-              <input
-                className="input"
-                value={form.gpu_renderer ?? ""}
-                onChange={(e) => set("gpu_renderer", e.target.value || null)}
-                placeholder="Auto (from seed)"
-              />
+              <label className="label">GPU Family</label>
+              {hostOs === "macos" ? (
+                <select className="input" value="auto" disabled>
+                  <option value="auto">Apple Silicon (automatic)</option>
+                </select>
+              ) : hostOs === null ? (
+                <select className="input" value="auto" disabled>
+                  <option value="auto">Automatic (detecting runtime…)</option>
+                </select>
+              ) : (
+                <select
+                  className="input"
+                  value={form.gpu_family ?? "auto"}
+                  onChange={(e) => set("gpu_family", e.target.value as "auto" | "nvidia" | "intel")}
+                >
+                  <option value="auto">Auto (from seed)</option>
+                  <option value="nvidia">NVIDIA</option>
+                  <option value="intel">Intel</option>
+                </select>
+              )}
+              <p className="text-xs text-gray-500 mt-1">
+                {hostOs === "macos"
+                  ? "The seed selects a coherent Apple Silicon model and matching hardware profile."
+                  : "The seed selects a coherent GPU model, CPU, memory, and screen profile within the family."}
+              </p>
             </div>
           </div>
         </section>
@@ -436,15 +613,17 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                 </select>
               </div>
             )}
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={form.clipboard_sync ?? true}
-                onChange={(e) => set("clipboard_sync", e.target.checked)}
-                className="rounded border-border bg-surface-2"
-              />
-              Enable clipboard sync by default in VNC viewer
-            </label>
+            {viewerMode === "vnc" && (
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.clipboard_sync ?? true}
+                  onChange={(e) => set("clipboard_sync", e.target.checked)}
+                  className="rounded border-border bg-surface-2"
+                />
+                Enable clipboard sync by default in VNC viewer
+              </label>
+            )}
             <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
               <input
                 type="checkbox"
@@ -452,31 +631,65 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
                 onChange={(e) => set("auto_launch", e.target.checked)}
                 className="rounded border-border bg-surface-2"
               />
-              Launch automatically when container starts
+              Launch automatically when Manager starts
             </label>
-            <div>
-              <label className="label">Color Scheme</label>
-              <select
-                className="input"
-                value={form.color_scheme ?? ""}
-                onChange={(e) => set("color_scheme", e.target.value || null)}
-              >
-                <option value="">System default</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-                <option value="no-preference">No preference</option>
-              </select>
-            </div>
-            <div>
-              <label className="label">User Agent</label>
+            <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
               <input
-                className="input"
-                value={form.user_agent ?? ""}
-                onChange={(e) => set("user_agent", e.target.value || null)}
-                placeholder="Auto (from binary)"
+                type="checkbox"
+                checked={form.capture_preview ?? true}
+                onChange={(e) => set("capture_preview", e.target.checked)}
+                className="rounded border-border bg-surface-2 mt-0.5"
               />
-            </div>
+              <span>
+                Save a preview screenshot of the browser
+                <span className="block text-xs text-gray-500">
+                  Captures the page periodically while running, shown here after the profile stops.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.restore_session ?? true}
+                onChange={(e) => set("restore_session", e.target.checked)}
+                className="rounded border-border bg-surface-2 mt-0.5"
+              />
+              <span>
+                Restore previous tabs on launch
+                <span className="block text-xs text-gray-500">
+                  Reopens the tabs that were open when this profile was last stopped.
+                </span>
+              </span>
+            </label>
           </div>
+        </section>
+
+        {/* Compatibility */}
+        <section>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Compatibility</h3>
+          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={form.allow_3p_cookies ?? false}
+              onChange={(e) => set("allow_3p_cookies", e.target.checked)}
+              className="rounded border-border bg-surface-2"
+            />
+            Allow third-party cookies for login, SSO, and challenge flows
+          </label>
+          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+            <input
+              type="checkbox"
+              checked={form.set_google_default ?? true}
+              onChange={(e) => set("set_google_default", e.target.checked)}
+              className="rounded border-border bg-surface-2 mt-0.5"
+            />
+            <span>
+              Set Google as the default search engine
+              <span className="block text-xs text-gray-500">
+                Adds a few seconds to the profile's first launch (one-time setup).
+              </span>
+            </span>
+          </label>
         </section>
 
         {/* Tags */}
@@ -531,23 +744,51 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
           </div>
         </section>
 
-        {/* Launch Args */}
+        {/* Extensions */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Launch Args</h3>
-          <p className="text-xs text-gray-500 mb-2">Custom Chromium flags passed at launch (e.g. --load-extension, --disable-features)</p>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
+          <p className="text-xs text-gray-500 mb-2">Add one unpacked Chrome extension directory per path.</p>
+          {(form.extension_paths ?? []).length > 0 && (
+            <div className="space-y-1.5 mb-3">
+              {(form.extension_paths ?? []).map((path, index) => (
+                <div key={`${path}-${index}`} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
+                  <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
+                  <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-2">
+            <input
+              className="input flex-1 font-mono"
+              value={extensionPathInput}
+              onChange={(e) => setExtensionPathInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addExtensionPath(); } }}
+              placeholder="/data/extensions/ublock"
+            />
+            <button type="button" onClick={addExtensionPath} className="btn-secondary text-xs">Add</button>
+          </div>
+        </section>
+
+        {/* Advanced */}
+        <details className="rounded-md border border-border bg-surface-1 p-3">
+          <summary className="cursor-pointer text-xs font-semibold text-gray-400 uppercase tracking-wider">
+            Advanced launch arguments
+          </summary>
+          <p className="text-xs text-gray-500 my-3">
+            Unrestricted Chromium flags. Advanced arguments can override Manager-controlled behavior.
+          </p>
           {(form.launch_args ?? []).length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-3">
-              {(form.launch_args ?? []).map((arg, idx) => (
+              {(form.launch_args ?? []).map((arg, index) => (
                 <span
-                  key={idx}
+                  key={`${arg}-${index}`}
                   className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-gray-300 font-mono"
                 >
                   {arg}
-                  <button
-                    type="button"
-                    onClick={() => removeLaunchArg(idx)}
-                    className="hover:opacity-70"
-                  >
+                  <button type="button" onClick={() => removeLaunchArg(index)} className="hover:opacity-70">
                     <X className="h-3 w-3" />
                   </button>
                 </span>
@@ -560,13 +801,11 @@ export function ProfileForm({ profile, onSave, onDelete, onCancel }: ProfileForm
               value={launchArgInput}
               onChange={(e) => setLaunchArgInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addLaunchArg(); } }}
-              placeholder="--load-extension=/data/extensions/ublock"
+              placeholder="--disable-features=Foo"
             />
-            <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">
-              Add
-            </button>
+            <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">Add</button>
           </div>
-        </section>
+        </details>
 
         {/* Notes */}
         <section>
