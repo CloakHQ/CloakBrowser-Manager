@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import random
 import sqlite3
 import uuid
@@ -263,6 +264,53 @@ def reorder_profiles(ordered_ids: list[str]) -> None:
             [(index, profile_id) for index, profile_id in enumerate(ordered_ids)],
         )
         conn.commit()
+
+
+def sync_native_profiles(path: Path | None = None) -> int:
+    """Create or update native profiles from a local, non-secret registry."""
+    path = path or Path(os.getenv(
+        "NATIVE_PROFILE_REGISTRY",
+        str(DATA_DIR / "native-profiles.json"),
+    ))
+    if not path.exists():
+        return 0
+
+    entries = json.loads(path.read_text())
+    existing = list_profiles()
+    by_native_name = {
+        arg.partition("=")[2]: profile
+        for profile in existing
+        for arg in profile.get("launch_args") or []
+        if arg.startswith("--native-profile=")
+    }
+
+    # Profiles renamed or removed from the registry leave the list too.
+    wanted = {entry["native_profile"] for entry in entries}
+    for native_name, profile in by_native_name.items():
+        if native_name not in wanted:
+            delete_profile(profile["id"])
+
+    for entry in entries:
+        native_name = entry["native_profile"]
+        fields = {
+            "launch_args": [
+                f"--native-profile={native_name}",
+                *[f"--start-url={url}" for url in entry.get("start_urls", [])],
+            ],
+            "notes": entry.get("notes"),
+            "tags": entry.get("tags", []),
+            "clipboard_sync": False,
+        }
+        # Browser settings the profile record owns. Fields left out keep their Manager value.
+        for key in ("timezone", "locale", "fingerprint_seed", "humanize", "human_preset"):
+            if key in entry:
+                fields[key] = entry[key]
+        current = by_native_name.get(native_name)
+        if current:
+            update_profile(current["id"], name=entry["name"], **fields)
+        else:
+            create_profile(name=entry["name"], **fields)
+    return len(entries)
 
 
 def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:

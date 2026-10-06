@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,9 @@ from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
+
+BITWARDEN_EXTENSION_ID = "ecblnbbmmimjhikjdpekghmjhmnboiff"
+BITWARDEN_SEED_PROFILE = "bitwarden-auth-seed"
 
 
 UPGRADE_URL = "https://cloakbrowser.dev/#pricing"
@@ -91,6 +95,39 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+def _repair_native_extension_registration(profile_name: str) -> bool:
+    """Restore Bitwarden's enabled registration from the authenticated seed profile."""
+    seed_name = os.getenv("BITWARDEN_SEED_PROFILE", BITWARDEN_SEED_PROFILE)
+    if profile_name == seed_name:
+        return False
+
+    profiles_root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", Path.home() / ".cloakbrowser/profiles"))
+    extension_id = os.getenv("BITWARDEN_EXTENSION_ID", BITWARDEN_EXTENSION_ID)
+    seed_preferences = profiles_root / seed_name / "Default" / "Secure Preferences"
+    target_preferences = profiles_root / profile_name / "Default" / "Secure Preferences"
+    if not seed_preferences.exists() or not target_preferences.exists():
+        return False
+
+    seed = json.loads(seed_preferences.read_text())
+    target = json.loads(target_preferences.read_text())
+    registration = seed.get("extensions", {}).get("settings", {}).get(extension_id)
+    if not registration:
+        return False
+
+    target.setdefault("extensions", {}).setdefault("settings", {})[extension_id] = registration
+    temporary = target_preferences.with_suffix(".tmp")
+    temporary.write_text(json.dumps(target, separators=(",", ":")))
+    temporary.chmod(target_preferences.stat().st_mode & 0o777)
+    temporary.replace(target_preferences)
+    return True
+
+
+def _native_profile_running(processes: str, profile_name: str) -> bool:
+    profile_path = Path.home() / ".cloakbrowser" / "profiles" / profile_name
+    needle = f"--user-data-dir={profile_path}"
+    return any(needle in line for line in processes.splitlines())
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
@@ -309,10 +346,12 @@ class ProfileBusyError(RuntimeError):
 @dataclass
 class RunningProfile:
     profile_id: str
-    context: Any  # Playwright BrowserContext
+    context: Any | None  # Playwright BrowserContext; None for registry-launched profiles
     cdp_port: int
     display: int | None = None
     ws_port: int | None = None
+    process: asyncio.subprocess.Process | None = None
+    native: bool = False
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
     capture_preview: bool = True
@@ -447,6 +486,17 @@ class BrowserManager:
             # Fresh attempt — drop any stale denial from a previous launch so the
             # status poll doesn't keep showing an old "out of seats" message.
             self._last_errors.pop(profile_id, None)
+
+        native_profile = self._native_profile_name(profile)
+        if native_profile:
+            try:
+                return await self._launch_native(
+                    profile_id, native_profile, self._start_urls(profile)
+                )
+            except BaseException:
+                async with self._lock:
+                    self._launching.discard(profile_id)
+                raise
 
         display: int | None = None
         ws_port: int | None = None
@@ -667,6 +717,145 @@ class BrowserManager:
                 self._release_stopping(profile_id)
             raise
 
+    @staticmethod
+    def _native_profile_name(profile: dict[str, Any]) -> str | None:
+        for arg in profile.get("launch_args") or []:
+            if arg.startswith("--native-profile="):
+                return arg.partition("=")[2] or None
+        return None
+
+    @staticmethod
+    def _start_urls(profile: dict[str, Any]) -> list[str]:
+        return [
+            arg.partition("=")[2]
+            for arg in profile.get("launch_args") or []
+            if arg.startswith("--start-url=") and arg.partition("=")[2]
+        ]
+
+    @staticmethod
+    def _native_cdp_port(profile_name: str) -> int:
+        """The profile's own port, saved in its cloak.json record; the hash only as a fallback."""
+        root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", Path.home() / ".cloakbrowser/profiles"))
+        # profiles/<group>/<name> (group = first word of the name), or the older flat layout
+        record = root / profile_name / "cloak.json"
+        if not record.exists():
+            record = root / profile_name.split("-")[0] / profile_name / "cloak.json"
+        try:
+            port = json.loads(record.read_text()).get("cdpPort")
+            if isinstance(port, int):
+                return port
+        except (OSError, ValueError):
+            pass
+        digest = hashlib.sha256(profile_name.encode()).digest()
+        return 9400 + (int.from_bytes(digest[:2], "big") % 400)
+
+    async def _launch_native(
+        self,
+        profile_id: str,
+        profile_name: str,
+        start_urls: list[str],
+    ) -> RunningProfile:
+        await self._wait_for_native_profile_exit(profile_name)
+        launcher = os.getenv(
+            "NATIVE_CLOAK_LAUNCHER",
+            str(Path.home() / ".local/bin/cloak-bitwarden-profile"),
+        )
+        cdp_port = self._native_cdp_port(profile_name)
+        repaired_extension = _repair_native_extension_registration(profile_name)
+        if repaired_extension:
+            logger.info("Restored Bitwarden extension registration for %s", profile_name)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                launcher,
+                "open",
+                profile_name,
+                *start_urls,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await self._wait_for_port(cdp_port, process)
+            running = RunningProfile(
+                profile_id=profile_id,
+                context=None,
+                cdp_port=cdp_port,
+                process=process,
+                native=True,
+            )
+            async with self._lock:
+                self.running[profile_id] = running
+                self._launching.discard(profile_id)
+            asyncio.create_task(self._watch_native(profile_id, process))
+            logger.info("Launched native profile %s on CDP port %d", profile_name, cdp_port)
+            return running
+        except BaseException:
+            async with self._lock:
+                self._launching.discard(profile_id)
+            raise
+
+    @staticmethod
+    async def _wait_for_native_profile_exit(
+        profile_name: str,
+        timeout: float = 10,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            process = await asyncio.create_subprocess_exec(
+                "/bin/ps",
+                "ax",
+                "-o",
+                "command=",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            if not _native_profile_running(stdout.decode(errors="replace"), profile_name):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"Native profile processes did not exit: {profile_name}"
+                )
+            await asyncio.sleep(0.25)
+
+    @staticmethod
+    async def _wait_for_port(
+        port: int,
+        process: asyncio.subprocess.Process,
+        timeout: float = 45,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if process.returncode is not None:
+                error = await process.stderr.read() if process.stderr else b""
+                raise RuntimeError(error.decode().strip() or "Native launcher exited")
+            try:
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                await writer.wait_closed()
+                return
+            except OSError:
+                await asyncio.sleep(0.25)
+        process.terminate()
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            _, stderr = await process.communicate()
+        detail = stderr.decode(errors="replace").strip()
+        suffix = f": {detail[-2000:]}" if detail else ""
+        raise TimeoutError(f"Native profile CDP port {port} did not open{suffix}")
+
+    async def _watch_native(
+        self,
+        profile_id: str,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        await process.wait()
+        async with self._lock:
+            current = self.running.get(profile_id)
+            if current and current.process is process:
+                self.running.pop(profile_id, None)
+
     async def _ensure_search_engine(
         self, profile_id: str, user_data_dir: Path
     ) -> None:
@@ -840,7 +1029,7 @@ class BrowserManager:
     ) -> None:
         if running.screenshot_task is not None:
             running.screenshot_task.cancel()
-        if close_context:
+        if close_context and running.context is not None:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:
             await self.vnc.stop_vnc(running.display)
@@ -915,9 +1104,17 @@ class BrowserManager:
 
         logger.info("Stopping profile %s", profile_id)
         try:
+            if running.native and running.process:
+                running.process.terminate()
+                try:
+                    await asyncio.wait_for(running.process.wait(), timeout=10)
+                except TimeoutError:
+                    running.process.kill()
+                    await running.process.wait()
+                return
             # Final preview capture while the context is still alive (the on-close
             # path can't screenshot — the browser is already gone by then).
-            if running.capture_preview:
+            if running.capture_preview and running.context is not None:
                 try:
                     await self._capture_screenshot(running)
                 except Exception as exc:
@@ -988,11 +1185,14 @@ class BrowserManager:
             "viewer_mode": self.runtime.viewer_mode,
             "vnc_ws_port": running.ws_port if running else None,
             "display": (
-                f":{running.display}"
-                if running and running.display is not None
+                "native-macos" if running and running.native is True
+                else f":{running.display}" if running and running.display is not None
                 else None
             ),
             "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+            "direct_cdp_url": (
+                f"http://127.0.0.1:{running.cdp_port}" if running else None
+            ),
             # Set when the last launch closed on a license denial (post-handshake
             # out-of-seats / bad key). Only meaningful while stopped; cleared on
             # the next launch. {message, reason, upgrade_url?} or None.

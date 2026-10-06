@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from backend.browser_manager import (
+    BITWARDEN_EXTENSION_ID,
     _init_profile_defaults,
     _normalize_proxy,
+    _native_profile_running,
+    _repair_native_extension_registration,
     _validate_proxy,
     BrowserManager,
     ProfileBusyError,
@@ -199,6 +202,34 @@ def test_launch_args_none_no_effect():
     base_count = len(args)
     args += profile.get("launch_args") or []
     assert len(args) == base_count
+
+
+def test_repair_native_extension_registration_clears_disabled_state(tmp_path, monkeypatch):
+    profiles = tmp_path / "profiles"
+    seed = profiles / "bitwarden-auth-seed" / "Default"
+    target = profiles / "outlook-out-003" / "Default"
+    seed.mkdir(parents=True)
+    target.mkdir(parents=True)
+    extension_id = BITWARDEN_EXTENSION_ID
+    seed_registration = {"disable_reasons": [], "location": 8, "path": "/extensions/bitwarden"}
+    (seed / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {extension_id: seed_registration}}}))
+    (target / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {extension_id: {"disable_reasons": [16777216]}}}}))
+    monkeypatch.setenv("CLOAK_NATIVE_PROFILES_ROOT", str(profiles))
+
+    assert _repair_native_extension_registration("outlook-out-003") is True
+
+    repaired = json.loads((target / "Secure Preferences").read_text())
+    assert repaired["extensions"]["settings"][extension_id] == seed_registration
+
+
+def test_native_profile_running_matches_only_exact_profile_path(monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/Users/test")))
+    processes = "\n".join([
+        "Chromium --user-data-dir=/Users/test/.cloakbrowser/profiles/linkedin-001",
+        "Chromium --user-data-dir=/Users/test/.cloakbrowser/profiles/linkedin-001-old",
+    ])
+    assert _native_profile_running(processes, "linkedin-001") is True
+    assert _native_profile_running(processes, "linkedin-002") is False
 
 
 # ── runtime-specific launch behavior ─────────────────────────────────────────
@@ -529,6 +560,30 @@ async def test_wait_for_cdp_rejects_wrong_debugger_port(monkeypatch):
     monkeypatch.setattr(manager, "_fetch_cdp_version", fetch)
     with pytest.raises(TimeoutError, match="was not ready"):
         await manager._wait_for_cdp(53123, timeout=0.01)
+
+
+def test_native_profile_name():
+    profile = {"launch_args": ["--native-profile=google-001"]}
+    assert _mgr._native_profile_name(profile) == "google-001"
+
+
+def test_native_profile_name_missing():
+    assert _mgr._native_profile_name({"launch_args": []}) is None
+
+
+def test_start_urls():
+    profile = {
+        "launch_args": [
+            "--native-profile=google-002",
+            "--start-url=https://accounts.google.com/",
+        ]
+    }
+    assert _mgr._start_urls(profile) == ["https://accounts.google.com/"]
+
+
+def test_native_cdp_ports_match_launcher():
+    assert _mgr._native_cdp_port("google-001") == 9558
+    assert _mgr._native_cdp_port("google-002") == 9684
 
 
 # ── _init_profile_defaults ───────────────────────────────────────────────────

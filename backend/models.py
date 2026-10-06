@@ -186,6 +186,9 @@ class ProfileStatusResponse(BaseModel):
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None
+    direct_cdp_url: str | None = None
+    # Same payload as ProfileResponse.last_error; present on the status poll too.
+    last_error: dict[str, str] | None = None
 
 
 class ClipboardRequest(BaseModel):

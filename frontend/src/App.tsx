@@ -5,6 +5,7 @@ import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemSt
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
+import { NativeProfileViewer } from "./components/NativeProfileViewer";
 import { NativeWindowStatus } from "./components/NativeWindowStatus";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
@@ -410,7 +411,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           )}
 
           {view === "view" && selected && selected.status === "running" && (
-            selected.viewer_mode === "vnc" ? (
+            selected.launch_args.some((arg) => arg.startsWith("--native-profile=")) ? (
+              <NativeProfileViewer profile={selected} />
+            ) : selected.viewer_mode === "vnc" ? (
               <ProfileViewer
                 key={selected.id}
                 profileId={selected.id}

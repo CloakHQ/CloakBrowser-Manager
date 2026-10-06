@@ -88,6 +88,22 @@ def test_get_profile_not_found(app_client: TestClient):
     assert resp.status_code == 404
 
 
+def test_running_profile_status_exposes_loopback_direct_cdp(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "CDP"})
+    pid = create.json()["id"]
+    running = MagicMock(spec=RunningProfile)
+    running.display = None
+    running.ws_port = None
+    running.cdp_port = 9501
+    running.native = True
+    main.browser_mgr.running[pid] = running
+
+    response = app_client.get(f"/api/profiles/{pid}/status")
+
+    assert response.status_code == 200
+    assert response.json()["direct_cdp_url"] == "http://127.0.0.1:9501"
+
+
 def test_reorder_profiles(app_client: TestClient):
     a = app_client.post("/api/profiles", json={"name": "A"}).json()["id"]
     b = app_client.post("/api/profiles", json={"name": "B"}).json()["id"]

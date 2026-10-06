@@ -488,6 +488,9 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    synced = db.sync_native_profiles()
+    if synced:
+        logger.info("Synced %d native profiles", synced)
     await browser_mgr.cleanup_stale()
     # Resolve tier + pre-download the (Pro) binary before serving launches, so the
     # download never blocks a launch or auto-launch's 60s timeout.
@@ -588,6 +591,12 @@ async def create_profile(req: ProfileCreate):
 async def reorder_profiles(req: ReorderRequest):
     db.reorder_profiles(req.ordered_ids)
     return {"ok": True}
+
+
+@app.post("/api/native/sync")
+async def sync_native():
+    """Reload native profiles from the registry (built by `cloak registry`). No restart needed."""
+    return {"synced": db.sync_native_profiles()}
 
 
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -846,7 +855,11 @@ async def launch_profile(profile_id: str):
         runtime_mode=browser_mgr.runtime.runtime_mode,
         viewer_mode=browser_mgr.runtime.viewer_mode,
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}" if running.display is not None else None,
+        display=(
+            "native-macos" if running.native
+            else f":{running.display}" if running.display is not None
+            else None
+        ),
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
