@@ -286,7 +286,7 @@ async def test_launch_rejects_user_debugging_flags(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
+async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path, tmp_db):
     from backend import browser_manager as module
 
     context = MagicMock()
@@ -300,6 +300,12 @@ async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
 
     running = await manager.launch(_launch_profile(tmp_path))
+    background_tasks = [
+        task for task in (running.download_task, running.screenshot_task) if task is not None
+    ]
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
 
     assert running.display == 100
     assert running.ws_port == 6100
