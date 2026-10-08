@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
+import mimetypes
 import os
 import signal
 import struct
@@ -19,13 +21,14 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import starlette.requests
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .env_file import load_env_file
@@ -34,6 +37,7 @@ from .env_file import load_env_file
 # (database.resolve_runtime, AUTH_TOKEN, the license config below).
 load_env_file()
 
+from . import artifacts
 from . import database as db
 from cloakbrowser.license import CloakBrowserLicenseError
 
@@ -46,6 +50,7 @@ from .browser_manager import (
     test_proxy,
 )
 from .models import (
+    ArtifactResponse,
     ClipboardRequest,
     LaunchResponse,
     LoginRequest,
@@ -488,6 +493,15 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    # Repair pass. A crash leaves bytes with no row, and the file-chooser view out of step
+    # with the database. The bookmarks file is rebuilt once at the end rather than once per
+    # profile, since each rebuild reads the whole profile list.
+    reclaimed = artifacts.reclaim_all()
+    if reclaimed:
+        logger.info("Reclaimed %d unpublished artifact file(s) left by an earlier run", reclaimed)
+    for profile_id in db.profile_ids_with_artifacts():
+        artifacts.sync_picker_view(profile_id, refresh_bookmarks=False)
+    artifacts.refresh_picker_bookmarks()
     await browser_mgr.cleanup_stale()
     # Resolve tier + pre-download the (Pro) binary before serving launches, so the
     # download never blocks a launch or auto-launch's 60s timeout.
@@ -608,6 +622,9 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
+    if "name" in data:
+        # The chooser sidebar labels each entry with the profile name.
+        artifacts.refresh_picker_bookmarks()
     return _profile_response(profile)
 
 
@@ -630,6 +647,8 @@ async def delete_profile(profile_id: str):
             # Then clean up disk
             if user_data_dir.exists():
                 shutil.rmtree(user_data_dir, ignore_errors=True)
+            artifacts.remove_profile_artifacts(profile_id)
+            artifacts.refresh_picker_bookmarks()
     except ProfileBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -808,6 +827,162 @@ async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None
         shutil.rmtree(dst_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail="Failed to duplicate profile")
     return _profile_response(clone)
+
+
+# ── Profile files ────────────────────────────────────────────────────────────
+
+
+def _artifact_response(row: dict) -> ArtifactResponse:
+    return ArtifactResponse(
+        **row,
+        container_path=str(artifacts.artifact_path(row["profile_id"], row["id"], row["name"])),
+    )
+
+
+def _require_profile(profile_id: str) -> dict:
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+
+@app.get("/api/profiles/{profile_id}/files", response_model=list[ArtifactResponse])
+async def list_profile_files(profile_id: str):
+    """Files attached to a profile — uploaded in, or downloaded by its browser."""
+    _require_profile(profile_id)
+    return [_artifact_response(row) for row in db.list_artifacts(profile_id)]
+
+
+def _content_length(request: Request) -> int | None:
+    try:
+        return int(request.headers["content-length"])
+    except (KeyError, ValueError):
+        return None
+
+
+# Body types a client sends by default rather than because they are true of the file:
+# curl's --data-binary is form-urlencoded, browsers fall back to octet-stream.
+_GENERIC_BODY_TYPES = {"application/octet-stream", "application/x-www-form-urlencoded"}
+
+
+def _upload_content_type(request: Request, name: str) -> str | None:
+    declared = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if declared and declared not in _GENERIC_BODY_TYPES:
+        return declared
+    return mimetypes.guess_type(name)[0] or declared or None
+
+
+@app.post("/api/profiles/{profile_id}/files", response_model=ArtifactResponse, status_code=201)
+async def upload_profile_file(profile_id: str, request: Request):
+    """Store the request body as a file of the profile; returns its id and in-container path.
+
+    The body is the file itself, streamed straight into the profile's store: one copy on
+    disk, nothing buffered ahead of the size check. ``X-File-Name`` carries the name,
+    URL-encoded. The path returned is what a CDP call (``DOM.setFileInputFiles``,
+    ``Input.dispatchDragEvent``) hands to the page; uploading does not by itself select the
+    file in any input.
+    """
+    _require_profile(profile_id)
+    encoded_name = request.headers.get("x-file-name")
+    if encoded_name is None:
+        raise HTTPException(
+            status_code=400, detail="X-File-Name header (the URL-encoded file name) is required"
+        )
+    # Starlette decodes header bytes as latin-1; undoing that first accepts both the
+    # frontend's percent-encoded name and a raw UTF-8 one typed into curl.
+    name = artifacts.safe_filename(
+        unquote_to_bytes(encoded_name.encode("latin-1")).decode("utf-8", "replace")
+    )
+    stop_sending = {"Connection": "close"}  # a refusal before the body is read must end it
+    declared = _content_length(request)
+    if declared is not None and declared > artifacts.MAX_ARTIFACT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"upload exceeds {artifacts.MAX_ARTIFACT_BYTES} bytes",
+            headers=stop_sending,
+        )
+    artifact_id = db.new_artifact_id()
+    try:
+        # What the client declared is refused up front; what it actually sends is re-checked.
+        artifacts.check_quota(profile_id, declared or 0)
+    except artifacts.ArtifactQuotaExceeded as exc:
+        raise HTTPException(status_code=507, detail=str(exc), headers=stop_sending) from exc
+    try:
+        size = await artifacts.save_stream(profile_id, artifact_id, name, request.stream())
+    except artifacts.ArtifactTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc), headers=stop_sending) from exc
+    except ClientDisconnect as exc:
+        raise HTTPException(status_code=400, detail="client disconnected during upload") from exc
+    except OSError as exc:
+        logger.exception("Failed to store upload for profile %s", profile_id)
+        raise HTTPException(status_code=500, detail=f"Failed to store upload: {exc}") from exc
+
+    # Re-check against the real received size; an over-quota upload is discarded, not published.
+    try:
+        artifacts.check_quota(profile_id, size)
+    except artifacts.ArtifactQuotaExceeded as exc:
+        artifacts.delete_file(profile_id, artifact_id)
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+
+    try:
+        row = db.create_artifact(
+            artifact_id, profile_id, name, size, kind="upload",
+            content_type=_upload_content_type(request, name),
+            picker_name=artifacts.reserve_picker_name(profile_id, name),
+        )
+    except Exception as exc:
+        # The bytes are on disk but nothing references them, so they could never be listed
+        # or deleted and would not count against the profile's quota.
+        artifacts.delete_file(profile_id, artifact_id)
+        logger.exception("Failed to record upload for profile %s", profile_id)
+        raise HTTPException(status_code=500, detail=f"Failed to record upload: {exc}") from exc
+    artifacts.sync_picker_view(profile_id)
+    return _artifact_response(row)
+
+
+@app.get("/api/profiles/{profile_id}/files/{artifact_id}")
+async def download_profile_file(profile_id: str, artifact_id: str):
+    """Serve an artifact's bytes.
+
+    Always an attachment of an opaque type: these files come from merchant portals, and
+    rendering one inline on the Manager's own origin would be a needless script-execution path.
+    """
+    _require_profile(profile_id)
+    row = db.get_artifact(profile_id, artifact_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if row["state"] == "pending":
+        raise HTTPException(status_code=409, detail="Download is still in progress")
+    path = artifacts.artifact_path(profile_id, artifact_id, row["name"])
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact bytes are missing")
+    return FileResponse(
+        path,
+        filename=row["name"],
+        media_type="application/octet-stream",
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/profiles/{profile_id}/files/{artifact_id}")
+async def delete_profile_file(profile_id: str, artifact_id: str):
+    """Remove an artifact. Row first, then bytes — same order as profile deletion, so a
+    failure leaves an unreferenced file (reclaimed with the profile) rather than a dead row."""
+    _require_profile(profile_id)
+    row = db.get_artifact(profile_id, artifact_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if row["state"] == "pending" and browser_mgr.is_active(profile_id):
+        # Removing the row would not stop the browser, and its bytes would then land with
+        # nothing to attach them to. Let the transfer reach a terminal state first.
+        raise HTTPException(
+            status_code=409, detail="Download is still in progress; it cannot be removed yet"
+        )
+    if not db.delete_artifact(profile_id, artifact_id):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifacts.delete_file(profile_id, artifact_id)
+    artifacts.sync_picker_view(profile_id)
+    return {"ok": True}
 
 
 # ── Launch / Stop ─────────────────────────────────────────────────────────────
@@ -1473,15 +1648,39 @@ async def cdp_json_list(profile_id: str, request: Request):
     return data
 
 
+_DOWNLOAD_BEHAVIOUR_METHODS = ("Browser.setDownloadBehavior", "Page.setDownloadBehavior")
+
+
+def _sets_download_behaviour(frame: str) -> bool:
+    """Whether a client->CDP frame changes the profile's download behaviour.
+
+    A call naming a ``browserContextId`` targets a context the client created itself, not
+    the profile's own (default) context, so it is not one Chromium will undo on our behalf.
+    """
+    if "setDownloadBehavior" not in frame:  # cheap check first: this runs per frame
+        return False
+    try:
+        message = json.loads(frame)
+        return (
+            message.get("method") in _DOWNLOAD_BEHAVIOUR_METHODS
+            and not (message.get("params") or {}).get("browserContextId")
+        )
+    except (ValueError, AttributeError):
+        return False
+
+
 async def _proxy_cdp_websocket(
     websocket: WebSocket, target_url: str, label: str,
-) -> None:
+) -> bool:
     """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
 
-    Used by both browser-level and page-level CDP proxy endpoints.
+    Used by both browser-level and page-level CDP proxy endpoints. Returns whether the
+    client changed the browser's download behaviour: Chromium reverts that to its default
+    when such a client detaches, so the caller then has capture re-armed.
     """
     import websockets
 
+    touched_downloads = False
     try:
         async with websockets.connect(
             target_url, max_size=None, ping_interval=None, ping_timeout=None
@@ -1489,12 +1688,15 @@ async def _proxy_cdp_websocket(
             logger.info("%s: connected to %s", label, target_url)
 
             async def client_to_cdp():
+                nonlocal touched_downloads
                 try:
                     while True:
                         msg = await websocket.receive()
                         if msg.get("type") == "websocket.disconnect":
                             break
                         if "text" in msg and msg["text"]:
+                            if not touched_downloads and _sets_download_behaviour(msg["text"]):
+                                touched_downloads = True
                             await cdp_ws.send(msg["text"])
                         elif "bytes" in msg and msg["bytes"]:
                             await cdp_ws.send(msg["bytes"])
@@ -1531,6 +1733,7 @@ async def _proxy_cdp_websocket(
             await websocket.close()
         except Exception as exc:
             logger.debug("%s: websocket.close() failed: %s", label, exc)
+    return touched_downloads
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp")
@@ -1558,7 +1761,10 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4005, reason="CDP not available")
         return
 
-    await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]")
+    if await _proxy_cdp_websocket(websocket, ws_url, f"CDP proxy [{profile_id}]"):
+        # Only once the upstream socket is closed: Chromium has processed the detach by
+        # then, and capture is reasserted after it.
+        browser_mgr.cdp_client_detached(running)
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
@@ -1575,7 +1781,8 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     await websocket.accept()
 
     target_url = f"ws://127.0.0.1:{running.cdp_port}/devtools/{path}"
-    await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
+    if await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]"):
+        browser_mgr.cdp_client_detached(running)
 
 
 # ── Static Frontend ───────────────────────────────────────────────────────────

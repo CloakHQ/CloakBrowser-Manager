@@ -21,6 +21,7 @@ from cloakbrowser.license import (
     read_denial_file,
 )
 
+from . import downloads
 from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
@@ -315,6 +316,8 @@ class RunningProfile:
     ws_port: int | None = None
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
+    download_task: Any = None  # asyncio.Task capturing this browser's downloads
+    download_rearm: Any = None  # asyncio.Event: a CDP client left, reassert download capture
     capture_preview: bool = True
     # Path to the wrapper's per-launch denial file (set by launch_persistent_
     # context_async on the returned context). Read on close to tell a seat/
@@ -639,6 +642,20 @@ class BrowserManager:
                     self._screenshot_loop(profile_id)
                 )
 
+            # Files this browser downloads become artifacts of the profile — but only under
+            # Docker. On a native install the browser writes to the user's own Downloads
+            # folder, and diverting that into the Manager's store would take their files away.
+            if self.runtime.runtime_mode == "docker":
+                running.download_rearm = asyncio.Event()
+                running.download_task = asyncio.ensure_future(
+                    downloads.watch(
+                        profile_id,
+                        cdp_port,
+                        still_running=lambda: profile_id in self.running,
+                        rearm=running.download_rearm,
+                    )
+                )
+
             logger.info(
                 "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
                 profile_id,
@@ -840,6 +857,20 @@ class BrowserManager:
     ) -> None:
         if running.screenshot_task is not None:
             running.screenshot_task.cancel()
+        if running.download_task is not None:
+            running.download_task.cancel()
+            # Awaited, not just cancelled: the watcher owns staged download files, and
+            # disposal must not race its cleanup.
+            await asyncio.gather(running.download_task, return_exceptions=True)
+            # The browser is gone, so a transfer still marked pending can never finish.
+            # Reconciling only on the next launch would strand it while the profile is stopped.
+            try:
+                downloads.reconcile_interrupted(running.profile_id)
+            except Exception as exc:  # noqa: BLE001 — teardown must not fail on bookkeeping
+                logger.warning(
+                    "Profile %s: could not reconcile downloads on stop: %s",
+                    running.profile_id, exc,
+                )
         if close_context:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:
@@ -949,6 +980,13 @@ class BrowserManager:
             or profile_id in self._launching
             or profile_id in self._stopping
         )
+
+    def cdp_client_detached(self, running: RunningProfile) -> None:
+        """A proxied CDP client that changed download behaviour has disconnected. Chromium
+        reverts to its default, so capture is re-armed. ``running`` is the browser the
+        client was attached to: a late notification must not touch a relaunched one."""
+        if self.running.get(running.profile_id) is running and running.download_rearm is not None:
+            running.download_rearm.set()
 
     @asynccontextmanager
     async def hold_stopped(self, profile_id: str):

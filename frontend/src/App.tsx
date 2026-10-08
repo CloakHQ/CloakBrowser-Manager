@@ -414,6 +414,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               <ProfileViewer
                 key={selected.id}
                 profileId={selected.id}
+                profileName={selected.name}
                 cdpUrl={selected.cdp_url}
                 clipboardSync={selected.clipboard_sync}
                 onClipboardSyncChange={handleClipboardSyncChange}

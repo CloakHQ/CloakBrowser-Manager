@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 import os
 import threading
 from dataclasses import dataclass
@@ -1222,3 +1224,155 @@ async def test_reset_and_delete_refuse_a_profile_mid_launch(tmp_db: Path):
         main.browser_mgr._launching.discard(src["id"])
     assert (Path(src["user_data_dir"]) / "Default" / "Cookies").read_text() == "session=abc"
     assert db.get_profile(src["id"]) is not None
+
+
+# ── CDP proxy: download capture survives external clients ────────────────────
+
+
+class _FakeUpstream:
+    """A CDP target that accepts a connection, swallows ``expect`` frames, then hangs up.
+
+    The browser ends the session here because the test client cancels the app task the
+    moment its own side disconnects, before the proxy could finish.
+    """
+
+    def __init__(self, expect: int) -> None:
+        self.expect = expect
+        self.closed = False
+        self.received: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.closed = True
+        return False
+
+    async def send(self, frame) -> None:
+        self.received.append(frame)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while len(self.received) < self.expect:
+            await asyncio.sleep(0.01)
+        raise StopAsyncIteration
+
+
+def _cdp_version_client() -> AsyncMock:
+    version = MagicMock()
+    version.json.return_value = {"webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/browser/x"}
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=version)
+    return client
+
+
+def _capturing_profile(app_client: TestClient) -> RunningProfile:
+    pid = app_client.post("/api/profiles", json={"name": "Detach"}).json()["id"]
+    running = RunningProfile(pid, MagicMock(), 53123, download_rearm=asyncio.Event())
+    main.browser_mgr.running[pid] = running
+    return running
+
+
+def _wait_for(condition, seconds: float = 2.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
+def _run_proxied_client(
+    app_client: TestClient, path: str, frames: list[dict], until
+) -> tuple[_FakeUpstream, list[bool]]:
+    """Connect through the proxy, send ``frames``, and stay connected until ``until`` holds
+    or the browser side has hung up. Returns the fake browser and, for each time the detach
+    hook fired, whether the upstream socket was already closed."""
+    upstream = _FakeUpstream(expect=len(frames))
+    seen_closed: list[bool] = []
+    real_hook = main.browser_mgr.cdp_client_detached
+
+    def hook(running: RunningProfile) -> None:
+        seen_closed.append(upstream.closed)
+        real_hook(running)
+
+    with patch("websockets.connect", return_value=upstream), \
+         patch("httpx.AsyncClient", return_value=_cdp_version_client()), \
+         patch.object(main.browser_mgr, "cdp_client_detached", new=hook):
+        with app_client.websocket_connect(path, headers={"origin": "http://testserver"}) as ws:
+            for frame in frames:
+                ws.send_text(json.dumps(frame))
+            _wait_for(lambda: until() or upstream.closed)
+            time.sleep(0.05)  # let the proxy run to the end after the browser hung up
+    return upstream, seen_closed
+
+
+_CDP_ROUTES = ["cdp", "cdp/devtools/page/abc"]
+
+
+@pytest.mark.parametrize("route", _CDP_ROUTES)
+def test_a_client_that_set_download_behaviour_re_arms_capture_when_it_leaves(
+    app_client: TestClient, route: str
+):
+    """Chromium reverts browser-wide download behaviour to its default when such a client
+    detaches; capture must be re-armed, and only once the upstream socket is closed."""
+    running = _capturing_profile(app_client)
+    upstream, seen_closed = _run_proxied_client(
+        app_client, f"/api/profiles/{running.profile_id}/{route}", [
+            {"id": 1, "method": "Target.getTargets"},
+            {"id": 2, "method": "Browser.setDownloadBehavior", "params": {"behavior": "deny"}},
+        ], until=running.download_rearm.is_set,
+    )
+    assert running.download_rearm.is_set()
+    assert seen_closed == [True]
+    assert len(upstream.received) == 2  # the frames still reached the browser
+    main.browser_mgr.running.pop(running.profile_id, None)
+
+
+@pytest.mark.parametrize("route", _CDP_ROUTES)
+def test_a_client_that_left_download_behaviour_alone_does_not_re_arm(
+    app_client: TestClient, route: str
+):
+    """Its detach does not reset Chromium — and re-arming would take the download path away
+    from another client that is still attached and set its own."""
+    running = _capturing_profile(app_client)
+    upstream, seen_closed = _run_proxied_client(
+        app_client, f"/api/profiles/{running.profile_id}/{route}", [
+            {"id": 1, "method": "Target.getTargets"},
+            {"id": 2, "method": "Runtime.evaluate", "params": {"expression": "'setDownloadBehavior'"}},
+        ], until=lambda: False,
+    )
+    assert upstream.closed
+    assert seen_closed == []
+    assert not running.download_rearm.is_set()
+    main.browser_mgr.running.pop(running.profile_id, None)
+
+
+def test_a_proxy_that_never_reached_the_browser_does_not_re_arm(app_client: TestClient):
+    running = _capturing_profile(app_client)
+    with patch("websockets.connect", side_effect=OSError("refused")), \
+         patch("httpx.AsyncClient", return_value=_cdp_version_client()):
+        with app_client.websocket_connect(
+            f"/api/profiles/{running.profile_id}/cdp", headers={"origin": "http://testserver"}
+        ):
+            pass
+    time.sleep(0.1)
+    assert not running.download_rearm.is_set()
+    main.browser_mgr.running.pop(running.profile_id, None)
+
+
+@pytest.mark.parametrize("frame, expected", [
+    ('{"id":1,"method":"Browser.setDownloadBehavior","params":{"behavior":"deny"}}', True),
+    # Through a flattened page session it still applies to the profile's own context.
+    ('{"sessionId":"S","id":2,"method":"Browser.setDownloadBehavior","params":{"behavior":"allow","downloadPath":"/x"}}', True),
+    ('{"id":3,"method":"Page.setDownloadBehavior","params":{"behavior":"allow","downloadPath":"/x"}}', True),
+    # A context the client created itself is not the profile's; Chromium resets only that one.
+    ('{"id":4,"method":"Browser.setDownloadBehavior","params":{"behavior":"deny","browserContextId":"C1"}}', False),
+    ('{"id":5,"method":"Runtime.evaluate","params":{"expression":"\'setDownloadBehavior\'"}}', False),
+    ('{"id":6,"method":"Target.getTargets"}', False),
+    ('not json but mentions setDownloadBehavior', False),
+    ('["setDownloadBehavior"]', False),
+])
+def test_only_download_behaviour_commands_for_the_profile_context_count(frame: str, expected: bool):
+    assert main._sets_download_behaviour(frame) is expected

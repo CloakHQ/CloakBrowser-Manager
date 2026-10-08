@@ -286,7 +286,7 @@ async def test_launch_rejects_user_debugging_flags(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
+async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path, tmp_db):
     from backend import browser_manager as module
 
     context = MagicMock()
@@ -300,6 +300,12 @@ async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
 
     running = await manager.launch(_launch_profile(tmp_path))
+    background_tasks = [
+        task for task in (running.download_task, running.screenshot_task) if task is not None
+    ]
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
 
     assert running.display == 100
     assert running.ws_port == 6100
@@ -566,3 +572,103 @@ def test_init_idempotent(tmp_path: Path):
     # Second call should NOT overwrite (file already exists)
     _init_profile_defaults(tmp_path)
     assert bookmarks_path.read_text() == "SENTINEL"
+
+
+@pytest.mark.asyncio
+async def test_downloads_are_captured_only_under_docker(monkeypatch, tmp_path: Path):
+    """Natively the browser writes to the user's own Downloads folder. Diverting that into
+    the Manager's artifact store would take their files away from where they expect them."""
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    watch = AsyncMock()
+    monkeypatch.setattr(module.downloads, "watch", watch)
+
+    running = await manager.launch(_launch_profile(tmp_path))
+
+    assert running.download_task is None
+    watch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_downloads_are_captured_under_docker(monkeypatch, tmp_db: Path, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(DOCKER_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
+    manager.vnc.start_vnc = AsyncMock()
+    manager.vnc.stop_vnc = AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(module.downloads, "watch", AsyncMock())
+
+    running = await manager.launch(_launch_profile(tmp_path))
+    try:
+        assert running.download_task is not None
+    finally:
+        await manager.stop(running.profile_id)
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_browser_settles_its_pending_downloads(
+    monkeypatch, tmp_db: Path, tmp_path: Path
+):
+    """Reconciling only on the next launch strands the row while the profile sits stopped."""
+    from backend import browser_manager as module
+    from backend import database as db
+    from backend import downloads
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(DOCKER_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
+    manager.vnc.start_vnc = AsyncMock()
+    manager.vnc.stop_vnc = AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(module.downloads, "watch", AsyncMock())
+
+    profile = db.create_profile(name="Downloader")
+    launch_profile = _launch_profile(tmp_path)
+    launch_profile["id"] = profile["id"]
+    running = await manager.launch(launch_profile)
+    artifact_id = downloads.DownloadTracker(profile["id"]).begin("guid-1", "half.csv")
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "pending"
+
+    await manager.stop(running.profile_id)
+
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "failed"
+
+
+def test_a_detaching_cdp_client_re_arms_download_capture():
+    manager = BrowserManager(DOCKER_RUNTIME)
+    running = RunningProfile("p1", MagicMock(), 9222, download_rearm=asyncio.Event())
+    manager.running["p1"] = running
+    manager.cdp_client_detached(running)
+    assert running.download_rearm.is_set()
+    # Running without capture (native): nothing to re-arm, nothing raised.
+    native = RunningProfile("native", MagicMock(), 9223)
+    manager.running["native"] = native
+    manager.cdp_client_detached(native)
+
+
+def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
+    manager = BrowserManager(DOCKER_RUNTIME)
+    stale = RunningProfile("p1", MagicMock(), 9222, download_rearm=asyncio.Event())
+    current = RunningProfile("p1", MagicMock(), 9224, download_rearm=asyncio.Event())
+    manager.running["p1"] = current  # the profile was stopped and launched again
+    manager.cdp_client_detached(stale)
+    assert not current.download_rearm.is_set()
+    assert not stale.download_rearm.is_set()
+    manager.running.pop("p1")
+    manager.cdp_client_detached(current)  # nor a browser that is gone altogether
+    assert not current.download_rearm.is_set()

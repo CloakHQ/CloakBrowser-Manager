@@ -80,6 +80,24 @@ def _create_tags_table(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _create_artifacts_table(conn: sqlite3.Connection) -> None:
+    """Files attached to a profile. Rows are metadata; the bytes live under DATA_DIR/artifacts."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT 'upload',
+            state TEXT NOT NULL DEFAULT 'ready',
+            content_type TEXT,
+            created_at TEXT NOT NULL,
+            picker_name TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_profile ON artifacts(profile_id)")
+
+
 def _rebuild_profiles(conn: sqlite3.Connection, old_columns: set[str]) -> None:
     """Rebuild the table in one transaction, retaining supported data and tags.
 
@@ -149,6 +167,7 @@ def init_db():
         if not exists:
             conn.execute(_PROFILE_SCHEMA)
             _create_tags_table(conn)
+            _create_artifacts_table(conn)
             conn.commit()
             return
         old_columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
@@ -156,7 +175,8 @@ def init_db():
             _rebuild_profiles(conn, old_columns)
         else:
             _create_tags_table(conn)
-            conn.commit()
+        _create_artifacts_table(conn)
+        conn.commit()
 
 
 def _now() -> str:
@@ -345,3 +365,107 @@ def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str
         tags=src.get("tags"),
         **fields,
     )
+
+
+# ── Artifacts ────────────────────────────────────────────────────────────────
+
+
+_ARTIFACT_COLUMNS = (
+    "id", "profile_id", "name", "size", "kind", "state", "content_type", "created_at", "picker_name",
+)
+
+
+def new_artifact_id() -> str:
+    return str(uuid.uuid4())
+
+
+def create_artifact(
+    artifact_id: str,
+    profile_id: str,
+    name: str,
+    size: int,
+    *,
+    kind: str = "upload",
+    state: str = "ready",
+    content_type: str | None = None,
+    picker_name: str | None = None,
+) -> dict[str, Any]:
+    """Record an artifact. An upload publishes its bytes first; a download starts at zero
+    bytes in the ``pending`` state and is updated when the transfer finishes."""
+    values = {
+        "id": artifact_id, "profile_id": profile_id, "name": name, "size": size,
+        "kind": kind, "state": state, "content_type": content_type, "created_at": _now(),
+        "picker_name": picker_name or name,
+    }
+    with get_db() as conn:
+        cols = ", ".join(_ARTIFACT_COLUMNS)
+        placeholders = ", ".join("?" for _ in _ARTIFACT_COLUMNS)
+        conn.execute(
+            f"INSERT INTO artifacts ({cols}) VALUES ({placeholders})",
+            [values[c] for c in _ARTIFACT_COLUMNS],
+        )
+        conn.commit()
+    return values
+
+
+def get_artifact(profile_id: str, artifact_id: str) -> dict[str, Any] | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM artifacts WHERE id = ? AND profile_id = ?", (artifact_id, profile_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_artifacts(profile_id: str) -> list[dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM artifacts WHERE profile_id = ? ORDER BY created_at DESC, id",
+            (profile_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_artifact(profile_id: str, artifact_id: str, **fields: Any) -> dict[str, Any] | None:
+    allowed = {
+        k: v for k, v in fields.items()
+        if k in ("name", "size", "state", "content_type", "picker_name")
+    }
+    if not allowed:
+        return get_artifact(profile_id, artifact_id)
+    assignments = ", ".join(f"{column} = ?" for column in allowed)
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE artifacts SET {assignments} WHERE id = ? AND profile_id = ?",
+            [*allowed.values(), artifact_id, profile_id],
+        )
+        conn.commit()
+    return get_artifact(profile_id, artifact_id)
+
+
+def profile_names() -> list[tuple[str, str]]:
+    """``(id, name)`` for every profile, without hydrating tags.
+
+    ``list_profiles`` runs a tag query per profile; the file-chooser bookmarks only need
+    these two columns and are rebuilt on every file mutation.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, name FROM profiles ORDER BY sort_order, created_at"
+        ).fetchall()
+    return [(row["id"], row["name"]) for row in rows]
+
+
+def profile_ids_with_artifacts() -> list[str]:
+    """Only these profiles have a file-chooser view worth reconciling at startup."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT DISTINCT profile_id FROM artifacts").fetchall()
+    return [row["profile_id"] for row in rows]
+
+
+def delete_artifact(profile_id: str, artifact_id: str) -> bool:
+    with get_db() as conn:
+        cur = conn.execute(
+            "DELETE FROM artifacts WHERE id = ? AND profile_id = ?", (artifact_id, profile_id)
+        )
+        conn.commit()
+    return cur.rowcount > 0

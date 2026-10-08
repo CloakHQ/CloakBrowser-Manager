@@ -231,6 +231,62 @@ await page.goto("https://example.com");
 
 The CDP URL is available from the running-profile view. The same browser session is accessible through its native window on Windows/macOS or through VNC on Linux Docker, and programmatically through the API on every platform.
 
+## Profile files
+
+A profile can exchange files with the outside world. This matters most under Docker, where the
+browser cannot see your filesystem: a file you want to upload to a website is not reachable from
+the guest's file dialog, and anything the browser downloads is trapped in the container.
+
+```bash
+# Put a file where the profile's browser can use it: the body is the file, the header its name
+curl --data-binary @report.csv -H "X-File-Name: report.csv" http://localhost:8080/api/profiles/<id>/files
+
+# What this profile holds
+curl http://localhost:8080/api/profiles/<id>/files
+
+# Fetch one back (also serves what the browser downloaded)
+curl -OJ http://localhost:8080/api/profiles/<id>/files/<artifact-id>
+
+curl -X DELETE http://localhost:8080/api/profiles/<id>/files/<artifact-id>
+```
+
+The upload body is the file itself, not a form: it streams straight into the profile's store,
+so a file costs one copy on disk and an oversized one is refused from its `Content-Length`
+before a byte is read. `X-File-Name` is URL-encoded (`%20` for a space), though a raw UTF-8 name
+works too; the stored type is the request's `Content-Type` when it is a real one, otherwise a
+guess from the name. An upload
+reports a `container_path`, which is what a CDP call that takes a path
+(`DOM.setFileInputFiles`, `Input.dispatchDragEvent`) hands to the page.
+
+In the Docker build the live viewer gains a files button: upload from your own machine, drop a
+file straight onto the screen, or pull one back. Uploaded files also appear in the guest's own
+file dialog under **Uploads — <profile>** in the sidebar, so a website's "Choose file" button can
+reach them, and files the browser downloads are captured automatically and land in the same list.
+
+On the native macOS and Windows builds the browser already shares your filesystem and writes to
+your own Downloads folder, so neither the sidebar shortcut nor download capture applies there.
+The endpoints above still work.
+
+Download behaviour is browser-wide and last-writer-wins, so an automation client attached to the
+profile's CDP endpoint controls it: Playwright's `connect_over_cdp`, for example, sets its own
+download directory (or disables downloads entirely) as it initialises. While such a client is
+attached its downloads go where it asked, not into the profile's files — the Manager records
+nothing it cannot see, and never cancels a transfer it does not own. When such a client
+disconnects, Chromium falls back to its default download behaviour rather than to the Manager's,
+so capture is re-armed as soon as a proxied CDP connection closes.
+
+Files live beside the profile, not inside it, so duplicating a profile's browser state never
+copies its documents. Deleting a profile deletes its files. Nothing expires on its own: the
+limits below are per profile. A file larger than `ARTIFACT_MAX_BYTES` is refused with `413`, and
+an upload that would breach a profile's count or total is refused with `507`; nothing is evicted
+to make room.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ARTIFACT_MAX_BYTES` | `268435456` (256 MiB) | Largest single file |
+| `ARTIFACT_MAX_COUNT` | `200` | Files per profile |
+| `ARTIFACT_MAX_TOTAL_BYTES` | `2147483648` (2 GiB) | Total per profile |
+
 ## Remote Access
 
 The container binds to localhost only. To access from a remote server:

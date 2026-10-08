@@ -6,6 +6,19 @@ export type HostOS = "windows" | "macos" | "linux";
 export type RuntimeMode = "native" | "docker";
 export type ViewerMode = "native-window" | "vnc";
 
+export interface ProfileFile {
+  id: string;
+  profile_id: string;
+  name: string;
+  size: number;
+  kind: string;
+  state: string;
+  content_type: string | null;
+  created_at: string;
+  /** Where the browser process sees the file, for CDP calls that take a path. */
+  container_path: string;
+}
+
 export interface Profile {
   id: string;
   name: string;
@@ -227,6 +240,37 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ include_browser_state: includeBrowserState }),
     }),
+
+  listProfileFiles: (id: string) =>
+    request<ProfileFile[]>(`/api/profiles/${id}/files`),
+
+  uploadProfileFile: async (id: string, file: File): Promise<ProfileFile> => {
+    // The file is the body itself, streamed as-is. Its name travels in a header, URL-encoded,
+    // because header values cannot carry arbitrary Unicode.
+    const res = await fetch(`/api/profiles/${id}/files`, {
+      method: "POST",
+      body: file,
+      headers: {
+        "X-File-Name": encodeURIComponent(file.name),
+        "Content-Type": file.type || "application/octet-stream",
+      },
+    });
+    if (!res.ok) {
+      if (res.status === 401 && _onUnauthorized) {
+        _onUnauthorized();
+        throw new ApiError(401, "Unauthorized");
+      }
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      const detail = typeof body.detail === "string" ? body.detail : res.statusText;
+      throw new ApiError(res.status, detail);
+    }
+    return res.json();
+  },
+
+  deleteProfileFile: (id: string, fileId: string) =>
+    request<{ ok: boolean }>(`/api/profiles/${id}/files/${fileId}`, { method: "DELETE" }),
+
+  profileFileUrl: (id: string, fileId: string) => `/api/profiles/${id}/files/${fileId}`,
 
   launchProfile: (id: string) =>
     request<LaunchResult>(`/api/profiles/${id}/launch`, { method: "POST" }),

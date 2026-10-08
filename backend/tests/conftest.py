@@ -88,3 +88,36 @@ def app_client(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
 
     with TestClient(main.app) as client:
         yield client
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path_factory, monkeypatch: pytest.MonkeyPatch):
+    """Keep the suite out of the developer's real ``$HOME``.
+
+    On Linux the Manager resolves to the Docker runtime, where it writes a GTK bookmarks file
+    into ``$HOME`` so the guest's file chooser can reach a profile's uploads. A test run must
+    never clobber a real one.
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+@pytest.fixture()
+def native_runtime(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run as the native macOS/Windows build, where the guest shares the user's filesystem."""
+    monkeypatch.setattr(db, "RUNTIME", RuntimeConfig("macos", "native", "native-window", tmp_db))
+    return db.RUNTIME
+
+
+@pytest.fixture()
+def docker_runtime(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run as the Linux/Docker build, the only one with a containerised file chooser.
+
+    Symlinks and the GTK bookmarks file are Docker-only, so tests that exercise them must
+    say so rather than depending on the host the suite happens to run on (CI covers
+    ubuntu, windows and macos).
+    """
+    monkeypatch.setattr(db, "RUNTIME", RuntimeConfig("linux", "docker", "vnc", tmp_db))
+    return db.RUNTIME
