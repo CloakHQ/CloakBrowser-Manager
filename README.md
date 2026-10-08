@@ -127,6 +127,8 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
+- **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage
+- **Profile files** — send files to a profile and, on a Linux server, keep everything its browser downloads
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
 - **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
 - **Playwright/Puppeteer API** — connect to any running profile through CDP while watching the same session live
@@ -338,6 +340,7 @@ Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/Clo
 - [quorentindupres-dev](https://github.com/quorentindupres-dev) — native macOS workflow and Manager integration concepts
 - [shellus](https://github.com/shellus) — auth-gated status endpoint and unauthenticated health probe
 - [hayka-pacha](https://github.com/hayka-pacha) — profile reset endpoint
+- [theaafofficial](https://github.com/theaafofficial) — duplicating a profile with its browser state, and per-profile files with download capture
 
 ## Links
 
