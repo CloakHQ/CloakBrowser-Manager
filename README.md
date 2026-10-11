@@ -338,7 +338,7 @@ Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/Clo
 
 - [lhq1363511234-arch](https://github.com/lhq1363511234-arch) — native Windows support foundation
 - [quorentindupres-dev](https://github.com/quorentindupres-dev) — native macOS workflow and Manager integration concepts
-- [shellus](https://github.com/shellus) — auth-gated status endpoint and unauthenticated health probe
+- [shellus](https://github.com/shellus) — auth-gated status endpoint and unauthenticated health probe, offline VNC startup
 - [hayka-pacha](https://github.com/hayka-pacha) — profile reset endpoint
 - [theaafofficial](https://github.com/theaafofficial) — duplicating a profile with its browser state, and per-profile files with download capture
 

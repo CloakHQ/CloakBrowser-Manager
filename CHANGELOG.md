@@ -4,6 +4,14 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-10-11
+
+### Fixed
+- **Profiles stayed stopped after booting without internet.** On a host with no internet uplink (e.g. after a power cut), the display server exited at startup, so auto-launched profiles never came up. It now starts offline too.
+
+### Changed
+- **Bundles the CloakBrowser 0.6.1 engine.** Profiles with humanize on now humanize the page they open with; on 0.6.0 that first page could run without it.
+
 ## [0.1.6] - 2026-10-08
 
 ### Added
