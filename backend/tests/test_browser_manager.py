@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -672,3 +674,393 @@ def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
     manager.running.pop("p1")
     manager.cdp_client_detached(current)  # nor a browser that is gone altogether
     assert not current.download_rearm.is_set()
+
+
+# ── GeoIP resolved off the event loop ────────────────────────────────────────
+# cloakbrowser's async launcher resolves GeoIP with a blocking call on the event
+# loop (maybe_resolve_geoip, 20s timeout), once per CDP attempt. The Manager now
+# resolves it once, in a thread, and launches with geoip=False plus the result.
+
+_GEO = ("America/New_York", "en-US", "203.0.113.7")
+
+
+def _geoip_profile(tmp_path: Path) -> dict:
+    profile = _launch_profile(tmp_path)
+    profile["geoip"] = True
+    profile["proxy"] = "http://user:pass@proxy.example:8080"
+    return profile
+
+
+@contextlib.asynccontextmanager
+async def _heartbeat():
+    """Counts event-loop ticks while the body runs; a blocked loop barely ticks. The task is
+    cancelled and awaited on every exit path, so it never outlives the test."""
+    ticks = [0]
+
+    async def beat():
+        while True:
+            await asyncio.sleep(0.02)
+            ticks[0] += 1
+
+    task = asyncio.create_task(beat())
+    try:
+        yield ticks
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def _geo_manager(monkeypatch, resolve, launch=None, wait_for_cdp=None):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    launch = launch or AsyncMock(return_value=context)
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = wait_for_cdp or AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+    monkeypatch.setattr(module, "maybe_resolve_geoip", resolve)
+    return manager, launch
+
+
+@pytest.mark.asyncio
+async def test_geoip_is_resolved_off_the_loop_and_the_library_skips_it(monkeypatch, tmp_path: Path):
+    import threading
+
+    calls = []
+
+    def resolve(geoip, proxy, timezone, locale, args):
+        calls.append((geoip, proxy, timezone, locale, threading.get_ident()))
+        return _GEO
+
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    await manager.launch(_geoip_profile(tmp_path))
+
+    assert len(calls) == 1
+    geoip, proxy, timezone, locale, thread_id = calls[0]
+    assert geoip is True and proxy == "http://user:pass@proxy.example:8080"
+    assert (timezone, locale) == (None, None)
+    assert thread_id != threading.get_ident()  # not on the event loop's thread
+    options = launch.await_args.kwargs
+    assert options["geoip"] is False
+    assert (options["timezone"], options["locale"]) == ("America/New_York", "en-US")
+    assert "--fingerprint-webrtc-ip=203.0.113.7" in options["args"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_lookup_does_not_freeze_the_event_loop(monkeypatch, tmp_path: Path):
+    """The symptom: /api/health (any coroutine) must keep running while GeoIP resolves."""
+    import time
+
+    def slow_resolve(*_args):
+        time.sleep(0.6)
+        return _GEO
+
+    async def blocking_library_launch(**kwargs):
+        # The real library blocks the loop when asked to resolve GeoIP itself.
+        if kwargs.get("geoip"):
+            time.sleep(0.6)
+        context = MagicMock(pages=[])
+        context.add_init_script = AsyncMock()
+        return context
+
+    manager, _ = _geo_manager(monkeypatch, slow_resolve, launch=AsyncMock(side_effect=blocking_library_launch))
+    async with _heartbeat() as ticks:
+        await manager.launch(_geoip_profile(tmp_path))
+    assert ticks[0] >= 6  # ~30 expected over 0.6s at 20ms; a blocked loop gets ~0
+
+
+@pytest.mark.asyncio
+async def test_the_lookup_runs_once_across_cdp_retries(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=_GEO)
+    contexts = [MagicMock(pages=[], close=AsyncMock()), MagicMock(pages=[], close=AsyncMock())]
+    contexts[1].add_init_script = AsyncMock()
+    manager, launch = _geo_manager(
+        monkeypatch,
+        resolve,
+        launch=AsyncMock(side_effect=contexts),
+        wait_for_cdp=AsyncMock(side_effect=[TimeoutError("busy"), None]),
+    )
+    await manager.launch(_geoip_profile(tmp_path))
+    assert launch.await_count == 2
+    resolve.assert_called_once()
+    assert all(call.kwargs["geoip"] is False for call in launch.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_explicit_timezone_and_locale_reach_the_lookup(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=("Europe/Berlin", "de-DE", "203.0.113.7"))
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    profile = _geoip_profile(tmp_path)
+    profile.update(timezone="Europe/Berlin", locale="de-DE")
+    await manager.launch(profile)
+    assert resolve.call_args.args[2:4] == ("Europe/Berlin", "de-DE")
+    assert launch.await_args.kwargs["timezone"] == "Europe/Berlin"
+
+
+@pytest.mark.asyncio
+async def test_a_user_webrtc_flag_is_not_overridden(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=_GEO)
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    profile = _geoip_profile(tmp_path)
+    profile["launch_args"] = ["--fingerprint-webrtc-ip=198.51.100.9"]
+    await manager.launch(profile)
+    webrtc = [a for a in launch.await_args.kwargs["args"] if a.startswith("--fingerprint-webrtc-ip")]
+    assert webrtc == ["--fingerprint-webrtc-ip=198.51.100.9"]
+
+
+@pytest.mark.asyncio
+async def test_geoip_off_does_no_lookup(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(return_value=_GEO)
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, timezone="America/Chicago", locale="en-US")
+    await manager.launch(profile)
+    resolve.assert_not_called()
+    options = launch.await_args.kwargs
+    assert options["geoip"] is False and options["timezone"] == "America/Chicago"
+    assert not any(a.startswith("--fingerprint-webrtc-ip") for a in options["args"])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_fails_the_launch_cleanly(monkeypatch, tmp_path: Path):
+    resolve = MagicMock(side_effect=RuntimeError("GeoIP resolution timed out after 20.0s"))
+    manager, launch = _geo_manager(monkeypatch, resolve)
+    with pytest.raises(RuntimeError, match="GeoIP resolution timed out"):
+        await manager.launch(_geoip_profile(tmp_path))
+    # Retried as often as the old per-CDP-attempt lookups were, then given up.
+    assert resolve.call_count == 3
+    launch.assert_not_awaited()
+    assert "profile-1" not in manager._launching and "profile-1" not in manager.running
+
+
+@pytest.mark.asyncio
+async def test_a_transient_lookup_failure_is_retried_and_the_launch_succeeds(monkeypatch, tmp_path: Path):
+    """Parity with the old behaviour, where each CDP attempt redid the lookup: a proxy that is
+    slow for one window and recovers still launches."""
+    import threading
+
+    threads = []
+
+    def flaky(*_args):
+        threads.append(threading.get_ident())
+        if len(threads) == 1:
+            raise RuntimeError("GeoIP resolution timed out after 20.0s")
+        return _GEO
+
+    manager, launch = _geo_manager(monkeypatch, flaky)
+    await manager.launch(_geoip_profile(tmp_path))
+    assert len(threads) == 2
+    assert all(t != threading.get_ident() for t in threads)  # every try off the loop
+    options = launch.await_args.kwargs
+    assert options["timezone"] == "America/New_York" and "--fingerprint-webrtc-ip=203.0.113.7" in options["args"]
+
+
+@pytest.mark.asyncio
+async def test_retrying_a_slow_lookup_never_freezes_the_event_loop(monkeypatch, tmp_path: Path):
+    import time
+
+    def slow_then_fail(*_args):
+        time.sleep(0.25)
+        raise RuntimeError("GeoIP resolution timed out after 20.0s")
+
+    manager, _ = _geo_manager(monkeypatch, slow_then_fail)
+    async with _heartbeat() as ticks:
+        with pytest.raises(RuntimeError):
+            await manager.launch(_geoip_profile(tmp_path))
+    assert ticks[0] >= 6  # three 0.25s tries = 0.75s: ~37 ticks at 20ms; a blocked loop gets ~0
+
+
+# ── --fingerprint-webrtc-ip=auto ─────────────────────────────────────────────
+# The library resolves `auto` with its own blocking lookup (_resolve_webrtc_args), even with
+# geoip=False. The Manager resolves it before launch so the library never sees `auto`.
+
+_AUTO = "--fingerprint-webrtc-ip=auto"
+
+
+@pytest.mark.asyncio
+async def test_webrtc_auto_uses_the_geoip_exit_ip_without_a_second_lookup(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    second_lookup = MagicMock()
+    monkeypatch.setattr(module, "_resolve_webrtc_args", second_lookup)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO))
+    profile = _geoip_profile(tmp_path)
+    profile["launch_args"] = [_AUTO]
+    await manager.launch(profile)
+
+    second_lookup.assert_not_called()
+    args = launch.await_args.kwargs["args"]
+    assert _AUTO not in args
+    assert [a for a in args if a.startswith("--fingerprint-webrtc-ip")] == ["--fingerprint-webrtc-ip=203.0.113.7"]
+
+
+@pytest.mark.asyncio
+async def test_webrtc_auto_without_geoip_is_resolved_off_the_loop(monkeypatch, tmp_path: Path):
+    import threading
+    import time
+
+    from backend import browser_manager as module
+
+    seen = []
+
+    def slow_resolve_webrtc(args, proxy):
+        seen.append((proxy, threading.get_ident()))
+        time.sleep(0.6)
+        return ["--fingerprint-webrtc-ip=198.51.100.4" if a == _AUTO else a for a in args]
+
+    async def blocking_library_launch(**kwargs):
+        # The real library blocks the loop when it is handed `auto` to resolve.
+        if _AUTO in kwargs["args"]:
+            time.sleep(0.6)
+        context = MagicMock(pages=[])
+        context.add_init_script = AsyncMock()
+        return context
+
+    monkeypatch.setattr(module, "_resolve_webrtc_args", slow_resolve_webrtc)
+    resolve = MagicMock(return_value=_GEO)
+    manager, launch = _geo_manager(monkeypatch, resolve, launch=AsyncMock(side_effect=blocking_library_launch))
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, launch_args=[_AUTO])
+    async with _heartbeat() as ticks:
+        await manager.launch(profile)
+
+    resolve.assert_not_called()
+    assert len(seen) == 1 and seen[0][0] == "http://user:pass@proxy.example:8080"
+    assert seen[0][1] != threading.get_ident()
+    assert ticks[0] >= 6  # ~30 expected at 20ms; a blocked loop gets ~0
+    args = launch.await_args.kwargs["args"]
+    assert _AUTO not in args and "--fingerprint-webrtc-ip=198.51.100.4" in args
+
+
+@pytest.mark.asyncio
+async def test_a_failed_webrtc_auto_lookup_drops_the_flag_and_still_launches(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    # The library's own rule on a failed lookup: remove `auto` rather than fail the launch.
+    monkeypatch.setattr(module, "_resolve_webrtc_args", lambda args, proxy: [a for a in args if a != _AUTO])
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO))
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, launch_args=[_AUTO])
+    await manager.launch(profile)
+    assert not any(a.startswith("--fingerprint-webrtc-ip") for a in launch.await_args.kwargs["args"])
+
+
+@pytest.mark.asyncio
+async def test_webrtc_auto_without_a_proxy_defers_to_the_library_rule(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    rule = MagicMock(side_effect=lambda args, proxy: [a for a in args if a != _AUTO])
+    monkeypatch.setattr(module, "_resolve_webrtc_args", rule)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO))
+    profile = _geoip_profile(tmp_path)
+    profile.update(proxy=None, launch_args=[_AUTO])
+    await manager.launch(profile)
+    # With no proxy the machine's own IP is what sites see; the library just removes `auto`.
+    rule.assert_called_once()
+    assert _AUTO not in launch.await_args.kwargs["args"]
+
+
+# The duplicate-flag tests below use conftest's FAITHFUL resolver (not a monkeypatch): the library
+# handles only the first `auto`, and the fake launcher resolves any `auto` it is handed exactly as
+# the real launcher does, on the event loop. Every lookup records its thread.
+
+
+@pytest.fixture
+def webrtc_resolver():
+    import cloakbrowser.browser as stub
+
+    stub.webrtc_lookups.clear()
+    stub.webrtc_exit_ip = "198.51.100.4"
+    yield stub
+    stub.webrtc_lookups.clear()
+    stub.webrtc_exit_ip = "198.51.100.4"
+
+
+def _launcher_that_resolves_auto_on_the_loop(stub):
+    async def launch(**kwargs):
+        # The real launcher calls the resolver synchronously, i.e. on the event loop's thread.
+        kwargs["args"] = stub._resolve_webrtc_args(kwargs["args"], kwargs.get("proxy"))
+        context = MagicMock(pages=[])
+        context.add_init_script = AsyncMock()
+        return context
+
+    return AsyncMock(side_effect=launch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("geoip", [False, True])
+async def test_repeated_auto_flags_never_reach_the_launcher(monkeypatch, tmp_path: Path, webrtc_resolver, geoip):
+    import threading
+
+    launch = _launcher_that_resolves_auto_on_the_loop(webrtc_resolver)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO), launch=launch)
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=geoip, launch_args=[_AUTO, "--x", _AUTO])
+    await manager.launch(profile)
+
+    args = launch.await_args.kwargs["args"]
+    assert _AUTO not in args
+    webrtc = [a for a in args if a.startswith("--fingerprint-webrtc-ip")]
+    assert len(webrtc) == 1  # one flag, whichever branch resolved it
+    assert webrtc == ["--fingerprint-webrtc-ip=" + ("203.0.113.7" if geoip else "198.51.100.4")]
+    loop_thread = threading.get_ident()
+    assert all(thread != loop_thread for _proxy, thread in webrtc_resolver.webrtc_lookups)
+    assert len(webrtc_resolver.webrtc_lookups) == (0 if geoip else 1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_with_repeated_auto_flags_drops_all_of_them(monkeypatch, tmp_path: Path, webrtc_resolver):
+    import threading
+
+    webrtc_resolver.webrtc_exit_ip = None  # the lookup fails: the library drops the flag
+    launch = _launcher_that_resolves_auto_on_the_loop(webrtc_resolver)
+    manager, launch = _geo_manager(monkeypatch, MagicMock(return_value=_GEO), launch=launch)
+    profile = _geoip_profile(tmp_path)
+    profile.update(geoip=False, launch_args=[_AUTO, _AUTO])
+    await manager.launch(profile)
+
+    assert not any(a.startswith("--fingerprint-webrtc-ip") for a in launch.await_args.kwargs["args"])
+    assert [t != threading.get_ident() for _p, t in webrtc_resolver.webrtc_lookups] == [True]
+
+
+
+@pytest.mark.asyncio
+async def test_every_failed_geoip_attempt_is_logged(monkeypatch, tmp_path: Path, caplog):
+    import logging
+
+    resolve = MagicMock(side_effect=RuntimeError("GeoIP resolution timed out after 20.0s"))
+    manager, _ = _geo_manager(monkeypatch, resolve)
+    with caplog.at_level(logging.WARNING, logger="cloakbrowser.manager.browser"):
+        with pytest.raises(RuntimeError):
+            await manager.launch(_geoip_profile(tmp_path))
+    logged = [r.getMessage() for r in caplog.records if "GeoIP attempt" in r.getMessage()]
+    assert [m.split(" failed")[0] for m in logged] == ["GeoIP attempt 1/3", "GeoIP attempt 2/3", "GeoIP attempt 3/3"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_launch_stops_further_geoip_attempts(monkeypatch, tmp_path: Path):
+    """Each try runs in its own worker thread, so a cancelled launch starts no further tries (the
+    in-flight one finishes in its thread, but nothing is retried after it)."""
+    import threading
+
+    started = threading.Event()
+    calls = []
+
+    def slow_failing(*_args):
+        calls.append(1)
+        started.set()
+        time.sleep(0.3)
+        raise RuntimeError("GeoIP resolution timed out after 20.0s")
+
+    manager, launch = _geo_manager(monkeypatch, slow_failing)
+    task = asyncio.create_task(manager.launch(_geoip_profile(tmp_path)))
+    await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.8)  # long enough for tries 2 and 3 to have started if anything retried
+    assert len(calls) == 1
+    launch.assert_not_awaited()
+    assert "profile-1" not in manager._launching
