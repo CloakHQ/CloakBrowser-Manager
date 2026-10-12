@@ -39,7 +39,50 @@ _mock_license.CloakBrowserLicenseError = type(  # type: ignore[attr-defined]
 _mock_license.license_error_for_code = lambda code: None  # type: ignore[attr-defined]
 _mock_license.read_denial_file = lambda path: None  # type: ignore[attr-defined]
 
+_mock_browser = types.ModuleType("cloakbrowser.browser")
+_mock_browser.maybe_resolve_geoip = MagicMock(return_value=(None, None, None))  # type: ignore[attr-defined]
+
+
+def _append_webrtc_exit_ip(args, exit_ip):
+    """Same rule as cloakbrowser.browser._append_webrtc_exit_ip (0.6.1)."""
+    if exit_ip and not (args and any(a.startswith("--fingerprint-webrtc-ip") for a in args)):
+        args = list(args or [])
+        args.append(f"--fingerprint-webrtc-ip={exit_ip}")
+    return args
+
+
+_mock_browser._append_webrtc_exit_ip = _append_webrtc_exit_ip  # type: ignore[attr-defined]
+# Faithful copy of cloakbrowser.browser._resolve_webrtc_args (0.6.1): only the FIRST
+# `--fingerprint-webrtc-ip=auto` is handled; it becomes the proxy exit IP, or is removed when there
+# is no proxy or the lookup fails. The lookup is recorded with the thread it ran on, so tests can
+# assert it never runs on the event loop's thread. Set `webrtc_exit_ip` to None to simulate failure.
+_mock_browser.webrtc_lookups = []  # type: ignore[attr-defined]
+_mock_browser.webrtc_exit_ip = "198.51.100.4"  # type: ignore[attr-defined]
+
+
+def _resolve_webrtc_args(args, proxy):
+    import threading
+
+    if not args or "--fingerprint-webrtc-ip=auto" not in args:
+        return args
+    idx = args.index("--fingerprint-webrtc-ip=auto")
+    args = list(args)
+    if not proxy:
+        del args[idx]
+        return args
+    _mock_browser.webrtc_lookups.append((proxy, threading.get_ident()))
+    exit_ip = _mock_browser.webrtc_exit_ip
+    if exit_ip:
+        args[idx] = f"--fingerprint-webrtc-ip={exit_ip}"
+    else:
+        del args[idx]
+    return args
+
+
+_mock_browser._resolve_webrtc_args = _resolve_webrtc_args  # type: ignore[attr-defined]
+
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
+sys.modules.setdefault("cloakbrowser.browser", _mock_browser)
 sys.modules.setdefault("cloakbrowser.config", _mock_config)
 sys.modules.setdefault("cloakbrowser.download", _mock_download)
 sys.modules.setdefault("cloakbrowser.license", _mock_license)
