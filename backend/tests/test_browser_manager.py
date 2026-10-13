@@ -13,6 +13,7 @@ from backend.browser_manager import (
     _init_profile_defaults,
     _normalize_proxy,
     _validate_proxy,
+    _validate_transparent_proxy,
     BrowserManager,
     ProfileBusyError,
     RunningProfile,
@@ -103,6 +104,26 @@ def test_validate_no_port():
         _validate_proxy("http://host")
 
 
+# ── _validate_transparent_proxy ──────────────────────────────────────────────
+
+
+def test_transparent_proxy_accepts_http_with_credentials():
+    _validate_transparent_proxy("http://user:pass@proxy.com:8080")  # should not raise
+
+
+@pytest.mark.parametrize("proxy", [
+    None,
+    "socks5://user:pass@proxy.com:1080",
+    "https://user:pass@proxy.com:443",
+    "http://proxy.com:8080",
+    "http://user@proxy.com:8080",
+    "http://us%3Aer:pass@proxy.com:8080",
+])
+def test_transparent_proxy_rejects_unusable_proxy(proxy):
+    with pytest.raises(ValueError, match="Transparent proxy needs"):
+        _validate_transparent_proxy(proxy)
+
+
 # ── _build_fingerprint_args ──────────────────────────────────────────────────
 
 # Use the BrowserManager instance to call the method
@@ -149,6 +170,15 @@ def test_build_args_gpu_family_and_cookie_compatibility():
     intel = _mgr._build_fingerprint_args({"gpu_family": "intel"})
     assert "--fingerprint-gpu-vendor=Intel" in intel
     assert not any("gpu-vendor" in arg for arg in _mgr._build_fingerprint_args({"gpu_family": "auto"}))
+
+
+def test_build_args_transparent_proxy_and_portable_cookies():
+    args = _mgr._build_fingerprint_args({"transparent_proxy": True, "portable_cookies": True})
+    assert "--fingerprint-transparent-proxy" in args
+    assert "--fingerprint-portable-cookies" in args
+    off = _mgr._build_fingerprint_args({"transparent_proxy": False, "portable_cookies": 0})
+    assert "--fingerprint-transparent-proxy" not in off
+    assert "--fingerprint-portable-cookies" not in off
 
 
 def test_build_args_screen():

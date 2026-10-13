@@ -63,7 +63,12 @@ def test_init_db_rebuilds_old_schema_preserving_profile_and_tags(tmp_db: Path):
         "platform", "user_agent", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "headless",
     }.isdisjoint(columns)
-    assert {"launch_args", "extension_paths", "allow_3p_cookies"}.issubset(columns)
+    assert {
+        "launch_args", "extension_paths", "allow_3p_cookies",
+        "transparent_proxy", "portable_cookies",
+    }.issubset(columns)
+    assert profile["transparent_proxy"] == 0
+    assert profile["portable_cookies"] == 0
 
 
 # ── create_profile ───────────────────────────────────────────────────────────
@@ -130,6 +135,8 @@ def test_create_profile_defaults(tmp_db: Path):
     assert p["geoip"] == 1
     assert p["extension_paths"] == []
     assert p["allow_3p_cookies"] == 1
+    assert p["transparent_proxy"] == 0
+    assert p["portable_cookies"] == 0
     assert p["human_preset"] == "default"
     assert p["launch_args"] == []
 

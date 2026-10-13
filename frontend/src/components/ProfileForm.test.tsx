@@ -26,6 +26,8 @@ function profile(status: Profile["status"]): Profile {
     set_google_default: true,
     capture_preview: true,
     restore_session: true,
+    transparent_proxy: false,
+    portable_cookies: false,
     notes: null,
     tags: [],
     user_data_dir: "/data/profiles/p1",

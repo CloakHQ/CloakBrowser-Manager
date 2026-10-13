@@ -41,6 +41,8 @@ export interface Profile {
   set_google_default: boolean;
   capture_preview: boolean;
   restore_session: boolean;
+  transparent_proxy: boolean;
+  portable_cookies: boolean;
   notes: string | null;
   user_data_dir: string;
   created_at: string;
@@ -84,6 +86,8 @@ export interface ProfileCreateData {
   set_google_default?: boolean;
   capture_preview?: boolean;
   restore_session?: boolean;
+  transparent_proxy?: boolean;
+  portable_cookies?: boolean;
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }

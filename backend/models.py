@@ -32,6 +32,8 @@ class ProfileCreate(BaseModel):
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    transparent_proxy: bool = False
+    portable_cookies: bool = False
     notes: str | None = None
     tags: list[TagCreate] | None = None
 
@@ -59,6 +61,8 @@ class ProfileUpdate(BaseModel):
     set_google_default: bool | None = None
     capture_preview: bool | None = None
     restore_session: bool | None = None
+    transparent_proxy: bool | None = None
+    portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
@@ -136,6 +140,8 @@ class ProfileResponse(BaseModel):
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    transparent_proxy: bool = False
+    portable_cookies: bool = False
     notes: str | None = None
     user_data_dir: str
     created_at: str

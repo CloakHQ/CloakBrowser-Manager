@@ -94,6 +94,24 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing port: {url}")
 
 
+def _validate_transparent_proxy(url: str | None) -> None:
+    """Reject proxies the binary's transparent mode can't consume.
+
+    The binary fails closed (dead network, or exit on no proxy) unless it gets
+    one http proxy with a username and password, so refuse to launch instead.
+    """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url or "")
+    if (
+        parsed.scheme != "http"
+        or not parsed.username
+        or not parsed.password
+        or ":" in unquote(parsed.username)
+    ):
+        raise ValueError("Transparent proxy needs an http:// proxy with a username and password")
+
+
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
     """Connect through a proxy, return exit IP + geo + latency (or an error).
 
@@ -507,6 +525,8 @@ class BrowserManager:
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
                 _validate_proxy(proxy)
+            if profile.get("transparent_proxy"):
+                _validate_transparent_proxy(proxy)
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
@@ -1166,6 +1186,10 @@ class BrowserManager:
 
         if profile.get("allow_3p_cookies", False):
             args.append("--fingerprint-allow-3p-cookies")
+        if profile.get("transparent_proxy", False):
+            args.append("--fingerprint-transparent-proxy")
+        if profile.get("portable_cookies", False):
+            args.append("--fingerprint-portable-cookies")
 
         sw = profile.get("screen_width")
         sh = profile.get("screen_height")

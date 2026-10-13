@@ -22,7 +22,8 @@ _PROFILE_COLUMNS = (
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
-    "restore_session", "notes", "user_data_dir", "created_at", "updated_at", "sort_order",
+    "restore_session", "transparent_proxy", "portable_cookies", "notes", "user_data_dir",
+    "created_at", "updated_at", "sort_order",
 )
 
 _PROFILE_SCHEMA = """
@@ -48,6 +49,8 @@ CREATE TABLE profiles (
     set_google_default BOOLEAN DEFAULT 1,
     capture_preview BOOLEAN DEFAULT 1,
     restore_session BOOLEAN DEFAULT 1,
+    transparent_proxy BOOLEAN DEFAULT 0,
+    portable_cookies BOOLEAN DEFAULT 0,
     notes TEXT,
     user_data_dir TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -223,7 +226,9 @@ def create_profile(
         "allow_3p_cookies": fields.get("allow_3p_cookies", True),
         "set_google_default": fields.get("set_google_default", True),
         "capture_preview": fields.get("capture_preview", True),
-        "restore_session": fields.get("restore_session", True), "notes": fields.get("notes"),
+        "restore_session": fields.get("restore_session", True),
+        "transparent_proxy": fields.get("transparent_proxy", False),
+        "portable_cookies": fields.get("portable_cookies", False), "notes": fields.get("notes"),
         "user_data_dir": user_data_dir, "created_at": now, "updated_at": now,
     }
     with get_db() as conn:

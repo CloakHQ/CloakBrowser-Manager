@@ -300,6 +300,26 @@ def test_profile_extensions_and_3p_cookie_setting(app_client: TestClient):
     assert resp.json()["allow_3p_cookies"] is True
 
 
+def test_profile_transparent_proxy_and_portable_cookies(app_client: TestClient):
+    resp = app_client.post("/api/profiles", json={"name": "Defaults"})
+    assert resp.json()["transparent_proxy"] is False
+    assert resp.json()["portable_cookies"] is False
+
+    resp = app_client.post("/api/profiles", json={
+        "name": "ProxyCookies",
+        "transparent_proxy": True,
+        "portable_cookies": True,
+    })
+    assert resp.status_code == 201
+    pid = resp.json()["id"]
+    assert resp.json()["transparent_proxy"] is True
+    assert resp.json()["portable_cookies"] is True
+
+    resp = app_client.put(f"/api/profiles/{pid}", json={"transparent_proxy": False})
+    assert resp.json()["transparent_proxy"] is False
+    assert resp.json()["portable_cookies"] is True
+
+
 # ── Clipboard Sync Setting ──────────────────────────────────────────────────
 
 
