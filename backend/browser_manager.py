@@ -1364,7 +1364,11 @@ class BrowserManager:
             elif gpu_family == "intel":
                 args.append("--fingerprint-gpu-vendor=Intel")
 
-        if profile.get("allow_3p_cookies", False):
+        # A login often opens another window (Clerk, Sumsub, Google) and sets a
+        # third-party cookie. Let that window open. The agent closes it later
+        # if it should. An explicit allow_3p_cookies=False still turns cookies off.
+        args.append("--disable-popup-blocking")
+        if profile.get("allow_3p_cookies", True):
             args.append("--fingerprint-allow-3p-cookies")
 
         sw = profile.get("screen_width")

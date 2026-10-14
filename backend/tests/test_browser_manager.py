@@ -163,7 +163,17 @@ def test_build_args_screen():
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
     # Docker software rendering + runtime platform.
-    assert len(args) == 2
+    # Popups and third-party cookies stay on so a login window can open.
+    assert "--use-angle=swiftshader" in args
+    assert "--fingerprint-platform=windows" in args
+    assert "--disable-popup-blocking" in args
+    assert "--fingerprint-allow-3p-cookies" in args
+
+
+def test_build_args_can_turn_third_party_cookies_off():
+    args = _mgr._build_fingerprint_args({"allow_3p_cookies": False})
+    assert "--disable-popup-blocking" in args
+    assert "--fingerprint-allow-3p-cookies" not in args
 
 
 def test_native_build_args_do_not_force_software_gl():
