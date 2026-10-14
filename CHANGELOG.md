@@ -4,6 +4,14 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-10-14
+
+### Added
+- **Transparent proxy and portable cookies, per profile.** Two new checkboxes under Compatibility, both off by default. **Transparent proxy connection** turns on the browser's stronger proxy connection mode. It needs one `http://` proxy with a username and password, so any other proxy is refused at launch with a clear message (HTTP 400) instead of starting a browser with no network. **Portable cookies** lets a profile move to another machine with its logins. Only cookies saved while it is on are portable, so turn it on before logging in. Existing profiles get both settings switched off, and duplicating a profile copies them.
+
+### Changed
+- **Bundles the CloakBrowser 0.6.3 engine.** Humanized typing, mouse moves and scrolling follow measured human timing, humanized clicks reach popups inside scrolling panels, and humanized actions work on Playwright 1.64. A proxy exit in a country with no mapped language no longer fails the launch.
+
 ## [0.1.7] - 2026-10-11
 
 ### Fixed
