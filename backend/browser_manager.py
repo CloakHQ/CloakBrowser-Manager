@@ -340,6 +340,23 @@ _MAKE_GOOGLE_DEFAULT_JS = """() => {
 }"""
 
 
+
+def leave_dialogs_open(context: Any) -> None:
+    """Keep JS dialogs (alert, confirm, prompt, leave-page) open on every page.
+
+    Playwright answers a dialog that has no listener at once with "cancel", on every
+    page of this context — instant, no reading time, and it also hides the dialog
+    from the agent's own CDP client. A no-op listener leaves it for whoever drives
+    the page (the agent's dialog tool, or the person at the screen).
+    """
+
+    def keep(page: Any) -> None:
+        page.on("dialog", lambda dialog: None)
+
+    for page in list(getattr(context, "pages", []) or []):
+        keep(page)
+    context.on("page", keep)
+
 class ProfileBusyError(RuntimeError):
     """The profile's browser or on-disk state is in use by another operation."""
 
@@ -599,6 +616,7 @@ class BrowserManager:
                     if lic is not None:
                         raise lic
                     await self._wait_for_cdp(cdp_port, denial_path=denial_path)
+                    leave_dialogs_open(context)
                     break
                 except asyncio.CancelledError:
                     if context is not None:

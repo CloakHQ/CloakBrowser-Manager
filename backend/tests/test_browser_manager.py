@@ -737,3 +737,31 @@ def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
     manager.running.pop("p1")
     manager.cdp_client_detached(current)  # nor a browser that is gone altogether
     assert not current.download_rearm.is_set()
+
+
+def test_leave_dialogs_open_listens_on_every_page():
+    """Playwright auto-dismisses dialogs with no listener; the Manager adds one so they stay open."""
+    from backend.browser_manager import leave_dialogs_open
+
+    class FakePage:
+        def __init__(self):
+            self.events = {}
+
+        def on(self, name, fn):
+            self.events[name] = fn
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = [FakePage()]
+            self.events = {}
+
+        def on(self, name, fn):
+            self.events[name] = fn
+
+    ctx = FakeContext()
+    leave_dialogs_open(ctx)
+    assert "dialog" in ctx.pages[0].events
+    later = FakePage()
+    ctx.events["page"](later)
+    assert "dialog" in later.events
+    assert ctx.pages[0].events["dialog"](object()) is None
