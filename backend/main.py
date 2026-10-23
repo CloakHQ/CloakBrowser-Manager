@@ -12,8 +12,10 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import signal
 import struct
+import zlib
 import shutil
 import time
 import webbrowser
@@ -302,43 +304,106 @@ FRONTEND_DIR = bundle_dir() / "frontend" / "dist"
 # ---------------------------------------------------------------------------
 
 
-def _parse_kasmvnc_clipboard(data: bytes) -> str | None:
-    """Extract text/plain from KasmVNC BinaryClipboard (type 180).
+_CLIP_MIME_RE = re.compile(rb"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+;=\- ]*$")
+_CLIP_MAX_BUFFER = 16 * 1024 * 1024
+_CLIP_PARTIAL_TIMEOUT = 0.25  # seconds to wait for the rest of a held clipboard message
 
-    Format: type(1) + action(1) + flags(4) + entries...
-    Each entry: mime_len(u8) + mime(N) + data_len(u32 BE) + data(M)
+_CLIP_OK, _CLIP_PARTIAL, _CLIP_BAD = "ok", "partial", "bad"
+
+
+def _scan_kasmvnc_clipboard(data: bytes) -> tuple[str, int, str | None]:
+    """Classify the start of a frame as a KasmVNC BinaryClipboard (type 180) message.
+
+    Layout: type(1) count(1) then count entries of
+    flags(u32) mime_len(u8) mime data_len(u32 BE) data.
+    Returns (status, message_length, text/plain or None):
+    - ok: a complete, well-formed message; message_length bytes belong to it
+    - partial: well-formed so far but the frame ends early (the server flushes
+      per message, but large messages can span several WebSocket frames)
+    - bad: not a clipboard message, e.g. a continuation of a larger
+      FramebufferUpdate that merely starts with 0xB4; must be passed through
     """
-    if len(data) < 7:
-        return None
-    offset = 6  # skip type(1) + action(1) + flags(4)
-    while offset < len(data):
-        if offset + 1 > len(data):
-            break
+    if len(data) < 2 or data[0] != 180:
+        return _CLIP_BAD, 0, None
+    count = data[1]
+    if count == 0:
+        return _CLIP_BAD, 0, None
+    offset = 2
+    text = None
+    # A frame that ends before the first mime type is fully seen is too little evidence to
+    # hold back: it may be the tail of a FramebufferUpdate, and holding that back stalls
+    # the stream because the client never requests another update.
+    seen_entry = False
+    for _ in range(count):
+        if offset + 5 > len(data):
+            return (_CLIP_PARTIAL if seen_entry else _CLIP_BAD), 0, None
+        offset += 4  # flags
         mime_len = data[offset]
         offset += 1
-        if offset + mime_len > len(data):
-            break
-        mime_type = data[offset:offset + mime_len]
+        if mime_len == 0:
+            return _CLIP_BAD, 0, None
+        mime = data[offset:offset + mime_len]
+        if not _CLIP_MIME_RE.match(mime):
+            # a truncated mime is still checked on the bytes present
+            if len(mime) == mime_len or not _CLIP_MIME_PREFIX_RE.match(mime):
+                return _CLIP_BAD, 0, None
+        if offset + mime_len + 4 > len(data):
+            return (_CLIP_PARTIAL if seen_entry or len(mime) == mime_len else _CLIP_BAD), 0, None
+        seen_entry = True
         offset += mime_len
-        if offset + 4 > len(data):
-            break
         data_len = struct.unpack_from(">I", data, offset)[0]
         offset += 4
-        if mime_type == b"text/plain":
-            end = min(offset + data_len, len(data))
-            return data[offset:end].decode("utf-8", errors="replace")
+        if offset + data_len > len(data):
+            return _CLIP_PARTIAL, 0, None
+        if mime == b"text/plain" and text is None:
+            text = data[offset:offset + data_len].decode("utf-8", errors="replace")
         offset += data_len
+    return _CLIP_OK, offset, text
+
+
+_CLIP_MIME_PREFIX_RE = re.compile(rb"^[A-Za-z0-9!#$&^_.+;=/\- ]*$")
+
+
+def _find_embedded_clipboard(data: bytes) -> int | None:
+    """Find a clipboard message that starts in the middle of a frame.
+
+    KasmVNC can flush a clipboard message in the same WebSocket write as the tail
+    of a FramebufferUpdate. It is always the last thing written, so it must run to
+    the end of the frame (or continue into the next one). To avoid mistaking pixel
+    data for it, the first entry's mime type must be fully present and valid.
+    """
+    pos = data.find(b"\xb4", 1)
+    while pos != -1:
+        if pos + 7 <= len(data) and 1 <= data[pos + 1] <= 8:
+            mime_len = data[pos + 6]
+            end = pos + 7 + mime_len
+            if mime_len >= 3 and end + 4 <= len(data) and _CLIP_MIME_RE.match(data[pos + 7:end]):
+                status, length, _ = _scan_kasmvnc_clipboard(data[pos:])
+                if status == _CLIP_PARTIAL or (status == _CLIP_OK and pos + length == len(data)):
+                    return pos
+        pos = data.find(b"\xb4", pos + 1)
     return None
 
 
-def _build_server_cut_text(text: str) -> bytes:
-    """Build standard RFB ServerCutText (type 3) message.
+def _split_kasmvnc_clipboard(data: bytes) -> tuple[int, str | None] | None:
+    """Return (message_length, text) for a complete clipboard message, else None."""
+    status, length, text = _scan_kasmvnc_clipboard(data)
+    return (length, text) if status == _CLIP_OK else None
 
-    RFB spec mandates Latin-1 encoding for ServerCutText.
-    Characters outside Latin-1 (CJK, emoji, etc.) are replaced with '?'.
+
+def _build_server_cut_text(text: str) -> bytes:
+    """Build an RFB Extended Clipboard "Provide" ServerCutText (type 3) message.
+
+    Plain ServerCutText is Latin-1 only and would turn CJK/emoji into '?'.
+    noVNC >= 1.3 accepts the extended form, which carries UTF-8 text:
+    flags(u32: Provide|Text) + zlib(len(u32 BE) + utf8 + NUL), sent with a
+    negative length.
     """
-    text_bytes = text.encode("latin-1", errors="replace")
-    return struct.pack(">BxxxI", 3, len(text_bytes)) + text_bytes
+    raw = text.encode("utf-8", errors="replace") + b"\0"
+    payload = zlib.compress(struct.pack(">I", len(raw)) + raw)
+    flags = (1 << 28) | 1  # Provide action, text format
+    body = struct.pack(">I", flags) + payload
+    return struct.pack(">BxxxI", 3, (-len(body)) & 0xFFFFFFFF) + body
 
 
 # ---------------------------------------------------------------------------
@@ -1494,21 +1559,53 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
 
             async def vnc_to_client():
                 count = 0
+                pending = b""  # head of a clipboard message split across frames
                 try:
-                    async for msg in vnc_ws:
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(
+                                vnc_ws.recv(), _CLIP_PARTIAL_TIMEOUT if pending else None,
+                            )
+                        except asyncio.TimeoutError:
+                            # The rest never came; release what was held so the stream can't stall.
+                            logger.warning("VNC proxy [v->c]: flushing %d held bytes after timeout", len(pending))
+                            await websocket.send_bytes(pending)
+                            pending = b""
+                            continue
+                        except websockets.exceptions.ConnectionClosed:
+                            break
                         count += 1
                         if isinstance(msg, bytes) and len(msg) > 0:
-                            msg_type = msg[0]
-                            if msg_type == 180:
-                                # KasmVNC BinaryClipboard → convert to standard
+                            if pending:
+                                msg = pending + msg
+                                pending = b""
+                            status, clip_len, text = (
+                                _scan_kasmvnc_clipboard(msg) if msg[0] == 180 else (_CLIP_BAD, 0, None)
+                            )
+                            if status == _CLIP_BAD:
+                                emb = _find_embedded_clipboard(msg)
+                                if emb is not None:
+                                    logger.info("VNC proxy [v->c]: clipboard embedded at offset %d of %d-byte frame", emb, len(msg))
+                                    await websocket.send_bytes(msg[:emb])
+                                    msg = msg[emb:]
+                                    status, clip_len, text = _scan_kasmvnc_clipboard(msg)
+                            if status == _CLIP_PARTIAL and len(msg) < _CLIP_MAX_BUFFER:
+                                pending = msg
+                                continue
+                            if status == _CLIP_OK:
+                                # KasmVNC BinaryClipboard → convert to RFB Extended Clipboard
                                 # ServerCutText (type 3) so noVNC can handle it
-                                text = _parse_kasmvnc_clipboard(msg)
                                 if text:
                                     logger.info("VNC proxy [v->c]: clipboard %d chars", len(text))
                                     await websocket.send_bytes(_build_server_cut_text(text))
                                 else:
                                     logger.info("VNC proxy [v->c]: dropped type 180 (no text/plain)")
+                                rest = msg[clip_len:]
+                                if rest:
+                                    await websocket.send_bytes(rest)
                                 continue
+                            if msg[0] == 180:
+                                logger.warning("VNC proxy [v->c]: unparsed type-180 frame len=%d head=%s", len(msg), msg[:48].hex())
                             await websocket.send_bytes(msg)
                         elif isinstance(msg, bytes):
                             await websocket.send_bytes(msg)
