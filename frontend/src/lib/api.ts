@@ -59,6 +59,43 @@ export interface Profile {
   last_error: LaunchDenial | null;
 }
 
+export type ProxyVerdict = "good" | "slow" | "handshake" | "unmeasured";
+
+/** One native profile's exit line, judged against what a page needs to paint. */
+export interface ProxyHealthRow {
+  profile: string;
+  profile_id: string | null;
+  status: string;
+  proxy: string;
+  server: string | null;
+  ip: string | null;
+  family: "v4" | "v6" | null;
+  drifted: string[];
+  country: string | null;
+  city: string | null;
+  /** Timezone the exit reports. */
+  timezone: string | null;
+  /** Timezone the profile is set to. */
+  profile_timezone: string | null;
+  /** False when the exit sits in a different clock than the profile: the mismatch a login notices. */
+  place_match: boolean | null;
+  network: string | null;
+  kbps: number | null;
+  tls_sec: number | null;
+  /** kbps / expectation. 1.0 is exactly the floor. */
+  ratio: number | null;
+  verdict: ProxyVerdict;
+  measured_at: string | null;
+  reputation: string | null;
+}
+
+export interface ProxyHealth {
+  expectation: { kbps: number; tls_sec: number };
+  at: string;
+  /** Worst first. */
+  profiles: ProxyHealthRow[];
+}
+
 export interface LaunchDenial {
   message: string;
   reason: "seat_limit" | "license";
@@ -206,6 +243,11 @@ export const api = {
     request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
 
   listProfiles: () => request<Profile[]>("/api/profiles"),
+
+  proxyHealth: () => request<ProxyHealth>("/api/native/proxy-health"),
+
+  /** Raise a running profile's tab and window: the browser it already owns. */
+  focusProfile: (id: string) => request<{ ok: boolean; port: number; tab?: string; url?: string }>(`/api/profiles/${id}/focus`, { method: "POST" }),
 
   reorderProfiles: (ids: string[]) =>
     request<{ ok: boolean }>("/api/profiles/reorder", {

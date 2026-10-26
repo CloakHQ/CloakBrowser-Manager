@@ -4,7 +4,7 @@ import type { SystemStatus } from "../lib/api";
 const TIER_LABEL: Record<string, string> = {
   pro: "Pro",
   free: "Free key",
-  keyless: "Free (keyless)",
+  keyless: "🟢 Keyless",
 };
 
 const TIER_COLOR: Record<string, string> = {
@@ -20,7 +20,7 @@ export function SystemStatusBadge({ status }: { status: SystemStatus | null }) {
   const tier = status.license_tier || "keyless";
   const title =
     tier === "keyless"
-      ? "No license key set. Running the free keyless build. Open Settings to add a key for the latest Pro build."
+      ? "Save point: keyless, many windows. Do not put the Pro key back. One seat, then the windows die."
       : `${TIER_LABEL[tier] ?? tier} license — running ${status.binary_version}`;
 
   return (

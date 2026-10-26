@@ -5,6 +5,7 @@ import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemSt
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
+import { NativeProfileViewer } from "./components/NativeProfileViewer";
 import { NativeWindowStatus } from "./components/NativeWindowStatus";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
@@ -12,6 +13,7 @@ import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { ProxySpeedBadge } from "./components/ProxySpeedBadge";
 import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
@@ -122,7 +124,20 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     api.checkUpdate().then(setUpdateInfo).catch(() => setUpdateInfo(null));
   }, []);
 
+  // Bring a profile's window forward. The Manager raises its tab over CDP and activates the app; a stopped profile
+  // has nothing to raise, so the selection stays on it instead of failing silently.
+  const focusProfile = useCallback(async (id: string) => {
+    try {
+      await api.focusProfile(id);
+    } catch {
+      setSelectedId(id);
+    }
+  }, []);
+
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
+  // The corner badge speaks the profile's native name (facebook-013), not the Manager's display title.
+  const selectedNativeName =
+    selected?.launch_args.find((arg) => arg.startsWith("--native-profile="))?.slice("--native-profile=".length) ?? null;
 
   // Switching profiles clears the banner (like X); a post-handshake denial
   // (profile.last_error, arriving via the poll) shows only while its own
@@ -247,6 +262,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
   return (
     <div className="h-screen flex flex-col">
+      <ProxySpeedBadge nativeName={selectedNativeName} sidebarOpen={sidebarOpen} />
       {settingsOpen && (
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}
@@ -269,6 +285,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             onSelect={handleSelect}
             onNew={handleNew}
             onReorder={reorder}
+            onFocus={focusProfile}
           />
         </div>
       )}
@@ -341,37 +358,15 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             ((systemStatus?.license_tier ?? "keyless") === "keyless" ? (
               <div className="flex items-center justify-center h-full px-6">
                 <div className="max-w-sm text-center">
-                  <p className="text-sm font-medium text-gray-200">No license key set</p>
-                  <p className="mt-1.5 text-sm text-gray-500">
-                    You're running the free keyless build. Add a key to run the
-                    latest Pro build.
+                  <p className="text-sm font-medium text-gray-200">🟢 Keyless. This is the save point.</p>
+                  <p className="mt-1.5 text-sm text-gray-400">
+                    Many windows. No seat cap. Leave it like this.
                   </p>
-                  <div className="mt-5 flex flex-col items-center gap-2">
-                    <button
-                      onClick={() => setSettingsOpen(true)}
-                      className="btn-primary w-56"
-                    >
-                      Enter a key in Settings
-                    </button>
-                    <a
-                      href="https://cloakbrowser.dev/free"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-secondary w-56"
-                    >
-                      Get a free key
-                    </a>
-                    <a
-                      href="https://cloakbrowser.dev/#pricing"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-gray-500 hover:text-gray-300"
-                    >
-                      See Pro plans &rarr;
-                    </a>
-                  </div>
+                  <p className="mt-3 text-sm text-amber-300">
+                    🟠 Do not put the Pro key back. One seat, then the windows die.
+                  </p>
                   <p className="mt-6 text-xs text-gray-600">
-                    Or select a profile or create a new one to continue keyless.
+                    Pick a profile. Open as many as you want.
                   </p>
                 </div>
               </div>
@@ -410,7 +405,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           )}
 
           {view === "view" && selected && selected.status === "running" && (
-            selected.viewer_mode === "vnc" ? (
+            selected.launch_args.some((arg) => arg.startsWith("--native-profile=")) ? (
+              <NativeProfileViewer profile={selected} />
+            ) : selected.viewer_mode === "vnc" ? (
               <ProfileViewer
                 key={selected.id}
                 profileId={selected.id}

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import logging
 import os
+import shutil
 import socket
 import time
 import urllib.request
@@ -26,6 +28,15 @@ from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
+
+
+class ProfileNotRunningError(RuntimeError):
+    """Raised when an action needs a browser that is not up."""
+
+BITWARDEN_EXTENSION_ID = "chfhbihjjbdiggdbioadkpofibadomhl"
+BITWARDEN_SEED_PROFILE = "bw-g"
+CLOAK_HOME = Path(os.getenv("CLOAK_HOME", Path.home() / ".cloakbrowser"))
+DEFAULT_BITWARDEN_EXTENSION_PATH = CLOAK_HOME / "extensions" / "bitwarden" / "current"
 
 
 UPGRADE_URL = "https://cloakbrowser.dev/#pricing"
@@ -92,6 +103,153 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+def _resolve_bitwarden_seed_dir() -> Path:
+    seed_name = os.getenv("BITWARDEN_SEED_PROFILE", BITWARDEN_SEED_PROFILE)
+    operator_file = CLOAK_HOME / "operator.json"
+    if operator_file.exists():
+        try:
+            op_id = json.loads(operator_file.read_text()).get("id")
+            if op_id:
+                seed_name = f"bw-{op_id}"
+        except Exception:
+            pass
+    seed_dir = CLOAK_HOME / "seeds" / seed_name
+    if seed_dir.exists():
+        return seed_dir
+    return CLOAK_HOME / "profiles" / seed_name
+
+
+def _resolve_native_profile_dir(profile_name: str) -> Path:
+    profiles_root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", CLOAK_HOME / "profiles"))
+    flat = profiles_root / profile_name
+    if flat.exists():
+        return flat
+    group = profile_name.split("-")[0]
+    return profiles_root / group / profile_name
+
+
+def _ensure_bitwarden_defaults(user_data_dir: Path, extension_paths: list[str] | None = None) -> list[str]:
+    """Ensure every profile has the Bitwarden extension loaded and seeded by default."""
+    paths = list(extension_paths or [])
+    if DEFAULT_BITWARDEN_EXTENSION_PATH.exists():
+        bw_str = str(DEFAULT_BITWARDEN_EXTENSION_PATH)
+        if bw_str not in paths:
+            paths.insert(0, bw_str)
+
+    seed_dir = _resolve_bitwarden_seed_dir()
+    extension_id = os.getenv("BITWARDEN_EXTENSION_ID", BITWARDEN_EXTENSION_ID)
+    if not seed_dir.exists() or user_data_dir.resolve() == seed_dir.resolve():
+        return paths
+
+    for rel in (
+        Path("Default") / "Local Extension Settings" / extension_id,
+        Path("Default") / "Managed Extension Settings" / extension_id,
+    ):
+        src = seed_dir / rel
+        dst = user_data_dir / rel
+        if src.exists() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            (dst / "LOCK").unlink(missing_ok=True)
+
+    seed_preferences = seed_dir / "Default" / "Secure Preferences"
+    target_preferences = user_data_dir / "Default" / "Secure Preferences"
+    if seed_preferences.exists():
+        try:
+            seed = json.loads(seed_preferences.read_text())
+            registration = seed.get("extensions", {}).get("settings", {}).get(extension_id)
+            if registration:
+                target_preferences.parent.mkdir(parents=True, exist_ok=True)
+                target = json.loads(target_preferences.read_text()) if target_preferences.exists() else {}
+                target.setdefault("extensions", {}).setdefault("settings", {})[extension_id] = registration
+                temporary = target_preferences.with_suffix(".tmp")
+                temporary.write_text(json.dumps(target, separators=(",", ":")))
+                temporary.replace(target_preferences)
+        except Exception as exc:
+            logger.debug("Bitwarden Secure Preferences sync skipped for %s: %s", user_data_dir, exc)
+
+    return paths
+
+
+async def _auto_unlock_bitwarden_context(context: Any) -> None:
+    """Restore Bitwarden session and auto-unlock local keys from ~/.cloakbrowser/secrets/bw-session.json."""
+    session_file = CLOAK_HOME / "secrets" / "bw-session.json"
+    if not session_file.exists():
+        return
+    try:
+        session_payload = json.loads(session_file.read_text())
+        if not isinstance(session_payload, dict) or "session-key" not in session_payload:
+            return
+        local_payload: dict[str, Any] = {
+            "global_vaultBrowserDefaultPasswordManagerPrompt_defaultPasswordManagerPromptDismissed": {"__json__": True, "value": "true"},
+            "global_vaultBrowserIntroCarousel_introCarouselDismissed": {"__json__": True, "value": "true"},
+        }
+        for key, entry in session_payload.items():
+            if key.startswith("user_") and key.endswith("_crypto_userKey") and isinstance(entry, dict):
+                user_id = key[len("user_"):-len("_crypto_userKey")]
+                parsed = json.loads(entry.get("value", "{}"))
+                key_b64 = parsed.get("keyB64")
+                if user_id and key_b64:
+                    local_payload[f"{user_id}_user_auto"] = {"__json__": True, "value": json.dumps(key_b64)}
+                    local_payload[f"user_{user_id}_vaultTimeoutSettings_vaultTimeout"] = {"__json__": True, "value": json.dumps("never")}
+                    local_payload[f"user_{user_id}_vaultTimeoutSettings_vaultTimeoutAction"] = {"__json__": True, "value": json.dumps("lock")}
+
+        ext_id = os.getenv("BITWARDEN_EXTENSION_ID", BITWARDEN_EXTENSION_ID)
+        workers = [w for w in getattr(context, "service_workers", []) if ext_id in w.url]
+        if workers:
+            await workers[0].evaluate(
+                """async ({ s, l }) => {
+                    if (l) await globalThis.chrome.storage.local.set(l);
+                    await globalThis.chrome.storage.session.set(s);
+                }""",
+                {"s": session_payload, "l": local_payload},
+            )
+    except Exception as exc:
+        logger.debug("Bitwarden auto-unlock in Manager context skipped: %s", exc)
+
+
+def _repair_native_extension_registration(profile_name: str) -> bool:
+    """Restore Bitwarden's enabled registration from the authenticated seed profile."""
+    seed_dir = _resolve_bitwarden_seed_dir()
+    target_dir = _resolve_native_profile_dir(profile_name)
+    if target_dir.resolve() == seed_dir.resolve():
+        return False
+
+    extension_id = os.getenv("BITWARDEN_EXTENSION_ID", BITWARDEN_EXTENSION_ID)
+    seed_preferences = seed_dir / "Default" / "Secure Preferences"
+    target_preferences = target_dir / "Default" / "Secure Preferences"
+    if not seed_preferences.exists():
+        return False
+
+    seed = json.loads(seed_preferences.read_text())
+    registration = seed.get("extensions", {}).get("settings", {}).get(extension_id)
+    if not registration:
+        return False
+
+    target_preferences.parent.mkdir(parents=True, exist_ok=True)
+    target = json.loads(target_preferences.read_text()) if target_preferences.exists() else {}
+    target.setdefault("extensions", {}).setdefault("settings", {})[extension_id] = registration
+    temporary = target_preferences.with_suffix(".tmp")
+    temporary.write_text(json.dumps(target, separators=(",", ":")))
+    if target_preferences.exists():
+        temporary.chmod(target_preferences.stat().st_mode & 0o777)
+    temporary.replace(target_preferences)
+    return True
+
+
+def _native_profile_running(processes: str, profile_name: str) -> bool:
+    """True when a process is already running this profile's directory.
+
+    Profiles live in a group folder (profiles/<group>/<name>) since the grouped layout, but an older install, or a
+    profile created before the move, still runs from the flat path (profiles/<name>). Accept either, so a running
+    browser is never launched a second time against the same directory.
+    """
+    profile_path = _resolve_native_profile_dir(profile_name)
+    root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", CLOAK_HOME / "profiles"))
+    needles = {f"--user-data-dir={profile_path}", f"--user-data-dir={root / profile_name}"}
+    return any(needle in line for line in processes.splitlines() for needle in needles)
 
 
 def _validate_transparent_proxy(url: str | None) -> None:
@@ -321,6 +479,23 @@ _MAKE_GOOGLE_DEFAULT_JS = """() => {
 }"""
 
 
+
+def leave_dialogs_open(context: Any) -> None:
+    """Keep JS dialogs (alert, confirm, prompt, leave-page) open on every page.
+
+    Playwright answers a dialog that has no listener at once with "cancel", on every
+    page of this context — instant, no reading time, and it also hides the dialog
+    from the agent's own CDP client. A no-op listener leaves it for whoever drives
+    the page (the agent's dialog tool, or the person at the screen).
+    """
+
+    def keep(page: Any) -> None:
+        page.on("dialog", lambda dialog: None)
+
+    for page in list(getattr(context, "pages", []) or []):
+        keep(page)
+    context.on("page", keep)
+
 class ProfileBusyError(RuntimeError):
     """The profile's browser or on-disk state is in use by another operation."""
 
@@ -328,10 +503,12 @@ class ProfileBusyError(RuntimeError):
 @dataclass
 class RunningProfile:
     profile_id: str
-    context: Any  # Playwright BrowserContext
+    context: Any | None  # Playwright BrowserContext; None for registry-launched profiles
     cdp_port: int
     display: int | None = None
     ws_port: int | None = None
+    process: asyncio.subprocess.Process | None = None
+    native: bool = False
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
     download_task: Any = None  # asyncio.Task capturing this browser's downloads
@@ -469,6 +646,17 @@ class BrowserManager:
             # status poll doesn't keep showing an old "out of seats" message.
             self._last_errors.pop(profile_id, None)
 
+        native_profile = self._native_profile_name(profile)
+        if native_profile:
+            try:
+                return await self._launch_native(
+                    profile_id, native_profile, self._start_urls(profile)
+                )
+            except BaseException:
+                async with self._lock:
+                    self._launching.discard(profile_id)
+                raise
+
         display: int | None = None
         ws_port: int | None = None
         cdp_port: int | None = None
@@ -528,6 +716,9 @@ class BrowserManager:
             if profile.get("transparent_proxy"):
                 _validate_transparent_proxy(proxy)
 
+            extension_paths = _ensure_bitwarden_defaults(
+                user_data_dir, profile.get("extension_paths") or []
+            )
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
                 "headless": False,
@@ -539,7 +730,7 @@ class BrowserManager:
                 "human_preset": profile.get("human_preset", "default"),
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
-                "extension_paths": profile.get("extension_paths") or [],
+                "extension_paths": extension_paths,
                 "license_key": self.license_key,
                 "release_channel": self.release_channel,
             }
@@ -569,6 +760,8 @@ class BrowserManager:
                     if lic is not None:
                         raise lic
                     await self._wait_for_cdp(cdp_port, denial_path=denial_path)
+                    leave_dialogs_open(context)
+                    await _auto_unlock_bitwarden_context(context)
                     break
                 except asyncio.CancelledError:
                     if context is not None:
@@ -703,6 +896,195 @@ class BrowserManager:
             finally:
                 self._release_stopping(profile_id)
             raise
+
+    async def focus(self, profile_id: str, profile: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Bring a running profile's tab, and its window, to the front.
+
+        CDP `Page.bringToFront` raises the tab inside Chromium and Chromium raises the window that holds it; on macOS the
+        app is then activated so the window is not behind Terminal. Best effort: a composed window manager may refuse,
+        and that must not fail the request.
+        """
+        running = self.running.get(profile_id)
+        # After a Manager restart the browser is still up but no longer in `running`. The record names the native
+        # profile, and the record's cdp port is where that browser listens — so focus keeps working across restarts.
+        port = running.cdp_port if running else None
+        if port is None:
+            native = self._native_profile_name(profile or {})
+            port = self._native_cdp_port(native) if native else None
+        if port is None:
+            raise ProfileNotRunningError(f"Profile {profile_id} is not running")
+        try:
+            self._cdp_targets(port)
+        except Exception as exc:
+            raise ProfileNotRunningError(f"Nothing is listening on CDP {port} for {profile_id}") from exc
+        page: dict[str, Any] = {}
+        try:
+            targets = await asyncio.to_thread(self._cdp_targets, port)
+            page = next((t for t in targets if t.get("type") == "page"), {}) or {}
+            url = page.get("webSocketDebuggerUrl")
+            if url:
+                import websockets
+
+                async with websockets.connect(url, max_size=None) as ws:
+                    await ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
+                    await asyncio.wait_for(ws.recv(), timeout=3)
+        except Exception as exc:  # a missing page or a closed socket is not an error to the caller
+            logger.debug("focus: CDP bringToFront skipped for %s: %s", profile_id, exc)
+        if self.runtime.host_os == "macos":
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["osascript", "-e", 'tell application "Chromium" to activate'],
+                    capture_output=True,
+                    timeout=3,
+                )
+            except Exception as exc:
+                logger.debug("focus: activate skipped: %s", exc)
+        return {"ok": True, "port": port, "tab": page.get("title"), "url": page.get("url")}
+
+    @staticmethod
+    def _cdp_targets(port: int) -> list[dict[str, Any]]:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3) as res:
+            return json.loads(res.read().decode())
+
+    @staticmethod
+    def _native_profile_name(profile: dict[str, Any]) -> str | None:
+        for arg in profile.get("launch_args") or []:
+            if arg.startswith("--native-profile="):
+                return arg.partition("=")[2] or None
+        return None
+
+    @staticmethod
+    def _start_urls(profile: dict[str, Any]) -> list[str]:
+        return [
+            arg.partition("=")[2]
+            for arg in profile.get("launch_args") or []
+            if arg.startswith("--start-url=") and arg.partition("=")[2]
+        ]
+
+    @staticmethod
+    def _native_cdp_port(profile_name: str) -> int:
+        """The profile's own port, saved in its cloak.json record; the hash only as a fallback."""
+        root = Path(os.getenv("CLOAK_NATIVE_PROFILES_ROOT", Path.home() / ".cloakbrowser/profiles"))
+        # profiles/<group>/<name> (group = first word of the name), or the older flat layout
+        record = root / profile_name / "cloak.json"
+        if not record.exists():
+            record = root / profile_name.split("-")[0] / profile_name / "cloak.json"
+        try:
+            port = json.loads(record.read_text()).get("cdpPort")
+            if isinstance(port, int):
+                return port
+        except (OSError, ValueError):
+            pass
+        digest = hashlib.sha256(profile_name.encode()).digest()
+        return 9400 + (int.from_bytes(digest[:2], "big") % 400)
+
+    async def _launch_native(
+        self,
+        profile_id: str,
+        profile_name: str,
+        start_urls: list[str],
+    ) -> RunningProfile:
+        await self._wait_for_native_profile_exit(profile_name)
+        launcher = os.getenv(
+            "NATIVE_CLOAK_LAUNCHER",
+            str(Path.home() / ".local/bin/cloak-bitwarden-profile"),
+        )
+        cdp_port = self._native_cdp_port(profile_name)
+        repaired_extension = _repair_native_extension_registration(profile_name)
+        if repaired_extension:
+            logger.info("Restored Bitwarden extension registration for %s", profile_name)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                launcher,
+                "open",
+                profile_name,
+                *start_urls,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await self._wait_for_port(cdp_port, process)
+            running = RunningProfile(
+                profile_id=profile_id,
+                context=None,
+                cdp_port=cdp_port,
+                process=process,
+                native=True,
+            )
+            async with self._lock:
+                self.running[profile_id] = running
+                self._launching.discard(profile_id)
+            asyncio.create_task(self._watch_native(profile_id, process))
+            logger.info("Launched native profile %s on CDP port %d", profile_name, cdp_port)
+            return running
+        except BaseException:
+            async with self._lock:
+                self._launching.discard(profile_id)
+            raise
+
+    @staticmethod
+    async def _wait_for_native_profile_exit(
+        profile_name: str,
+        timeout: float = 10,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            process = await asyncio.create_subprocess_exec(
+                "/bin/ps",
+                "ax",
+                "-o",
+                "command=",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            if not _native_profile_running(stdout.decode(errors="replace"), profile_name):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"Native profile processes did not exit: {profile_name}"
+                )
+            await asyncio.sleep(0.25)
+
+    @staticmethod
+    async def _wait_for_port(
+        port: int,
+        process: asyncio.subprocess.Process,
+        timeout: float = 45,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if process.returncode is not None:
+                error = await process.stderr.read() if process.stderr else b""
+                raise RuntimeError(error.decode().strip() or "Native launcher exited")
+            try:
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                await writer.wait_closed()
+                return
+            except OSError:
+                await asyncio.sleep(0.25)
+        process.terminate()
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            _, stderr = await process.communicate()
+        detail = stderr.decode(errors="replace").strip()
+        suffix = f": {detail[-2000:]}" if detail else ""
+        raise TimeoutError(f"Native profile CDP port {port} did not open{suffix}")
+
+    async def _watch_native(
+        self,
+        profile_id: str,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        await process.wait()
+        async with self._lock:
+            current = self.running.get(profile_id)
+            if current and current.process is process:
+                self.running.pop(profile_id, None)
 
     async def _ensure_search_engine(
         self, profile_id: str, user_data_dir: Path
@@ -891,7 +1273,7 @@ class BrowserManager:
                     "Profile %s: could not reconcile downloads on stop: %s",
                     running.profile_id, exc,
                 )
-        if close_context:
+        if close_context and running.context is not None:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:
             await self.vnc.stop_vnc(running.display)
@@ -966,9 +1348,17 @@ class BrowserManager:
 
         logger.info("Stopping profile %s", profile_id)
         try:
+            if running.native and running.process:
+                running.process.terminate()
+                try:
+                    await asyncio.wait_for(running.process.wait(), timeout=10)
+                except TimeoutError:
+                    running.process.kill()
+                    await running.process.wait()
+                return
             # Final preview capture while the context is still alive (the on-close
             # path can't screenshot — the browser is already gone by then).
-            if running.capture_preview:
+            if running.capture_preview and running.context is not None:
                 try:
                     await self._capture_screenshot(running)
                 except Exception as exc:
@@ -1046,11 +1436,14 @@ class BrowserManager:
             "viewer_mode": self.runtime.viewer_mode,
             "vnc_ws_port": running.ws_port if running else None,
             "display": (
-                f":{running.display}"
-                if running and running.display is not None
+                "native-macos" if running and running.native is True
+                else f":{running.display}" if running and running.display is not None
                 else None
             ),
             "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+            "direct_cdp_url": (
+                f"http://127.0.0.1:{running.cdp_port}" if running else None
+            ),
             # Set when the last launch closed on a license denial (post-handshake
             # out-of-seats / bad key). Only meaningful while stopped; cleared on
             # the next launch. {message, reason, upgrade_url?} or None.
@@ -1184,7 +1577,11 @@ class BrowserManager:
             elif gpu_family == "intel":
                 args.append("--fingerprint-gpu-vendor=Intel")
 
-        if profile.get("allow_3p_cookies", False):
+        # A login often opens another window (Clerk, Sumsub, Google) and sets a
+        # third-party cookie. Let that window open. The agent closes it later
+        # if it should. An explicit allow_3p_cookies=False still turns cookies off.
+        args.append("--disable-popup-blocking")
+        if profile.get("allow_3p_cookies", True):
             args.append("--fingerprint-allow-3p-cookies")
         if profile.get("transparent_proxy", False):
             args.append("--fingerprint-transparent-proxy")

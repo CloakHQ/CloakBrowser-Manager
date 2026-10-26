@@ -39,6 +39,7 @@ load_env_file()
 
 from . import artifacts
 from . import database as db
+from . import native_health
 from cloakbrowser.license import CloakBrowserLicenseError
 
 from .browser_manager import (
@@ -493,6 +494,9 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    synced = db.sync_native_profiles()
+    if synced:
+        logger.info("Synced %d native profiles", synced)
     # Repair pass. A crash leaves bytes with no row, and the file-chooser view out of step
     # with the database. The bookmarks file is rebuilt once at the end rather than once per
     # profile, since each rebuild reads the whole profile list.
@@ -602,6 +606,22 @@ async def create_profile(req: ProfileCreate):
 async def reorder_profiles(req: ReorderRequest):
     db.reorder_profiles(req.ordered_ids)
     return {"ok": True}
+
+
+@app.post("/api/native/sync")
+async def sync_native():
+    """Reload native profiles from the registry (built by `cloak registry`). No restart needed."""
+    return {"synced": db.sync_native_profiles()}
+
+
+@app.get("/api/native/proxy-health")
+async def native_proxy_health():
+    """Exit speed per native profile and the expectation each is judged against.
+
+    Read-only: it reads the shared proxy list and the profile records, never a browser and never a secret. The badge in
+    the corner polls it; `cloak proxy check <profile> --speed` is what refreshes a measurement.
+    """
+    return native_health.proxy_health(db.list_profiles())
 
 
 @app.get("/api/profiles/{profile_id}", response_model=ProfileResponse)
@@ -1021,7 +1041,11 @@ async def launch_profile(profile_id: str):
         runtime_mode=browser_mgr.runtime.runtime_mode,
         viewer_mode=browser_mgr.runtime.viewer_mode,
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}" if running.display is not None else None,
+        display=(
+            "native-macos" if running.native
+            else f":{running.display}" if running.display is not None
+            else None
+        ),
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -1576,6 +1600,18 @@ async def cdp_info(profile_id: str):
         "usage": "playwright.chromium.connect_over_cdp('http://<host>/api/profiles/"
         + profile_id + "/cdp')",
     }
+
+
+@app.post("/api/profiles/{profile_id}/focus")
+async def focus_profile(profile_id: str):
+    """Bring a running profile's tab and window to the front."""
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    try:
+        return await browser_mgr.focus(profile_id, profile)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/profiles/{profile_id}/screenshot")

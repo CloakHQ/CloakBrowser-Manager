@@ -87,6 +87,9 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
 
         <div className="space-y-4 p-4">
           <div>
+            <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              🟠 Save point is keyless. Do not paste a Pro key. One seat, then Chromium quits.
+            </div>
             <label className="label">CloakBrowser license key</label>
             <input
               className="input font-mono"
@@ -98,20 +101,11 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               placeholder={
                 current?.license_key_set
                   ? `Current: ${current.license_key_masked ?? "set"} — type to replace`
-                  : "cb_… (leave empty to run the free keyless build)"
+                  : "Leave this empty. Keyless is the working save point."
               }
             />
             <p className="mt-1 text-xs text-gray-500">
-              One key per Manager instance — every profile shares its seat pool.{" "}
-              <a
-                href="https://cloakbrowser.dev/free"
-                target="_blank"
-                rel="noreferrer"
-                className="text-accent hover:underline"
-              >
-                Get a free key
-              </a>
-              .
+              🟢 Many windows, no seat cap. A Pro key puts the cap back.
             </p>
           </div>
 

@@ -20,8 +20,8 @@ export function useProfiles() {
 
   useEffect(() => {
     refresh();
-    // Poll for status changes every 3 seconds
-    const interval = setInterval(refresh, 3000);
+    // Poll for status changes every 1.5 s: a launch, a stop and a check all land inside one glance.
+    const interval = setInterval(refresh, 1500);
     return () => clearInterval(interval);
   }, [refresh]);
 

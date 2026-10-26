@@ -1,4 +1,4 @@
-import { Plus, Search, Monitor } from "lucide-react";
+import { Plus, Search, Monitor, Maximize2 } from "lucide-react";
 import { useState } from "react";
 import {
   DndContext,
@@ -24,6 +24,8 @@ interface ProfileListProps {
   onSelect: (id: string) => void;
   onNew: () => void;
   onReorder: (orderedIds: string[]) => void;
+  /** Raise the profile's window: the browser it owns, not a new tab. */
+  onFocus: (id: string) => void;
 }
 
 interface RowProps {
@@ -31,52 +33,92 @@ interface RowProps {
   selected: boolean;
   draggable: boolean;
   onSelect: (id: string) => void;
+  onFocus: (id: string) => void;
 }
 
-function SortableProfileRow({ profile, selected, draggable, onSelect }: RowProps) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: profile.id, disabled: !draggable });
-
+/** The profile's own picture: its last live frame while it runs, its initial when it is stopped or has no frame yet. */
+function ProfileAvatar({ profile }: { profile: Profile }) {
+  const [failed, setFailed] = useState(false);
+  const running = profile.status === "running";
+  // One URL per 10 s, so the frame is live without asking for a JPEG on every poll.
+  const src = `/api/profiles/${profile.id}/screenshot?t=${Math.floor(Date.now() / 10000)}`;
+  const initials = profile.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase();
   return (
-    <button
-      ref={setNodeRef}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
-      onClick={() => onSelect(profile.id)}
-      {...attributes}
-      {...listeners}
-      className={`w-full text-left px-3 py-2.5 rounded-md mb-1 transition-colors ${
-        draggable ? "cursor-grab active:cursor-grabbing" : ""
-      } ${isDragging ? "opacity-50" : ""} ${
-        selected
-          ? "bg-surface-3 border border-border-hover"
-          : "hover:bg-surface-2 border border-transparent"
-      }`}
-    >
-      <div className="flex items-center gap-2">
-        <StatusIndicator status={profile.status} />
-        <span className="text-sm font-medium truncate">{profile.name}</span>
-      </div>
-      <div className="flex items-center gap-2 mt-1 ml-4">
-        {profile.proxy && <span className="text-xs text-gray-500">Proxy</span>}
-      </div>
-      {profile.tags.length > 0 && (
-        <div className="flex gap-1 mt-1.5 ml-4 flex-wrap">
-          {profile.tags.map((t) => (
-            <span
-              key={t.tag}
-              className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-4 text-gray-400"
-              style={t.color ? { backgroundColor: `${t.color}20`, color: t.color } : undefined}
-            >
-              {t.tag}
-            </span>
-          ))}
-        </div>
+    <span className="relative block h-8 w-8 shrink-0 overflow-hidden rounded-md border border-border bg-surface-4">
+      {running && !failed ? (
+        <img src={src} alt="" className="h-full w-full object-cover" draggable={false} onError={() => setFailed(true)} />
+      ) : (
+        <span className="flex h-full w-full items-center justify-center text-[11px] font-medium text-gray-500">
+          {initials}
+        </span>
       )}
-    </button>
+    </span>
   );
 }
 
-export function ProfileList({ profiles, selectedId, onSelect, onNew, onReorder }: ProfileListProps) {
+function SortableProfileRow({ profile, selected, draggable, onSelect, onFocus }: RowProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: profile.id, disabled: !draggable });
+  const running = profile.status === "running";
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={`relative w-full rounded-md mb-1 transition-colors ${
+        draggable ? "cursor-grab active:cursor-grabbing" : ""
+      } ${isDragging ? "opacity-50" : ""} ${
+        selected ? "bg-surface-3 border border-border-hover" : "hover:bg-surface-2 border border-transparent"
+      }`}
+    >
+      <button
+        onClick={() => onSelect(profile.id)}
+        {...attributes}
+        {...listeners}
+        className="w-full text-left px-3 py-2.5 pr-[4.75rem]"
+      >
+        <div className="flex items-center gap-2">
+          <StatusIndicator status={profile.status} />
+          <span className="text-sm font-medium truncate">{profile.name}</span>
+        </div>
+        {profile.tags.length > 0 && (
+          <div className="flex gap-1 mt-1.5 ml-4 flex-wrap">
+            {profile.tags.map((t) => (
+              <span
+                key={t.tag}
+                className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-4 text-gray-400"
+                style={t.color ? { backgroundColor: `${t.color}20`, color: t.color } : undefined}
+              >
+                {t.tag}
+              </span>
+            ))}
+          </div>
+        )}
+      </button>
+
+      {/* the picture sits at the right of the row; the raise control only exists while there is a window to raise */}
+      <div className="absolute right-2 top-2 flex items-center gap-1">
+        {running && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onFocus(profile.id);
+            }}
+            title="Bring this profile's window to the front"
+            aria-label={`Bring ${profile.name} to the front`}
+            className="rounded p-1 text-gray-500 hover:bg-surface-4 hover:text-gray-200"
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+          </button>
+        )}
+        <ProfileAvatar profile={profile} />
+      </div>
+    </div>
+  );
+}
+
+export function ProfileList({ profiles, selectedId, onSelect, onNew, onReorder, onFocus }: ProfileListProps) {
   const [search, setSearch] = useState("");
 
   const filtered = profiles.filter((p) =>
@@ -141,6 +183,7 @@ export function ProfileList({ profiles, selectedId, onSelect, onNew, onReorder }
           <SortableContext items={filtered.map((p) => p.id)} strategy={verticalListSortingStrategy}>
             {filtered.map((profile) => (
               <SortableProfileRow
+                onFocus={onFocus}
                 key={profile.id}
                 profile={profile}
                 selected={selectedId === profile.id}

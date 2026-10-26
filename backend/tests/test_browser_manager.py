@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from backend.browser_manager import (
+    BITWARDEN_EXTENSION_ID,
     _init_profile_defaults,
     _normalize_proxy,
+    _native_profile_running,
+    _repair_native_extension_registration,
     _validate_proxy,
     _validate_transparent_proxy,
     BrowserManager,
@@ -190,7 +193,17 @@ def test_build_args_screen():
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
     # Docker software rendering + runtime platform.
-    assert len(args) == 2
+    # Popups and third-party cookies stay on so a login window can open.
+    assert "--use-angle=swiftshader" in args
+    assert "--fingerprint-platform=windows" in args
+    assert "--disable-popup-blocking" in args
+    assert "--fingerprint-allow-3p-cookies" in args
+
+
+def test_build_args_can_turn_third_party_cookies_off():
+    args = _mgr._build_fingerprint_args({"allow_3p_cookies": False})
+    assert "--disable-popup-blocking" in args
+    assert "--fingerprint-allow-3p-cookies" not in args
 
 
 def test_native_build_args_do_not_force_software_gl():
@@ -229,6 +242,43 @@ def test_launch_args_none_no_effect():
     base_count = len(args)
     args += profile.get("launch_args") or []
     assert len(args) == base_count
+
+
+def test_repair_native_extension_registration_clears_disabled_state(tmp_path, monkeypatch):
+    profiles = tmp_path / "profiles"
+    seed = profiles / "bitwarden-auth-seed" / "Default"
+    target = profiles / "outlook-out-003" / "Default"
+    seed.mkdir(parents=True)
+    target.mkdir(parents=True)
+    extension_id = BITWARDEN_EXTENSION_ID
+    seed_registration = {"disable_reasons": [], "location": 8, "path": "/extensions/bitwarden"}
+    (seed / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {extension_id: seed_registration}}}))
+    (target / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {extension_id: {"disable_reasons": [16777216]}}}}))
+    monkeypatch.setenv("CLOAK_NATIVE_PROFILES_ROOT", str(profiles))
+    # The seed is resolved from the real CLOAK_HOME unless it is pinned: on a machine that has one, the repair would
+    # copy that registration instead of this fixture's.
+    import backend.browser_manager as module
+    monkeypatch.setattr(module, "_resolve_bitwarden_seed_dir", lambda: profiles / "bitwarden-auth-seed")
+
+    assert _repair_native_extension_registration("outlook-out-003") is True
+
+    repaired = json.loads((target / "Secure Preferences").read_text())
+    assert repaired["extensions"]["settings"][extension_id] == seed_registration
+
+
+def test_native_profile_running_matches_only_exact_profile_path(monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/Users/test")))
+    # CLOAK_HOME is resolved at import time, so patching Path.home afterwards is not enough: pin the module constant
+    # the resolver actually reads.
+    import backend.browser_manager as module
+    monkeypatch.setattr(module, "CLOAK_HOME", Path("/Users/test/.cloakbrowser"))
+    monkeypatch.delenv("CLOAK_NATIVE_PROFILES_ROOT", raising=False)
+    processes = "\n".join([
+        "Chromium --user-data-dir=/Users/test/.cloakbrowser/profiles/linkedin-001",
+        "Chromium --user-data-dir=/Users/test/.cloakbrowser/profiles/linkedin-001-old",
+    ])
+    assert _native_profile_running(processes, "linkedin-001") is True
+    assert _native_profile_running(processes, "linkedin-002") is False
 
 
 # ── runtime-specific launch behavior ─────────────────────────────────────────
@@ -567,6 +617,30 @@ async def test_wait_for_cdp_rejects_wrong_debugger_port(monkeypatch):
         await manager._wait_for_cdp(53123, timeout=0.01)
 
 
+def test_native_profile_name():
+    profile = {"launch_args": ["--native-profile=google-001"]}
+    assert _mgr._native_profile_name(profile) == "google-001"
+
+
+def test_native_profile_name_missing():
+    assert _mgr._native_profile_name({"launch_args": []}) is None
+
+
+def test_start_urls():
+    profile = {
+        "launch_args": [
+            "--native-profile=google-002",
+            "--start-url=https://accounts.google.com/",
+        ]
+    }
+    assert _mgr._start_urls(profile) == ["https://accounts.google.com/"]
+
+
+def test_native_cdp_ports_match_launcher():
+    assert _mgr._native_cdp_port("google-001") == 9558
+    assert _mgr._native_cdp_port("google-002") == 9684
+
+
 # ── _init_profile_defaults ───────────────────────────────────────────────────
 
 
@@ -702,3 +776,31 @@ def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
     manager.running.pop("p1")
     manager.cdp_client_detached(current)  # nor a browser that is gone altogether
     assert not current.download_rearm.is_set()
+
+
+def test_leave_dialogs_open_listens_on_every_page():
+    """Playwright auto-dismisses dialogs with no listener; the Manager adds one so they stay open."""
+    from backend.browser_manager import leave_dialogs_open
+
+    class FakePage:
+        def __init__(self):
+            self.events = {}
+
+        def on(self, name, fn):
+            self.events[name] = fn
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = [FakePage()]
+            self.events = {}
+
+        def on(self, name, fn):
+            self.events[name] = fn
+
+    ctx = FakeContext()
+    leave_dialogs_open(ctx)
+    assert "dialog" in ctx.pages[0].events
+    later = FakePage()
+    ctx.events["page"](later)
+    assert "dialog" in later.events
+    assert ctx.pages[0].events["dialog"](object()) is None

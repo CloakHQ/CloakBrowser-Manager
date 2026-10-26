@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -101,6 +103,12 @@ def _isolate_home(tmp_path_factory, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    # The default Bitwarden extension path is resolved at import time, so moving HOME is not enough: on a machine that
+    # really has ~/.cloakbrowser/extensions/bitwarden/current every new profile would get it injected and the default
+    # assertions would fail. Point the default at a path under the throwaway home, which does not exist.
+    from backend import browser_manager as bm
+    monkeypatch.setattr(db, "DEFAULT_BW_EXT", home / "extensions" / "bitwarden" / "current")
+    monkeypatch.setattr(bm, "DEFAULT_BITWARDEN_EXTENSION_PATH", home / "extensions" / "bitwarden" / "current")
     return home
 
 
