@@ -22,7 +22,8 @@ _PROFILE_COLUMNS = (
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
-    "restore_session", "transparent_proxy", "portable_cookies", "notes", "user_data_dir",
+    "restore_session", "transparent_proxy", "portable_cookies", "notes", "license_key_id",
+    "user_data_dir",
     "created_at", "updated_at", "sort_order",
 )
 
@@ -52,6 +53,7 @@ CREATE TABLE profiles (
     transparent_proxy BOOLEAN DEFAULT 0,
     portable_cookies BOOLEAN DEFAULT 0,
     notes TEXT,
+    license_key_id TEXT,
     user_data_dir TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -229,6 +231,7 @@ def create_profile(
         "restore_session": fields.get("restore_session", True),
         "transparent_proxy": fields.get("transparent_proxy", False),
         "portable_cookies": fields.get("portable_cookies", False), "notes": fields.get("notes"),
+        "license_key_id": fields.get("license_key_id") or None,
         "user_data_dir": user_data_dir, "created_at": now, "updated_at": now,
     }
     with get_db() as conn:
@@ -357,10 +360,13 @@ def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str
     src = get_profile(profile_id)
     if src is None:
         return None
+    # The license-key pin is deliberately dropped: a key serves one running
+    # browser, so a clone pinned to the same key could never launch beside the
+    # original. The clone leases a free key instead.
     fields = {
         key: value
         for key, value in src.items()
-        if key not in {"id", "name", "fingerprint_seed", "tags",
+        if key not in {"id", "name", "fingerprint_seed", "tags", "license_key_id",
                        "user_data_dir", "created_at", "updated_at", "sort_order"}
     }
     return create_profile(

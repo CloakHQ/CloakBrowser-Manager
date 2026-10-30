@@ -4,6 +4,10 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- **License key pool: one key per concurrent profile.** The Manager used to hold a single app-wide key, so a free plan allowed one running profile and every second launch was denied by the license server. **Settings → Key pool** now holds as many keys as you have accounts: each launch leases one key, and the key is released when the profile stops, crashes, or fails to launch, so a small pool can rotate through many profiles as long as they are not all running at once. Keys are validated on add and can be re-validated with **Validate all**; a key the binary rejects (exit 77) is marked invalid and drops out of rotation, while an out-of-seats denial (76) leaves the key healthy. The launch is refused *before* the browser starts when every key is leased, with the same "session limit reached" message the server would have produced. A profile can pin one pooled key, which reserves it so a first-come launch cannot consume it. The raw key never leaves the server: `GET /api/keys` returns a masked form and a short id, and `POST /api/keys`, `DELETE /api/keys/{id}` and `POST /api/keys/check` manage the pool. The one-key-one-concurrent-browser seat limit is unchanged — pooling your own keys is not a seat bypass.
+
 ## [0.2.0] - 2026-11-01
 
 ### Changed

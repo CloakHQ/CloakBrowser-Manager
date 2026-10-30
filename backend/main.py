@@ -39,6 +39,7 @@ load_env_file()
 
 from . import artifacts
 from . import database as db
+from . import key_pool
 from cloakbrowser.license import CloakBrowserLicenseError
 
 from .browser_manager import (
@@ -53,6 +54,10 @@ from .models import (
     ArtifactResponse,
     ClipboardRequest,
     LaunchResponse,
+    LicenseKeyAdd,
+    LicenseKeyCheck,
+    LicenseKeyCheckResult,
+    LicenseKeyEntry,
     LoginRequest,
     ProfileCreate,
     ProfileDuplicateRequest,
@@ -72,6 +77,10 @@ from .runtime import bundle_dir
 from .settings_store import load_settings, save_settings
 
 logger = logging.getLogger("cloakbrowser.manager")
+
+# Fire-and-forget tasks need a strong reference or the event loop may garbage
+# collect them mid-flight; the done callback drops each one on completion.
+_background_tasks: set[asyncio.Task] = set()
 
 # Log to the console AND to a rotating file in the data dir. The native frozen
 # app has no visible terminal, so the file is the only way a user (or we, for
@@ -509,7 +518,7 @@ async def lifespan(app: FastAPI):
     diagnostics.install_asyncio_handler(asyncio.get_running_loop(), logger)
     logger.info(diagnostics.startup_line(browser_mgr))
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
-    logger.info("CloakBrowser Manager started")
+    logger.info("CloakBrowser Manager (Custom) started")
     yield
     logger.info("Shutting down — stopping all browsers...")
     if browser_mgr._auto_launch_task and not browser_mgr._auto_launch_task.done():
@@ -518,7 +527,7 @@ async def lifespan(app: FastAPI):
     await browser_mgr.cleanup_all()
 
 
-app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
+app = FastAPI(title="CloakBrowser Manager (Custom)", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 
 
@@ -1088,6 +1097,7 @@ async def get_system_status():
         running_count=len(browser_mgr.running),
         binary_version=binary_version,
         license_tier=browser_mgr.license_tier,
+        license_plan=browser_mgr.license_plan,
         profiles_total=len(profiles),
         host_os=browser_mgr.runtime.host_os,
         runtime_mode=browser_mgr.runtime.runtime_mode,
@@ -1103,9 +1113,10 @@ async def get_system_status():
 # Latest Manager release on the public GitHub repo. No auth needed; anonymous
 # GitHub API allows 60 req/hr/IP, so the result is cached to fetch at most once
 # per TTL regardless of how many clients/reloads hit the endpoint.
-_GITHUB_LATEST_RELEASE_URL = (
-    "https://api.github.com/repos/CloakHQ/CloakBrowser-Manager/releases/latest"
-)
+# Fork note: the upstream releases are NOT this build, so advertising them would
+# be wrong. The check is opt-in — set CB_CUSTOM_UPDATE_URL to your own fork's
+# `releases/latest` endpoint to enable it; leave unset to disable the banner.
+_GITHUB_LATEST_RELEASE_URL = os.environ.get("CB_CUSTOM_UPDATE_URL", "").strip()
 _UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60
 _update_cache: tuple[float, UpdateCheckResponse] | None = None
 
@@ -1137,6 +1148,9 @@ async def _fetch_update_status() -> UpdateCheckResponse:
     result = UpdateCheckResponse(current=current)
     if current == "unknown":
         # Dev checkout with no git, or unresolvable build — nothing to compare.
+        return result
+    if not _GITHUB_LATEST_RELEASE_URL:
+        # Fork without its own release feed: never advertise upstream releases.
         return result
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -1188,6 +1202,102 @@ async def check_for_update():
 # ── Settings ─────────────────────────────────────────────────────────────────
 
 
+# ── License key pool ─────────────────────────────────────────────────────────
+# A shared pool of keys, leased one per running profile. This is what makes N
+# free-tier keys usable by N concurrent profiles: the app-wide key alone is one
+# seat pool, so a second launch on it is denied by the server. The raw key never
+# leaves the server — entries are addressed by id and listed masked.
+def _key_leased_to(entry_id: str) -> str | None:
+    """The profile currently holding this key, or None."""
+    for profile_id, key_id in browser_mgr.leased_keys().items():
+        if key_id == entry_id:
+            return profile_id
+    return None
+
+
+def _refresh_binary_status_soon() -> None:
+    """Re-resolve the tier/binary after the pool changed, off the request path.
+
+    The resolve can download a few hundred MB, so a POST that adds or removes a
+    key must not wait for it; the next status poll picks up the new tier.
+    """
+    task = asyncio.create_task(asyncio.to_thread(browser_mgr.resolve_binary_status))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def _key_entry_response(entry: dict) -> LicenseKeyEntry:
+    return LicenseKeyEntry(
+        id=entry["id"],
+        key_masked=key_pool.mask_key(entry["key"]),
+        label=entry["label"],
+        state=entry["state"],
+        plan=entry["plan"],
+        expires=entry["expires"],
+        added_at=entry["added_at"],
+        checked_at=entry["checked_at"],
+        leased_to=_key_leased_to(entry["id"]),
+    )
+
+
+@app.get("/api/keys", response_model=list[LicenseKeyEntry])
+async def list_keys():
+    """Every pooled key with its last validation outcome and current lease."""
+    return [_key_entry_response(entry) for entry in key_pool.entries()]
+
+
+@app.post("/api/keys", response_model=list[LicenseKeyEntry], status_code=201)
+async def add_keys(payload: LicenseKeyAdd):
+    """Add keys, one per line, and validate them right away.
+
+    Validating here rather than at first launch means a dead key is caught while
+    the user is still looking at the pool, not as a failed launch later.
+    """
+    result = key_pool.add(payload.keys, payload.label)
+    if result["added"]:
+        await asyncio.to_thread(key_pool.validate)
+        logger.info("Added %d license key(s) to the pool", result["added"])
+        # A pool key can lift the app out of keyless mode; let the badge follow.
+        _refresh_binary_status_soon()
+    return [_key_entry_response(entry) for entry in key_pool.entries()]
+
+
+@app.delete("/api/keys/{entry_id}")
+async def delete_key(entry_id: str):
+    """Remove a key from the pool. Refused while a profile is running on it."""
+    leased_to = _key_leased_to(entry_id)
+    if leased_to is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Key is in use by running profile {leased_to}; stop it first",
+        )
+    if not key_pool.remove(entry_id):
+        raise HTTPException(status_code=404, detail="Key not found")
+    _refresh_binary_status_soon()
+    return {"ok": True}
+
+
+@app.post("/api/keys/check", response_model=list[LicenseKeyCheckResult])
+async def check_keys(payload: LicenseKeyCheck):
+    """Re-validate pooled keys against the license server.
+
+    Blocking (network), so it runs off the event loop. With no ids it checks the
+    whole pool — the "validate before assigning" pass.
+    """
+    pooled = {entry["id"]: entry["key"] for entry in key_pool.entries()}
+    if payload.ids:
+        unknown = [entry_id for entry_id in payload.ids if entry_id not in pooled]
+        if unknown:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown key id(s): {', '.join(unknown)}"
+            )
+        targets = [pooled[entry_id] for entry_id in payload.ids]
+    else:
+        targets = None
+    results = await asyncio.to_thread(key_pool.validate, targets)
+    return [LicenseKeyCheckResult(**result) for result in results]
+
+
 def _mask_key(key: str | None) -> str | None:
     """Show enough of a license key to recognise it, never the whole thing."""
     if not key:
@@ -1202,6 +1312,7 @@ def _settings_response() -> SettingsResponse:
         license_key_set=bool(browser_mgr.license_key),
         license_key_masked=_mask_key(browser_mgr.license_key),
         release_channel=(browser_mgr.release_channel or "stable"),
+        key_pool_size=len(key_pool.entries()),
     )
 
 
@@ -1233,7 +1344,7 @@ async def shutdown_manager(request: Request):
             os.kill(os.getpid(), signal.SIGINT)
 
         asyncio.create_task(_signal_self())
-    return {"ok": True, "message": "CloakBrowser Manager is shutting down"}
+    return {"ok": True, "message": "CloakBrowser Manager (Custom) is shutting down"}
 
 
 @app.get("/api/settings", response_model=SettingsResponse)

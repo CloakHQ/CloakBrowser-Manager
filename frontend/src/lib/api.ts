@@ -43,6 +43,8 @@ export interface Profile {
   restore_session: boolean;
   transparent_proxy: boolean;
   portable_cookies: boolean;
+  // Pinned pool key, or null to lease whichever key is free at launch.
+  license_key_id: string | null;
   notes: string | null;
   user_data_dir: string;
   created_at: string;
@@ -88,6 +90,7 @@ export interface ProfileCreateData {
   restore_session?: boolean;
   transparent_proxy?: boolean;
   portable_cookies?: boolean;
+  license_key_id?: string | null;
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }
@@ -116,6 +119,7 @@ export interface SystemStatus {
   running_count: number;
   binary_version: string;
   license_tier: string; // "pro" | "free" | "none"
+  license_plan?: string | null; // server-reported plan, informational only
   profiles_total: number;
   host_os: HostOS;
   runtime_mode: RuntimeMode;
@@ -136,6 +140,27 @@ export interface ManagerSettings {
   license_key_set: boolean;
   license_key_masked: string | null;
   release_channel: string; // "stable" | "preview"
+  key_pool_size: number;
+}
+export interface LicenseKeyEntry {
+  id: string;
+  key_masked: string;
+  label: string | null;
+  // "valid" | "invalid" | "unreachable" | "unknown"
+  state: string;
+  plan: string | null;
+  expires: string | null;
+  added_at: string;
+  checked_at: string | null;
+  // The profile currently running on this key, or null.
+  leased_to: string | null;
+}
+export interface LicenseKeyCheckResult {
+  id: string;
+  key_masked: string;
+  state: string;
+  plan: string | null;
+  expires: string | null;
 }
 
 export interface SettingsUpdate {
@@ -296,6 +321,19 @@ export const api = {
     request<{ ok: boolean; message?: string }>("/api/shutdown", { method: "POST" }),
 
   getSettings: () => request<ManagerSettings>("/api/settings"),
+  listKeys: () => request<LicenseKeyEntry[]>("/api/keys"),
+  addKeys: (keys: string, label?: string) =>
+    request<LicenseKeyEntry[]>("/api/keys", {
+      method: "POST",
+      body: JSON.stringify({ keys, label: label ?? null }),
+    }),
+  deleteKey: (id: string) =>
+    request<{ ok: boolean }>(`/api/keys/${id}`, { method: "DELETE" }),
+  checkKeys: (ids?: string[]) =>
+    request<LicenseKeyCheckResult[]>("/api/keys/check", {
+      method: "POST",
+      body: JSON.stringify({ ids: ids ?? null }),
+    }),
 
   updateSettings: (data: SettingsUpdate) =>
     request<SystemStatus>("/api/settings", {

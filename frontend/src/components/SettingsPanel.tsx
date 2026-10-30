@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Loader2, X } from "lucide-react";
 import { api, type ManagerSettings, type SystemStatus } from "../lib/api";
+import { KeyPoolPanel } from "./KeyPoolPanel";
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -71,14 +72,14 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md rounded-lg border border-border bg-surface-1 shadow-xl"
+        className="max-h-full w-full max-w-lg overflow-y-auto rounded-lg border border-border bg-surface-1 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold">Settings</h2>
           <button
             onClick={onClose}
-            className="text-gray-500 hover:text-gray-300"
+            className="text-fg-muted hover:text-fg"
             title="Close"
           >
             <X className="h-4 w-4" />
@@ -101,8 +102,9 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
                   : "cb_… (a free key works)"
               }
             />
-            <p className="mt-1 text-xs text-gray-500">
-              One key per Manager instance — every profile shares its seat pool.{" "}
+            <p className="mt-1 text-xs text-fg-muted">
+              The app-wide key. Every profile without a pooled key falls back to
+              this one, so it can only serve one profile at a time.{" "}
               <a
                 href="https://cloakbrowser.dev/free"
                 target="_blank"
@@ -115,6 +117,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             </p>
           </div>
 
+          <KeyPoolPanel />
           <div>
             <label className="label">Release channel</label>
             <select
@@ -129,7 +132,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             </select>
           </div>
 
-          {error && <p className="text-xs text-red-400">{error}</p>}
+          {error && <p className="text-xs text-danger">{error}</p>}
         </div>
 
         <div className="flex items-center justify-between gap-2 border-t border-border px-4 py-3">
@@ -137,7 +140,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             <button
               onClick={handleClearKey}
               disabled={saving}
-              className="text-xs text-gray-500 hover:text-red-400 disabled:opacity-50"
+              className="text-xs text-fg-muted hover:text-danger disabled:opacity-50"
             >
               Remove key
             </button>

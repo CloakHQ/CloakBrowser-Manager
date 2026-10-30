@@ -831,6 +831,82 @@ def test_settings_store_ignores_corrupt_file(
     assert settings_store.load_settings() == {}
 
 
+# ── License key pool API ─────────────────────────────────────────────────────
+@pytest.fixture()
+def keys_env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolate the pool file and stub the license server round trip."""
+    from backend import key_pool
+
+    monkeypatch.setattr(main.browser_mgr, "_key_leases", {})
+
+    def fake_validate(keys=None, retries=1):
+        targets = keys if keys is not None else [e["key"] for e in key_pool.entries()]
+        for key in targets:
+            key_pool.set_state(key, "valid", plan="free")
+        return [
+            {
+                "id": key_pool.key_id(key),
+                "key_masked": key_pool.mask_key(key),
+                "state": "valid",
+                "plan": "free",
+                "expires": None,
+            }
+            for key in targets
+        ]
+
+    monkeypatch.setattr(key_pool, "validate", fake_validate)
+    return key_pool
+
+
+def test_add_keys_returns_masked_entries(app_client: TestClient, keys_env):
+    resp = app_client.post(
+        "/api/keys", json={"keys": "cb_aaaaaaaaaaaa\ncb_bbbbbbbbbbbb"}
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert len(data) == 2
+    assert data[0]["state"] == "valid"
+    # The raw key must never be serialised.
+    assert "cb_aaaaaaaaaaaa" not in resp.text
+    assert data[0]["key_masked"].startswith("cb_aa")
+
+
+def test_list_keys_shows_the_current_lease(app_client: TestClient, keys_env):
+    keys_env.add("cb_leased")
+    entry_id = keys_env.key_id("cb_leased")
+    main.browser_mgr._key_leases["profile-x"] = entry_id
+    data = app_client.get("/api/keys").json()
+    assert data[0]["leased_to"] == "profile-x"
+
+
+def test_delete_key_refused_while_leased(app_client: TestClient, keys_env):
+    keys_env.add("cb_leased")
+    entry_id = keys_env.key_id("cb_leased")
+    main.browser_mgr._key_leases["profile-x"] = entry_id
+    assert app_client.delete(f"/api/keys/{entry_id}").status_code == 409
+    del main.browser_mgr._key_leases["profile-x"]
+    assert app_client.delete(f"/api/keys/{entry_id}").status_code == 200
+
+
+def test_delete_unknown_key_is_404(app_client: TestClient, keys_env):
+    assert app_client.delete("/api/keys/nope").status_code == 404
+
+
+def test_check_keys_validates_the_whole_pool(app_client: TestClient, keys_env):
+    keys_env.add("cb_one\ncb_two")
+    data = app_client.post("/api/keys/check", json={}).json()
+    assert {entry["state"] for entry in data} == {"valid"}
+
+
+def test_check_keys_rejects_an_unknown_id(app_client: TestClient, keys_env):
+    assert app_client.post("/api/keys/check", json={"ids": ["nope"]}).status_code == 404
+
+
+def test_settings_report_the_pool_size(app_client: TestClient, settings_env, keys_env):
+    keys_env.add("cb_one")
+    assert app_client.get("/api/settings").json()["key_pool_size"] == 1
+
+
 def test_bundle_dir_is_repo_root_when_unfrozen():
     from backend import runtime
 

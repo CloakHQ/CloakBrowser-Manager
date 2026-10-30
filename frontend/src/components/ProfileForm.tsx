@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
   HostOS,
+  LicenseKeyEntry,
   Profile,
   ProfileCreateData,
   ProxyTestResult,
@@ -59,11 +60,13 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     restore_session: true,
     transparent_proxy: false,
     portable_cookies: false,
+    license_key_id: null,
     extension_paths: [],
     launch_args: [],
     tags: [],
   });
 
+  const [keys, setKeys] = useState<LicenseKeyEntry[]>([]);
   const [previewError, setPreviewError] = useState(false);
   const [previewBuster, setPreviewBuster] = useState(0);
 
@@ -113,6 +116,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         restore_session: profile.restore_session,
         transparent_proxy: profile.transparent_proxy,
         portable_cookies: profile.portable_cookies,
+        license_key_id: profile.license_key_id,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
@@ -123,6 +127,14 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     setPreviewBuster(Date.now());
   }, [profile?.id]);
 
+  // The pool is only needed for the pin selector; a failed fetch just leaves
+  // "any free key" as the only choice, which is the default anyway.
+  useEffect(() => {
+    api
+      .listKeys()
+      .then(setKeys)
+      .catch(() => setKeys([]));
+  }, []);
   useEffect(() => {
     if (hostOs === "macos") {
       setForm((previous) => ({ ...previous, gpu_family: "auto" }));
@@ -315,8 +327,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                     onClick={() => handleDuplicate(false)}
                     className="w-full px-3 py-2 text-left hover:bg-surface-3"
                   >
-                    <div className="text-sm text-gray-200">Settings and fingerprint only</div>
-                    <div className="text-xs text-gray-500">Starts with empty browser state</div>
+                    <div className="text-sm text-fg">Settings and fingerprint only</div>
+                    <div className="text-xs text-fg-muted">Starts with empty browser state</div>
                   </button>
                   <button
                     type="button"
@@ -325,8 +337,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                     onClick={() => handleDuplicate(true)}
                     className="w-full px-3 py-2 text-left hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                   >
-                    <div className="text-sm text-gray-200">With browser state</div>
-                    <div className="text-xs text-gray-500">
+                    <div className="text-sm text-fg">With browser state</div>
+                    <div className="text-xs text-fg-muted">
                       {profile?.status === "stopped"
                         ? "Cookies, logged-in sessions and history"
                         : "Stop the profile first"}
@@ -374,7 +386,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         {/* Last preview — the last frame captured before the browser stopped */}
         {isEdit && !previewError && (
           <section>
-            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Last preview</h3>
+            <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Last preview</h3>
             <img
               src={`/api/profiles/${profile!.id}/screenshot?t=${previewBuster}`}
               onError={() => setPreviewError(true)}
@@ -386,7 +398,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Basic */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Basic</h3>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Basic</h3>
           <div className="grid grid-cols-2 gap-3">
             <div className="col-span-2">
               <label className="label">Profile Name</label>
@@ -446,7 +458,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Network */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Network</h3>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Network</h3>
           <div className="space-y-3">
             <div>
               <label className="label">Proxy</label>
@@ -472,7 +484,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               </div>
               {proxyTest && !testingProxy && (
                 <p
-                  className={`text-xs mt-1 ${proxyTest.ok ? "text-emerald-400" : "text-red-400"}`}
+                  className={`text-xs mt-1 ${proxyTest.ok ? "text-success" : "text-danger"}`}
                 >
                   {proxyTest.ok
                     ? `✓ ${proxyTest.ip}` +
@@ -504,7 +516,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 />
               </div>
             </div>
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <label className="flex items-center gap-2 text-sm text-fg-secondary cursor-pointer">
               <input
                 type="checkbox"
                 checked={form.geoip ?? false}
@@ -518,7 +530,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Hardware */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Hardware</h3>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Hardware</h3>
           <div className="space-y-3">
             <div>
               <label className="label">Screen Resolution</label>
@@ -582,7 +594,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   <option value="intel">Intel</option>
                 </select>
               )}
-              <p className="text-xs text-gray-500 mt-1">
+              <p className="text-xs text-fg-muted mt-1">
                 {hostOs === "macos"
                   ? "The seed selects a coherent Apple Silicon model and matching hardware profile."
                   : "The seed selects a coherent GPU model, CPU, memory, and screen profile within the family."}
@@ -593,9 +605,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Behavior */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Behavior</h3>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Behavior</h3>
           <div className="space-y-3">
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <label className="flex items-center gap-2 text-sm text-fg-secondary cursor-pointer">
               <input
                 type="checkbox"
                 checked={form.humanize ?? false}
@@ -618,7 +630,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               </div>
             )}
             {viewerMode === "vnc" && (
-              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <label className="flex items-center gap-2 text-sm text-fg-secondary cursor-pointer">
                 <input
                   type="checkbox"
                   checked={form.clipboard_sync ?? true}
@@ -628,7 +640,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 Enable clipboard sync by default in VNC viewer
               </label>
             )}
-            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <label className="flex items-center gap-2 text-sm text-fg-secondary cursor-pointer">
               <input
                 type="checkbox"
                 checked={form.auto_launch ?? false}
@@ -637,7 +649,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               />
               Launch automatically when Manager starts
             </label>
-            <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+            <label className="flex items-start gap-2 text-sm text-fg-secondary cursor-pointer">
               <input
                 type="checkbox"
                 checked={form.capture_preview ?? true}
@@ -646,12 +658,12 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               />
               <span>
                 Save a preview screenshot of the browser
-                <span className="block text-xs text-gray-500">
+                <span className="block text-xs text-fg-muted">
                   Captures the page periodically while running, shown here after the profile stops.
                 </span>
               </span>
             </label>
-            <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+            <label className="flex items-start gap-2 text-sm text-fg-secondary cursor-pointer">
               <input
                 type="checkbox"
                 checked={form.restore_session ?? true}
@@ -660,7 +672,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               />
               <span>
                 Restore previous tabs on launch
-                <span className="block text-xs text-gray-500">
+                <span className="block text-xs text-fg-muted">
                   Reopens the tabs that were open when this profile was last stopped.
                 </span>
               </span>
@@ -670,8 +682,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Compatibility */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Compatibility</h3>
-          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Compatibility</h3>
+          <label className="flex items-center gap-2 text-sm text-fg-secondary cursor-pointer">
             <input
               type="checkbox"
               checked={form.allow_3p_cookies ?? false}
@@ -680,7 +692,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             Allow third-party cookies for login, SSO, and challenge flows
           </label>
-          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+          <label className="flex items-start gap-2 text-sm text-fg-secondary cursor-pointer mt-3">
             <input
               type="checkbox"
               checked={form.transparent_proxy ?? false}
@@ -689,12 +701,12 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             <span>
               Transparent proxy connection
-              <span className="block text-xs text-gray-500">
+              <span className="block text-xs text-fg-muted">
                 Stronger proxy connection mode. Requires an http:// proxy with a username and password.
               </span>
             </span>
           </label>
-          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+          <label className="flex items-start gap-2 text-sm text-fg-secondary cursor-pointer mt-3">
             <input
               type="checkbox"
               checked={form.portable_cookies ?? false}
@@ -703,12 +715,42 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             <span>
               Portable cookies
-              <span className="block text-xs text-gray-500">
+              <span className="block text-xs text-fg-muted">
                 Lets this profile move to another machine with its logins. Only cookies saved while this is on are portable, so turn it on before logging in.
               </span>
             </span>
           </label>
-          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+          {keys.length > 0 && (
+            <div className="mt-3">
+              <label className="label">License key</label>
+              <select
+                className="input"
+                value={form.license_key_id ?? ""}
+                onChange={(e) => set("license_key_id", e.target.value || null)}
+              >
+                <option value="">Any free key at launch</option>
+                {keys.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {[
+                      entry.key_masked,
+                      // The server reports a placeholder plan for a rejected key;
+                      // "invalid" alone is the useful part.
+                      entry.state === "valid" ? entry.plan : null,
+                      entry.leased_to ? `in use by ${entry.leased_to}` : null,
+                      entry.state === "valid" ? null : entry.state,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-fg-muted">
+                Pinning reserves one key for this profile; leaving it on "any
+                free key" lets the Manager lease whichever is unused.
+              </p>
+            </div>
+          )}
+          <label className="flex items-start gap-2 text-sm text-fg-secondary cursor-pointer mt-3">
             <input
               type="checkbox"
               checked={form.set_google_default ?? true}
@@ -717,7 +759,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             <span>
               Set Google as the default search engine
-              <span className="block text-xs text-gray-500">
+              <span className="block text-xs text-fg-muted">
                 Adds a few seconds to the profile's first launch (one-time setup).
               </span>
             </span>
@@ -726,13 +768,13 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Tags */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Tags</h3>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Tags</h3>
           {(form.tags ?? []).length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-3">
               {(form.tags ?? []).map((t) => (
                 <span
                   key={t.tag}
-                  className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-gray-300"
+                  className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-fg-secondary"
                   style={t.color ? { backgroundColor: `${t.color}20`, color: t.color } : undefined}
                 >
                   {t.tag}
@@ -778,13 +820,13 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Extensions */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
-          <p className="text-xs text-gray-500 mb-2">Add one unpacked Chrome extension directory per path.</p>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Extensions</h3>
+          <p className="text-xs text-fg-muted mb-2">Add one unpacked Chrome extension directory per path.</p>
           {(form.extension_paths ?? []).length > 0 && (
             <div className="space-y-1.5 mb-3">
               {(form.extension_paths ?? []).map((path, index) => (
                 <div key={`${path}-${index}`} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
-                  <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
+                  <code className="flex-1 truncate text-xs text-fg-secondary">{path}</code>
                   <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
                     <X className="h-3 w-3" />
                   </button>
@@ -806,10 +848,10 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Advanced */}
         <details className="rounded-md border border-border bg-surface-1 p-3">
-          <summary className="cursor-pointer text-xs font-semibold text-gray-400 uppercase tracking-wider">
+          <summary className="cursor-pointer text-xs font-semibold text-fg-secondary uppercase tracking-wider">
             Advanced launch arguments
           </summary>
-          <p className="text-xs text-gray-500 my-3">
+          <p className="text-xs text-fg-muted my-3">
             Unrestricted Chromium flags. Advanced arguments can override Manager-controlled behavior.
           </p>
           {(form.launch_args ?? []).length > 0 && (
@@ -817,7 +859,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               {(form.launch_args ?? []).map((arg, index) => (
                 <span
                   key={`${arg}-${index}`}
-                  className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-gray-300 font-mono"
+                  className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-fg-secondary font-mono"
                 >
                   {arg}
                   <button type="button" onClick={() => removeLaunchArg(index)} className="hover:opacity-70">
@@ -841,7 +883,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Notes */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Notes</h3>
+          <h3 className="text-xs font-semibold text-fg-secondary uppercase tracking-wider mb-3">Notes</h3>
           <textarea
             className="input min-h-[80px] resize-y"
             value={form.notes ?? ""}

@@ -4,6 +4,25 @@
 
 <h3 align="center">Browser Profile Manager for CloakBrowser</h3>
 
+> ### ⚠ This is an unofficial fork
+>
+> **CloakBrowser Manager (Custom)** is a personal fork of
+> [CloakHQ/CloakBrowser-Manager](https://github.com/CloakHQ/CloakBrowser-Manager).
+> It is **not** affiliated with, endorsed by, or supported by CloakHQ.
+>
+> - The code is MIT and the original copyright notice is preserved (see [LICENSE](LICENSE)).
+> - The Chromium binary is **proprietary and is never bundled here** — it is downloaded
+>   at first run using *your* CloakBrowser license key (see [BINARY-LICENSE.md](BINARY-LICENSE.md)).
+> - No license keys are shared, resold, or multiplexed, and the **one-key-one-concurrent-browser**
+>   seat limit is untouched: the key pool holds *your own* keys and hands exactly one
+>   running browser each. Two browsers never share a key. There is no seat bypass and
+>   no bulk launch.
+> - For the supported product, install the [official release](https://github.com/CloakHQ/CloakBrowser-Manager/releases) instead.
+>
+> The installer uses its own AppId and its own data directory
+> (`CloakBrowser Manager (Custom)`), so it can sit next to the official build
+> without clobbering it.
+
 <p align="center">
 A self-hosted browser for managing unlimited accounts and profiles,<br>
 each one a genuinely separate machine: its own fingerprint, GPU, proxy, cookies, and history.<br>
@@ -34,7 +53,7 @@ Windows and macOS launch browsers directly in native desktop windows; Linux keep
 
 ### Windows and macOS
 
-Download the installer from the [latest release](https://github.com/CloakHQ/CloakBrowser-Manager/releases) and run it:
+Download the installer from the [latest **official** release](https://github.com/CloakHQ/CloakBrowser-Manager/releases) and run it (this fork currently ships no binaries of its own):
 
 - **macOS** — open the `.dmg` and drag **CloakBrowser Manager** into Applications. (Unsigned during early access — on first launch, run `xattr -rc "/Applications/CloakBrowser Manager.app"` in Terminal, or approve it under **System Settings → Privacy & Security → Open Anyway**.)
 - **Windows** — run the setup `.exe`. (Unsigned during early access — if SmartScreen warns, click **More info → Run anyway**.)
@@ -77,7 +96,8 @@ The Manager runs on the CloakBrowser engine, so it needs a key.<br>
 [Get a free one by email](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
 [Paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time, from a handful to thousands.
 
-Add your key once and every profile uses it.
+Add your key once and every profile uses it — or, to run profiles side by side, add
+several keys to the **key pool** (see below).
 
 **Native app (Windows/macOS):** open **Settings** (gear icon, top right), paste your key, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
 
@@ -103,6 +123,47 @@ CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
 ```
 
 The file is loaded automatically at startup (`docker compose` reads it too); restart the Manager after changing it. An environment variable overrides the in-app setting.
+
+### Key pool: one key per concurrent profile
+
+A free key allows **one concurrent browser**. The app-wide key is therefore a
+single seat: launch a second profile on it and the license server denies it. That
+denial is not a bug in the Manager — it is the plan working as sold.
+
+To run N profiles at once you need N keys, each from its own account. Add them in
+**Settings → Key pool**, one per line; they are validated on add, so a dead key is
+caught while you are still looking at the list rather than as a failed launch
+later.
+
+| Situation | Keys needed |
+|-----------|-------------|
+| One profile at a time | 1 (the app-wide key is enough) |
+| 5 profiles running together | 5, one leased per profile |
+| 20 profiles, 5 at a time | 5 — keys are released when a profile stops |
+
+How leasing works:
+
+- A launch leases the profile's **pinned** key if it has one, otherwise the first
+  free key in the pool, otherwise the app-wide key.
+- A key is reserved for as long as its browser runs and released on stop, crash,
+  or a failed launch — so a small pool can rotate through many profiles as long
+  as they are not all running at once.
+- If every key is already leased, the launch is refused **before** the browser
+  starts, with the same "session limit reached" message the server would have
+  produced a second later. Nothing is left half-started.
+- A key the binary rejects (exit code 77: invalid or expired) is marked invalid
+  and drops out of rotation. An *out of seats* denial (76) does not retire the
+  key — it is healthy, just busy.
+- The pool is stored in `keys.json` next to the database, readable only by the
+  Manager. The API and UI only ever see a masked form (`cb_ab…wxyz`) and a short
+  id; the raw key never leaves the server.
+
+Pinning a key to a profile (in the profile form) reserves that key for it, so a
+pooled key cannot be consumed by whichever profile happens to launch first.
+
+**Keys do not create identities.** Each key is a seat, not a fingerprint: profiles
+that must look unrelated still need their own proxy and their own browser process.
+Five keys behind one IP are five browsers that the target site can still correlate.
 
 ## Why Not a Cloud Anti-Detect Browser?
 

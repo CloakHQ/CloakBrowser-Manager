@@ -35,6 +35,9 @@ class ProfileCreate(BaseModel):
     transparent_proxy: bool = False
     portable_cookies: bool = False
     notes: str | None = None
+    # Pin this profile to one pooled key (its id, never the key itself). None
+    # lets the launch lease whichever pooled key is free.
+    license_key_id: str | None = None
     tags: list[TagCreate] | None = None
 
 
@@ -64,6 +67,8 @@ class ProfileUpdate(BaseModel):
     transparent_proxy: bool | None = None
     portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
+    # None = unchanged; "" = clear the pin (lease a free pooled key again).
+    license_key_id: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
     @field_validator("gpu_family", mode="before")
@@ -143,6 +148,9 @@ class ProfileResponse(BaseModel):
     transparent_proxy: bool = False
     portable_cookies: bool = False
     notes: str | None = None
+    # The pooled key this profile is pinned to, if any. The key itself is never
+    # returned; see GET /api/keys for the pool.
+    license_key_id: str | None = None
     user_data_dir: str
     created_at: str
     updated_at: str
@@ -172,6 +180,9 @@ class StatusResponse(BaseModel):
     running_count: int
     binary_version: str
     license_tier: str = "none"
+    # Plan reported by the license server ("free", "solo", "team", ...). Purely
+    # informational: the binary remains the authority on seat enforcement.
+    license_plan: str | None = None
     profiles_total: int
     host_os: HostOS
     runtime_mode: RuntimeMode
@@ -192,6 +203,46 @@ class SettingsResponse(BaseModel):
     license_key_set: bool
     license_key_masked: str | None = None
     release_channel: str = "stable"
+    # Size of the shared key pool (see /api/keys). Informational: a key in the
+    # pool is used before the app-wide key.
+    key_pool_size: int = 0
+
+
+class LicenseKeyEntry(BaseModel):
+    """One pooled key. The raw key never leaves the server."""
+
+    id: str
+    key_masked: str | None = None
+    label: str | None = None
+    state: str = "unknown"
+    plan: str | None = None
+    expires: str | None = None
+    added_at: str
+    checked_at: str | None = None
+    # Profile currently holding this key, if any. A key is leased to exactly one
+    # running browser, so a non-null value means it cannot be handed out again.
+    leased_to: str | None = None
+
+
+class LicenseKeyAdd(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # One key per line. Blank lines and lines starting with '#' are ignored.
+    keys: str = Field(min_length=1, max_length=100_000)
+    label: str | None = None
+
+
+class LicenseKeyCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Empty/omitted = re-check every key in the pool.
+    ids: list[str] = Field(default_factory=list)
+
+
+class LicenseKeyCheckResult(BaseModel):
+    id: str
+    key_masked: str | None = None
+    state: str
+    plan: str | None = None
+    expires: str | None = None
 
 
 class SettingsUpdate(BaseModel):

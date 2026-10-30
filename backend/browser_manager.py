@@ -341,6 +341,9 @@ class RunningProfile:
     # context_async on the returned context). Read on close to tell a seat/
     # license denial apart from a real crash or a user-initiated close.
     denial_path: str | None = None
+    # Pooled key id this browser was launched with (None for a keyless launch).
+    # A denial for this launch is recorded against that key in the pool.
+    license_key_id: str | None = None
 
 
 class BrowserManager:
@@ -375,6 +378,10 @@ class BrowserManager:
         # (duplicate / reset / delete). launch() refuses these; see hold_stopped().
         self._held: set[str] = set()
         self._initializing: set[str] = set()  # profile IDs in one-time first-launch setup
+        # profile_id -> pooled key id leased to the browser that profile is
+        # running. One key per running browser: two free-tier keys can't share a
+        # seat, so a key already leased is never handed to a second launch.
+        self._key_leases: dict[str, str] = {}
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
         self._cdp_ports: set[int] = set()
@@ -398,7 +405,12 @@ class BrowserManager:
         tier = "none"
         version = None
 
-        key = resolve_license_key(self.license_key)
+        # The badge describes the key a launch would actually get, so a pool-only
+        # setup reports its tier instead of claiming "no key".
+        from . import key_pool
+
+        pooled = key_pool.usable_keys()
+        key = resolve_license_key(self.license_key) or (pooled[0] if pooled else None)
         if not key:
             self.license_tier = tier
             self.license_plan = None
@@ -424,7 +436,7 @@ class BrowserManager:
 
         try:
             ensure_binary(
-                license_key=self.license_key,
+                license_key=key,
                 release_channel=self.release_channel,
             )
             logger.info("Binary ready: tier=%s version=%s", tier, version)
@@ -434,6 +446,102 @@ class BrowserManager:
                 exc,
                 exc_info=True,
             )
+
+    # ── License key leasing ───────────────────────────────────────────────
+    def _leased_key_ids(self, exclude: str | None = None) -> set[str]:
+        """Key ids currently held by a running profile, optionally ignoring one."""
+        return {
+            key_id for owner, key_id in self._key_leases.items() if owner != exclude
+        }
+
+    def _claim_license_key(self, profile: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Pick the key this launch gets, and reserve it.
+
+        Order: the profile's pinned key, then the first usable key in the shared
+        pool that no other running profile holds, then the app-wide key. Reserving
+        under the manager lock is what makes N free-tier keys usable by N
+        concurrent profiles: a key is never handed to a second browser while the
+        first still holds its seat.
+
+        Raises CloakBrowserLicenseError ("session limit reached", so the UI offers
+        the upgrade CTA) when every key is already leased — that is exactly the
+        condition the binary would deny a second later, caught before spending a
+        launch.
+        """
+        from . import key_pool
+
+        profile_id = profile["id"]
+        leased = self._leased_key_ids(exclude=profile_id)
+        pinned = profile.get("license_key_id")
+        if pinned:
+            entry = next((e for e in key_pool.entries() if e["id"] == pinned), None)
+            if entry is None:
+                raise CloakBrowserLicenseError(
+                    f"CloakBrowser Pro: this profile is pinned to license key {pinned}, "
+                    "which is no longer in the key pool. Re-add the key or clear the pin."
+                )
+            if entry["state"] == "invalid":
+                raise CloakBrowserLicenseError(
+                    f"CloakBrowser Pro: this profile's pinned license key "
+                    f"({key_pool.mask_key(entry['key'])}) was rejected by the license "
+                    "server. Replace it in the key pool or clear the pin."
+                )
+            if pinned in leased:
+                raise CloakBrowserLicenseError(
+                    f"CloakBrowser Pro: session limit reached — the key this profile is "
+                    f"pinned to ({key_pool.mask_key(entry['key'])}) is already in use by "
+                    "another running profile. Stop it, or unpin the key so this profile "
+                    "can lease a free one."
+                )
+            self._key_leases[profile_id] = pinned
+            return entry["key"], pinned
+
+        for entry in key_pool.entries():
+            if entry["state"] == "invalid" or entry["id"] in leased:
+                continue
+            self._key_leases[profile_id] = entry["id"]
+            return entry["key"], entry["id"]
+
+        # Pool exhausted (or empty) — fall back to the single app-wide key, which
+        # is also leased so a pool key can never double-book the same seat.
+        app_key = self.license_key
+        if app_key:
+            app_id = key_pool.key_id(app_key)
+            if app_id in leased:
+                raise CloakBrowserLicenseError(
+                    "CloakBrowser Pro: session limit reached — the app-wide license "
+                    "key is already in use by a running profile. Add a key to the "
+                    "pool so profiles can run side by side, or stop that profile."
+                )
+            self._key_leases[profile_id] = app_id
+            return app_key, app_id
+        pooled = key_pool.entries()
+        if pooled and not key_pool.usable_keys():
+            # Every pooled key was rejected. That is a dead pool, not a busy one,
+            # so neither "session limit" (which sends the user to the pricing
+            # page) nor a refusal fits: the keyless build still works, and
+            # refusing here would be a regression from the pre-pool behaviour.
+            # The pool list already shows the keys as invalid.
+            logger.warning(
+                "All %d pooled license keys were rejected; launching keyless",
+                len(pooled),
+            )
+            return None, None
+        if pooled:
+            raise CloakBrowserLicenseError(
+                "CloakBrowser Pro: session limit reached — every license key in the "
+                "pool is already in use by a running profile. Stop one, or add "
+                "another key."
+            )
+        return None, None
+
+    def _release_license_key(self, profile_id: str) -> None:
+        """Free the key a profile held, so the next launch can lease it."""
+        self._key_leases.pop(profile_id, None)
+
+    def leased_keys(self) -> dict[str, str]:
+        """profile_id → key id for every running profile that holds a key."""
+        return dict(self._key_leases)
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
@@ -469,6 +577,13 @@ class BrowserManager:
             # Fresh attempt — drop any stale denial from a previous launch so the
             # status poll doesn't keep showing an old "out of seats" message.
             self._last_errors.pop(profile_id, None)
+            # Reserve a license key while still holding the lock: two launches
+            # racing here must never lease the same key.
+            try:
+                launch_key, launch_key_id = self._claim_license_key(profile)
+            except BaseException:
+                self._launching.discard(profile_id)
+                raise
 
         display: int | None = None
         ws_port: int | None = None
@@ -493,7 +608,7 @@ class BrowserManager:
             # reports "initializing" via get_status while it works (one short
             # headless launch). Never fatal.
             if profile.get("set_google_default", True):
-                await self._ensure_search_engine(profile_id, user_data_dir)
+                await self._ensure_search_engine(profile_id, user_data_dir, launch_key)
 
             if display is not None and ws_port is not None:
                 await self.vnc.start_vnc(
@@ -541,7 +656,7 @@ class BrowserManager:
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
                 "extension_paths": profile.get("extension_paths") or [],
-                "license_key": self.license_key,
+                "license_key": launch_key,
                 "release_channel": self.release_channel,
             }
             if display is not None:
@@ -644,6 +759,7 @@ class BrowserManager:
                 user_data_dir=user_data_dir,
                 capture_preview=bool(profile.get("capture_preview", True)),
                 denial_path=getattr(context, "_cloak_denial_path", None),
+                license_key_id=launch_key_id,
             )
             context.on(
                 "close",
@@ -687,13 +803,18 @@ class BrowserManager:
             )
             return running
 
-        except BaseException:
+        except BaseException as _failure:
             # Stay "active" until the half-launched browser is really gone: swap
             # _launching for _stopping under the lock so is_active() never sees a
             # gap while a context may still be open, then clear it after cleanup.
             async with self._lock:
                 self._launching.discard(profile_id)
                 self._reserve_stopping(profile_id)
+                # The launch never took the key's seat, so hand it back. A denial
+                # that says the key itself is dead retires it from the pool first.
+                if isinstance(_failure, CloakBrowserLicenseError):
+                    self._retire_rejected_key(launch_key_id, _failure)
+                self._release_license_key(profile_id)
             try:
                 if context is not None:
                     await self._close_context(context, profile_id)
@@ -706,7 +827,7 @@ class BrowserManager:
             raise
 
     async def _ensure_search_engine(
-        self, profile_id: str, user_data_dir: Path
+        self, profile_id: str, user_data_dir: Path, license_key: str | None = None
     ) -> None:
         """Make Google the default search engine, once per profile.
 
@@ -774,7 +895,7 @@ class BrowserManager:
         dialog — Chrome creates the row with a valid hash — then "Make default".
         Every later launch then carries Google via the profile's own files.
         """
-        ctx = await self._headless_launch(user_data_dir)
+        ctx = await self._headless_launch(user_data_dir, license_key)
         try:
             page = await ctx.new_page()
             await page.goto("chrome://settings/searchEngines")
@@ -815,14 +936,21 @@ class BrowserManager:
             await self._close_context(ctx, "search-init")
         await asyncio.sleep(0.5)
 
-    async def _headless_launch(self, user_data_dir: Path) -> Any:
-        """Short headless launch used only by the one-time search-engine setup."""
+    async def _headless_launch(
+        self, user_data_dir: Path, license_key: str | None = None
+    ) -> Any:
+        """Short headless launch used only by the one-time search-engine setup.
+
+        Takes the key the caller already leased for this profile: this is a real
+        browser launch and would otherwise try to take a second seat with the
+        app-wide key, which a one-seat free plan denies.
+        """
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             (user_data_dir / lock_file).unlink(missing_ok=True)
         return await launch_persistent_context_async(
             user_data_dir=str(user_data_dir),
             headless=True,
-            license_key=self.license_key,
+            license_key=license_key,
             release_channel=self.release_channel,
         )
 
@@ -897,6 +1025,9 @@ class BrowserManager:
         if running.display is not None:
             await self.vnc.stop_vnc(running.display)
         self._release_cdp_port(running.cdp_port)
+        # Both stop() and a self-close land here, and both free the seat the
+        # profile held, so the next launch can lease that key again.
+        self._release_license_key(running.profile_id)
 
     async def _on_browser_closed(self, running: RunningProfile):
         """Release resources after a browser crash or user-initiated close.
@@ -917,7 +1048,9 @@ class BrowserManager:
                 return  # superseded — a newer launch owns this profile now
             # Record the denial and pop under the SAME lock so it can't race with
             # a concurrent launch() clearing _last_errors at its start.
-            self._record_denial_if_any(profile_id, running.denial_path)
+            denial = self._record_denial_if_any(profile_id, running.denial_path)
+            if denial is not None:
+                self._retire_rejected_key(running.license_key_id, denial)
             self.running.pop(profile_id, None)
             # Same contract as stop(): active until the dispose is really done.
             self._reserve_stopping(profile_id)
@@ -944,13 +1077,41 @@ class BrowserManager:
             return None
         return license_error_for_code(code) if code is not None else None
 
-    def _record_denial_if_any(self, profile_id: str, denial_path: str | None) -> None:
+    def _record_denial_if_any(
+        self, profile_id: str, denial_path: str | None
+    ) -> CloakBrowserLicenseError | None:
         """If the close was a license denial, stash it for the status poll."""
         lic = self._denial_error(denial_path)
         if lic is None:
-            return
+            return None
         self._last_errors[profile_id] = license_error_detail(lic)
         logger.warning("Profile %s closed on a license denial: %s", profile_id, lic)
+        return lic
+
+    @staticmethod
+    def _is_dead_key_error(exc: BaseException) -> bool:
+        """True for the "key itself is bad" denial (exit 77), not a seat refusal.
+
+        Only this one means the key is worthless everywhere: a seat refusal (76)
+        or an unreachable server (78) says nothing about the key's validity, so
+        marking it dead would retire a perfectly good key.
+        """
+        return "invalid, expired" in str(exc).lower()
+
+    def _retire_rejected_key(self, license_key_id: str | None, exc: BaseException) -> None:
+        """Mark a pooled key invalid after the binary rejected it.
+
+        The pool is only a hint — the binary is the authority — but a key the
+        binary has just refused should not be handed to the next launch.
+        """
+        if not license_key_id or not self._is_dead_key_error(exc):
+            return
+        from . import key_pool
+
+        if key_pool.set_state_by_id(license_key_id, "invalid"):
+            logger.warning(
+                "Key %s rejected by the binary — removed from rotation", license_key_id
+            )
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance and release all owned resources."""

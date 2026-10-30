@@ -357,6 +357,15 @@ def test_create_profile_honours_explicit_id(tmp_db: Path):
     assert db.get_profile(pid)["name"] == "Pre-minted"
 
 
+def test_duplicate_profile_drops_the_license_pin(tmp_db: Path):
+    # A pinned key serves one browser, so a clone carrying the pin could never
+    # launch beside the original.
+    src = db.create_profile(name="Src", fingerprint_seed=7, license_key_id="abc123")
+    clone = db.duplicate_profile(src["id"])
+    assert src["license_key_id"] == "abc123"
+    assert clone["license_key_id"] is None
+
+
 def test_duplicate_profile_honours_new_id(tmp_db: Path):
     src = db.create_profile(name="Src", fingerprint_seed=7)
     pid = db.new_profile_id()
