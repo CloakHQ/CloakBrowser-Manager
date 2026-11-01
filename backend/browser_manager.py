@@ -356,7 +356,7 @@ class BrowserManager:
         self.license_key = license_key
         self.release_channel = release_channel
         # Resolved at startup by resolve_binary_status(); read by GET /api/status.
-        self.license_tier = "keyless"
+        self.license_tier = "none"
         self.license_plan: str | None = None
         self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
@@ -385,9 +385,9 @@ class BrowserManager:
 
         Blocking — called once at startup (via a thread) so the multi-hundred-MB
         Pro download stays out of the launch path and auto-launch's 60s timeout.
-        Never raises: on any failure the keyless baked-in binary remains usable.
+        Never raises. Without a key there is nothing to download (wrapper 0.7+
+        needs one for every build); launches then fail with the free-key link.
         """
-        from cloakbrowser.config import CHROMIUM_VERSION, get_chromium_version
         from cloakbrowser.download import ensure_binary
         from cloakbrowser.license import (
             get_pro_latest_version,
@@ -395,28 +395,29 @@ class BrowserManager:
             validate_license,
         )
 
-        try:
-            keyless_version = get_chromium_version()
-        except Exception:
-            keyless_version = CHROMIUM_VERSION
-
-        tier = "keyless"
-        version = keyless_version
+        tier = "none"
+        version = None
 
         key = resolve_license_key(self.license_key)
-        if key:
+        if not key:
+            self.license_tier = tier
+            self.license_plan = None
+            self.binary_version = None
+            logger.info("No license key set: add one in Settings to launch profiles")
+            return
+
+        try:
+            info = validate_license(key)
+        except Exception as exc:
+            info = None
+            logger.warning("License validation failed: %s", exc)
+        if info and info.valid:
+            tier = "free" if info.plan == "free" else "pro"
+            self.license_plan = info.plan
             try:
-                info = validate_license(key)
+                version = get_pro_latest_version(self.release_channel)
             except Exception as exc:
-                info = None
-                logger.warning("License validation failed: %s", exc)
-            if info and info.valid:
-                tier = "free" if info.plan == "free" else "pro"
-                self.license_plan = info.plan
-                try:
-                    version = get_pro_latest_version(self.release_channel) or keyless_version
-                except Exception as exc:
-                    logger.warning("Could not resolve Pro version: %s", exc)
+                logger.warning("Could not resolve Pro version: %s", exc)
 
         self.license_tier = tier
         self.binary_version = version
@@ -429,7 +430,7 @@ class BrowserManager:
             logger.info("Binary ready: tier=%s version=%s", tier, version)
         except Exception as exc:
             logger.error(
-                "Binary pre-download failed (keyless fallback remains): %s",
+                "Binary pre-download failed: %s",
                 exc,
                 exc_info=True,
             )

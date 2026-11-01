@@ -249,7 +249,9 @@ def test_system_status(app_client: TestClient):
     assert resp.status_code == 200
     data = resp.json()
     assert data["running_count"] == 0
-    assert data["binary_version"] == "0.0.0-test"
+    # No key in the test env, so there is no build to report.
+    assert data["binary_version"] == ""
+    assert data["license_tier"] == "none"
     assert data["profiles_total"] >= 1
 
 

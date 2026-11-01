@@ -171,7 +171,7 @@ class LaunchResponse(BaseModel):
 class StatusResponse(BaseModel):
     running_count: int
     binary_version: str
-    license_tier: str = "keyless"
+    license_tier: str = "none"
     profiles_total: int
     host_os: HostOS
     runtime_mode: RuntimeMode
@@ -195,7 +195,7 @@ class SettingsResponse(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    # None = leave unchanged; "" = clear the license key (back to keyless).
+    # None = leave unchanged; "" = clear the license key.
     license_key: str | None = None
     release_channel: str | None = None
 

@@ -338,13 +338,13 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
         {/* Content */}
         <div className="flex-1 overflow-y-auto overscroll-contain">
           {view === "empty" &&
-            ((systemStatus?.license_tier ?? "keyless") === "keyless" ? (
+            ((systemStatus?.license_tier ?? "none") === "none" ? (
               <div className="flex items-center justify-center h-full px-6">
                 <div className="max-w-sm text-center">
                   <p className="text-sm font-medium text-gray-200">No license key set</p>
                   <p className="mt-1.5 text-sm text-gray-500">
-                    You're running the free keyless build. Add a key to run the
-                    latest Pro build.
+                    Profiles need a key to launch. A free key takes one email and
+                    runs the latest build.
                   </p>
                   <div className="mt-5 flex flex-col items-center gap-2">
                     <button
@@ -370,9 +370,6 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                       See Pro plans &rarr;
                     </a>
                   </div>
-                  <p className="mt-6 text-xs text-gray-600">
-                    Or select a profile or create a new one to continue keyless.
-                  </p>
                 </div>
               </div>
             ) : (

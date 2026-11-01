@@ -4,6 +4,12 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-01
+
+### Changed
+- **Bundles the CloakBrowser 0.7.0 engine: a license key is now required to launch profiles.** A free key takes one email and runs the latest build. Without a key, the Manager opens on a "No license key set" screen with links to enter a key in Settings or get a free one, the top bar shows "No key", and launching a profile shows the free-key link. Saving a key in Settings takes effect right away, no restart needed.
+- **The Docker image no longer contains a browser build.** The latest build downloads on the first start with a key.
+
 ## [0.1.8] - 2026-10-14
 
 ### Added

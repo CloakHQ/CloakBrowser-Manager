@@ -74,7 +74,7 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 ## CloakBrowser license key
 
 The Manager runs on the CloakBrowser engine, so it needs a key.<br>
-[Get a free one with GitHub](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
+[Get a free one by email](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
 [Paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time, from a handful to thousands.
 
 Add your key once and every profile uses it.
@@ -328,7 +328,7 @@ When `AUTH_TOKEN` is set:
 - **This application** (GUI source code) — MIT. See [LICENSE](LICENSE).
 - **CloakBrowser binary** (compiled Chromium) — governed by version-specific subscription terms and may not be redistributed. See [BINARY-LICENSE.md](BINARY-LICENSE.md).
 
-The GUI application requires the CloakBrowser Chromium binary to function. The binary is automatically downloaded on first launch and is governed by its own license terms. If you fork or redistribute this application, your users must comply with the [CloakBrowser Binary License](BINARY-LICENSE.md).
+The GUI application requires the CloakBrowser Chromium binary to function. The binary is automatically downloaded once you add a license key and is governed by its own license terms. If you fork or redistribute this application, your users must comply with the [CloakBrowser Binary License](BINARY-LICENSE.md).
 
 ## Contributing
 

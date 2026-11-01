@@ -13,15 +13,10 @@ import pytest
 # Mock cloakbrowser BEFORE any backend module is imported.
 # browser_manager.py does `from cloakbrowser import launch_persistent_context_async`
 # at module level, and main.py imports BrowserManager which triggers it.
-# main.py:381 also does `from cloakbrowser.config import CHROMIUM_VERSION`.
 # ---------------------------------------------------------------------------
 
 _mock_cloakbrowser = types.ModuleType("cloakbrowser")
 _mock_cloakbrowser.launch_persistent_context_async = AsyncMock()  # type: ignore[attr-defined]
-
-_mock_config = types.ModuleType("cloakbrowser.config")
-_mock_config.CHROMIUM_VERSION = "0.0.0-test"  # type: ignore[attr-defined]
-_mock_config.get_chromium_version = lambda: "0.0.0-test"  # type: ignore[attr-defined]
 
 # BrowserManager.resolve_binary_status() (run in the lifespan) imports these.
 _mock_download = types.ModuleType("cloakbrowser.download")
@@ -40,7 +35,6 @@ _mock_license.license_error_for_code = lambda code: None  # type: ignore[attr-de
 _mock_license.read_denial_file = lambda path: None  # type: ignore[attr-defined]
 
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
-sys.modules.setdefault("cloakbrowser.config", _mock_config)
 sys.modules.setdefault("cloakbrowser.download", _mock_download)
 sys.modules.setdefault("cloakbrowser.license", _mock_license)
 
