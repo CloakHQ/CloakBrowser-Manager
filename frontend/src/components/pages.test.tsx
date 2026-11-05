@@ -72,6 +72,10 @@ const { apiMock } = vi.hoisted(() => ({
     addKeys: vi.fn(),
     deleteKey: vi.fn(),
     checkKeys: vi.fn(),
+    updateProfile: vi.fn(),
+    testProxy: vi.fn(),
+    tmproxyLocations: vi.fn(() => Promise.resolve([])),
+    tmproxyIsps: vi.fn(() => Promise.resolve([])),
   },
 }));
 
@@ -161,6 +165,98 @@ describe("ProxyPage", () => {
 
     expect(screen.getByText("103.1.2.3:8000")).toBeTruthy();
     expect(screen.getByText("trực tiếp")).toBeTruthy();
+  });
+
+  it("counts a provider profile as proxied before its first launch", () => {
+    render(
+      <ProxyPage
+        profiles={[
+          profile({
+            id: "p1",
+            name: "Rotating",
+            proxy_provider: "tmproxy",
+            proxy_provider_key_set: true,
+          }),
+        ]}
+        onEdit={() => {}}
+      />,
+    );
+
+    expect(
+      screen.getByText((_, el) => el?.textContent?.replace(/\s/g, "") === "1/1"),
+    ).toBeTruthy();
+    expect(screen.getByText("lấy mới khi khởi chạy")).toBeTruthy();
+  });
+
+  it("assigns one proxy to every selected profile", async () => {
+    apiMock.updateProfile.mockResolvedValue(profile());
+    render(
+      <ProxyPage
+        profiles={[
+          profile({ id: "p1", name: "A" }),
+          profile({ id: "p2", name: "B" }),
+          profile({ id: "p3", name: "C" }),
+        ]}
+        onEdit={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Gán proxy hàng loạt/ }));
+    const dialog = screen.getByRole("dialog", { name: /Gán proxy hàng loạt/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Chọn tất cả/ }));
+
+    fireEvent.change(within(dialog).getByLabelText("Địa chỉ proxy"), {
+      target: { value: "http://user:pass@1.2.3.4:8000" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Gán cho 3 hồ sơ/ }));
+
+    await waitFor(() => expect(apiMock.updateProfile).toHaveBeenCalledTimes(3));
+    for (const id of ["p1", "p2", "p3"]) {
+      expect(apiMock.updateProfile).toHaveBeenCalledWith(id, {
+        proxy: "http://user:pass@1.2.3.4:8000",
+        proxy_provider: "none",
+        proxy_provider_key: "",
+      });
+    }
+  });
+
+  it("clears the proxy when the direct mode is chosen", async () => {
+    apiMock.updateProfile.mockResolvedValue(profile());
+    render(
+      <ProxyPage
+        profiles={[profile({ id: "p1", name: "A", proxy: "http://1.2.3.4:8000" })]}
+        onEdit={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Gán proxy hàng loạt/ }));
+    const dialog = screen.getByRole("dialog", { name: /Gán proxy hàng loạt/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Chọn tất cả/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Bỏ proxy/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: /Gán cho 1 hồ sơ/ }));
+
+    await waitFor(() =>
+      expect(apiMock.updateProfile).toHaveBeenCalledWith("p1", {
+        proxy: null,
+        proxy_provider: "none",
+        proxy_provider_key: "",
+      }),
+    );
+  });
+
+  it("refuses a malformed manual proxy before writing anything", () => {
+    render(<ProxyPage profiles={[profile({ id: "p1", name: "A" })]} onEdit={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Gán proxy hàng loạt/ }));
+    const dialog = screen.getByRole("dialog", { name: /Gán proxy hàng loạt/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Chọn tất cả/ }));
+    fireEvent.change(within(dialog).getByLabelText("Địa chỉ proxy"), {
+      target: { value: "not a proxy" },
+    });
+
+    const apply = within(dialog).getByRole("button", { name: /Gán cho 1 hồ sơ/ }) as HTMLButtonElement;
+    expect(apply.disabled).toBe(true);
+    expect(apiMock.updateProfile).not.toHaveBeenCalled();
   });
 });
 

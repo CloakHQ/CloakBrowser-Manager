@@ -55,10 +55,10 @@ export default function App() {
       <div className="h-screen flex items-center justify-center bg-surface-0 px-4">
         <div className="flex flex-col items-center gap-3">
           <div className="relative flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-brand/20 to-brand-deep/10 border border-brand/30 shadow-glow">
-            <Shield className="h-6 w-6 text-brand" />
+            <Shield className="h-6 w-6 text-brand-fg" />
           </div>
           <div className="flex items-center gap-2 text-fg-secondary text-sm font-medium">
-            <Loader2 className="h-4 w-4 animate-spin text-brand" />
+            <Loader2 className="h-4 w-4 animate-spin text-brand-fg" />
             <span>Đang tải...</span>
           </div>
         </div>
@@ -117,7 +117,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, actionError, clearActionError, create, update, remove, reorder, launch, stop, reset, duplicate } = useProfiles();
+  const { profiles, loading, error, actionError, clearActionError, create, update, remove, reorder, launch, stop, reset, duplicate, refresh } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("overview");
   const [sidebarOpen, setSidebarOpen] = useState(() =>
@@ -367,10 +367,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
       <div className="h-screen flex items-center justify-center bg-surface-0 px-4">
         <div className="flex flex-col items-center gap-3">
           <div className="relative flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-brand/20 to-brand-deep/10 border border-brand/30 shadow-glow">
-            <Shield className="h-6 w-6 text-brand" />
+            <Shield className="h-6 w-6 text-brand-fg" />
           </div>
           <div className="flex items-center gap-2 text-fg-secondary text-sm font-medium">
-            <Loader2 className="h-4 w-4 animate-spin text-brand" />
+            <Loader2 className="h-4 w-4 animate-spin text-brand-fg" />
             <span>Đang tải...</span>
           </div>
         </div>
@@ -468,7 +468,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                             type="button"
                             onClick={() => setView("view")}
                             className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
-                              view === "view" ? "bg-brand-subtle text-brand" : "text-fg-muted hover:text-fg"
+                              view === "view" ? "bg-brand-subtle text-brand-fg" : "text-fg-muted hover:text-fg"
                             }`}
                           >
                             <Eye className="h-3 w-3" />
@@ -478,7 +478,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                             type="button"
                             onClick={() => setView("edit")}
                             className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
-                              view === "edit" ? "bg-brand-subtle text-brand" : "text-fg-muted hover:text-fg"
+                              view === "edit" ? "bg-brand-subtle text-brand-fg" : "text-fg-muted hover:text-fg"
                             }`}
                           >
                             <SlidersHorizontal className="h-3 w-3" />
@@ -557,7 +557,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               />
             )}
 
-            {view === "proxy" && <ProxyPage profiles={profiles} onEdit={handleEditById} />}
+            {view === "proxy" && (
+              <ProxyPage profiles={profiles} onEdit={handleEditById} onApplied={refresh} />
+            )}
 
             {view === "license" && (
               <LicensePage status={systemStatus} onStatusChange={refreshStatus} />
