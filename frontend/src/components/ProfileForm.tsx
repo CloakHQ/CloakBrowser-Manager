@@ -9,6 +9,7 @@ import type {
   LicenseKeyEntry,
   Profile,
   ProfileCreateData,
+  ProxyKeyOption,
   ProxyProviderInfo,
   ProxyTestResult,
   TmProxyOption,
@@ -49,6 +50,8 @@ const TAG_COLORS = [
 const EMPTY_FORM: ProfileCreateData = {
   name: "",
   proxy_provider: "none",
+  proxy_account_id: null,
+  proxy_key_id: null,
   kiotproxy_region: "random",
   tmproxy_location_id: 0,
   tmproxy_isp_id: 0,
@@ -88,10 +91,12 @@ function folderPath(profile: Profile): string {
  */
 function formatProviderExpiry(value: number | string | null): string {
   if (value === null || value === "") return "";
-  const date =
-    typeof value === "number" || /^\d+$/.test(String(value))
-      ? new Date(Number(value) * 1000)
-      : new Date(value);
+  const numeric = typeof value === "number" || /^\d+$/.test(String(value));
+  const raw = numeric ? Number(value) : NaN;
+  // KiotProxy reports epoch millis; TMProxy reports epoch seconds or ISO.
+  const date = numeric
+    ? new Date(raw > 1e12 ? raw : raw * 1000)
+    : new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   return ` · hết hạn ${date.toLocaleString("vi-VN")}`;
 }
@@ -123,6 +128,8 @@ function formFromProfile(profile: Profile | null): ProfileCreateData {
     fingerprint_seed: profile.fingerprint_seed,
     proxy: profile.proxy,
     proxy_provider: profile.proxy_provider ?? "none",
+    proxy_account_id: profile.proxy_account_id,
+    proxy_key_id: profile.proxy_key_id,
     kiotproxy_region: profile.kiotproxy_region ?? "random",
     tmproxy_location_id: profile.tmproxy_location_id ?? 0,
     tmproxy_isp_id: profile.tmproxy_isp_id ?? 0,
@@ -148,6 +155,17 @@ function formFromProfile(profile: Profile | null): ProfileCreateData {
     notes: profile.notes,
     tags: profile.tags ?? [],
   };
+}
+
+/** The picker value that represents a stored profile's proxy choice. */
+function keyChoiceFromProfile(profile: Profile | null): string {
+  if (!profile || profile.proxy_provider === "none") return "manual";
+  if (profile.proxy_key_id === "random") return "random";
+  if (profile.proxy_account_id) {
+    const keyId = profile.proxy_key_id || profile.proxy_account_id;
+    return `${profile.proxy_account_id}::${keyId}`;
+  }
+  return "manual";
 }
 
 type Tab = "basic" | "network" | "hardware" | "options";
@@ -197,6 +215,12 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [currentProxyError, setCurrentProxyError] = useState<string | null>(null);
   const [tmLocations, setTmLocations] = useState<TmProxyOption[]>([]);
   const [tmIsps, setTmIsps] = useState<TmProxyOption[]>([]);
+  const [keyOptions, setKeyOptions] = useState<ProxyKeyOption[]>([]);
+  const [keyOptionsLoading, setKeyOptionsLoading] = useState(false);
+  const [keyOptionsError, setKeyOptionsError] = useState<string | null>(null);
+  // "", "random", "manual", or "<account_id>::<key_id>"
+  const [keyChoice, setKeyChoice] = useState("manual");
+  const keyChoiceTouched = useRef(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -214,6 +238,32 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const baseline = useRef<string>(serialize(form, ""));
   const current = useMemo(() => serialize(form, providerKey), [form, providerKey]);
   const dirty = current !== baseline.current;
+  const groupedKeyOptions = useMemo(() => {
+    const groups = new Map<
+      string,
+      { id: string; label: string; options: ProxyKeyOption[] }
+    >();
+    for (const option of keyOptions) {
+      const group = groups.get(option.account_id) ?? {
+        id: option.account_id,
+        label:
+          option.account_label ||
+          option.account_masked ||
+          option.account_id,
+        options: [],
+      };
+      group.options.push(option);
+      groups.set(option.account_id, group);
+    }
+    return [...groups.values()];
+  }, [keyOptions]);
+  const selectedSavedMissing =
+    !keyOptionsLoading &&
+    !keyOptionsError &&
+    keyChoice.includes("::") &&
+    !keyOptions.some(
+      (option) => `${option.account_id}::${option.key_id}` === keyChoice,
+    );
 
   useEffect(() => {
     if (profile) {
@@ -227,6 +277,10 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     setProviderKey("");
     setProviderTest(null);
     setProviderTestError(null);
+    setCurrentProxy(null);
+    setCurrentProxyError(null);
+    setKeyChoice(keyChoiceFromProfile(profile));
+    keyChoiceTouched.current = false;
     setTab("basic");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.id]);
@@ -257,6 +311,81 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     api.tmproxyLocations().then(setTmLocations).catch(() => setTmLocations([]));
     api.tmproxyIsps().then(setTmIsps).catch(() => setTmIsps([]));
   }, []);
+
+  // Saved provider keys become one dropdown. The raw key input is only shown
+  // for "manual"; random/specific choices are resolved server-side at launch.
+  useEffect(() => {
+    const provider = form.proxy_provider;
+    setKeyOptions([]);
+    setKeyOptionsError(null);
+    keyChoiceTouched.current = false;
+    if (!provider || provider === "none") {
+      setKeyOptionsLoading(false);
+      setKeyChoice("manual");
+      return;
+    }
+    let cancelled = false;
+    setKeyOptionsLoading(true);
+    api
+      .availableProxyKeys(provider, profile?.id)
+      .then((options) => {
+        if (!cancelled) setKeyOptions(options);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setKeyOptionsError(
+          err instanceof ApiError
+            ? err.message
+            : "Không tải được danh sách key đã lưu",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setKeyOptionsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.proxy_provider, profile?.id]);
+
+  // Default to the saved choice, else a random free key when one exists.
+  useEffect(() => {
+    if (keyOptionsLoading || keyChoiceTouched.current) return;
+    const provider = form.proxy_provider;
+    if (!provider || provider === "none") {
+      setKeyChoice("manual");
+      return;
+    }
+    const saved =
+      form.proxy_key_id === "random"
+        ? "random"
+        : form.proxy_account_id && form.proxy_key_id
+          ? `${form.proxy_account_id}::${form.proxy_key_id}`
+          : "";
+    if (saved) {
+      setKeyChoice(saved);
+      return;
+    }
+    if (
+      profile?.proxy_provider === provider &&
+      profile.proxy_provider_key_set
+    ) {
+      setKeyChoice("manual");
+      return;
+    }
+    setKeyChoice(
+      keyOptions.some((option) => option.key_id && !option.error)
+        ? "random"
+        : "manual",
+    );
+  }, [
+    keyOptionsLoading,
+    keyOptions,
+    form.proxy_provider,
+    form.proxy_account_id,
+    form.proxy_key_id,
+    profile?.proxy_provider,
+    profile?.proxy_provider_key_set,
+  ]);
   useEffect(() => {
     if (hostOs === "macos") {
       setForm((previous) => ({ ...previous, gpu_family: "auto" }));
@@ -282,24 +411,32 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     }
   };
 
-  const handleTestProvider = async () => {
-    if (!providerKey.trim() || form.proxy_provider === "none") return;
+  const handleNewProviderProxy = async () => {
+    if (form.proxy_provider === "none") return;
+    const manual = keyChoice === "manual";
+    if (manual && !providerKey.trim()) return;
+    if (!manual && !profile) return;
     setProviderTest(null);
     setProviderTestError(null);
     setTestingProvider(true);
     try {
-      if (form.proxy_provider === "kiotproxy") {
-        setProviderTest(
-          await api.kiotproxyNew(providerKey.trim(), form.kiotproxy_region ?? "random"),
-        );
+      if (manual) {
+        if (form.proxy_provider === "kiotproxy") {
+          setProviderTest(
+            await api.kiotproxyNew(providerKey.trim(), form.kiotproxy_region ?? "random"),
+          );
+        } else {
+          setProviderTest(
+            await api.tmproxyNew(
+              providerKey.trim(),
+              form.tmproxy_location_id ?? 0,
+              form.tmproxy_isp_id ?? 0,
+            ),
+          );
+        }
       } else {
-        setProviderTest(
-          await api.tmproxyNew(
-            providerKey.trim(),
-            form.tmproxy_location_id ?? 0,
-            form.tmproxy_isp_id ?? 0,
-          ),
-        );
+        if (!profile) return;
+        setProviderTest(await api.profileNewProxy(profile.id));
       }
     } catch (err) {
       setProviderTestError(
@@ -326,23 +463,81 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     }
   };
 
+  const chooseKey = (choice: string) => {
+    keyChoiceTouched.current = true;
+    setKeyChoice(choice);
+    setProviderTest(null);
+    setProviderTestError(null);
+    setCurrentProxy(null);
+    setCurrentProxyError(null);
+    if (choice === "random") {
+      setForm((prev) => ({
+        ...prev,
+        proxy_account_id: null,
+        proxy_key_id: "random",
+        proxy_provider_key: null,
+      }));
+      return;
+    }
+    if (choice === "manual") {
+      setForm((prev) => ({
+        ...prev,
+        proxy_account_id: null,
+        proxy_key_id: null,
+      }));
+      return;
+    }
+    const [accountId, ...rest] = choice.split("::");
+    setForm((prev) => ({
+      ...prev,
+      proxy_account_id: accountId,
+      proxy_key_id: rest.join("::") || accountId,
+      proxy_provider_key: null,
+    }));
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.name.trim()) return;
+    const provider = form.proxy_provider ?? "none";
+    const storedProvider = profile?.proxy_provider ?? "none";
+    const hasStoredKey =
+      profile?.proxy_provider === provider && profile.proxy_provider_key_set;
+    if (
+      provider !== "none" &&
+      keyChoice === "manual" &&
+      !providerKey.trim() &&
+      !hasStoredKey
+    ) {
+      toast.error("Chọn key đã lưu hoặc nhập API key của nhà cung cấp");
+      return;
+    }
     setSaving(true);
     try {
       const payload: ProfileCreateData = { ...form };
-      const storedProvider = profile?.proxy_provider ?? "none";
-      if (payload.proxy_provider === "none") {
-        // Clearing the source also clears the stored provider key.
+      if (provider === "none") {
         payload.proxy_provider_key = "";
-      } else if (providerKey.trim()) {
-        payload.proxy_provider_key = providerKey.trim();
-      } else if (payload.proxy_provider !== storedProvider) {
-        // Switching provider with an empty input must not reuse the old key.
+        payload.proxy_account_id = null;
+        payload.proxy_key_id = null;
+      } else if (keyChoice === "random") {
         payload.proxy_provider_key = "";
+        payload.proxy_account_id = null;
+        payload.proxy_key_id = "random";
+      } else if (keyChoice === "manual") {
+        payload.proxy_account_id = null;
+        payload.proxy_key_id = null;
+        if (providerKey.trim()) {
+          payload.proxy_provider_key = providerKey.trim();
+        } else if (provider !== storedProvider || !hasStoredKey) {
+          payload.proxy_provider_key = "";
+        } else {
+          delete payload.proxy_provider_key;
+        }
       } else {
-        delete payload.proxy_provider_key;
+        const [accountId, ...rest] = keyChoice.split("::");
+        payload.proxy_provider_key = "";
+        payload.proxy_account_id = accountId;
+        payload.proxy_key_id = rest.join("::") || accountId;
       }
       await onSave(payload);
       setProviderKey("");
@@ -728,10 +923,22 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 className="input"
                 value={form.proxy_provider ?? "none"}
                 onChange={(e) => {
-                  set("proxy_provider", e.target.value as "none" | "kiotproxy" | "tmproxy");
+                  setForm((prev) => ({
+                    ...prev,
+                    proxy_provider: e.target.value as
+                      | "none"
+                      | "kiotproxy"
+                      | "tmproxy",
+                    proxy_account_id: null,
+                    proxy_key_id: null,
+                  }));
+                  setKeyChoice("manual");
+                  keyChoiceTouched.current = false;
                   setProxyTest(null);
                   setProviderTest(null);
                   setProviderTestError(null);
+                  setCurrentProxy(null);
+                  setCurrentProxyError(null);
                 }}
               >
                 <option value="none">Tùy chỉnh (nhập tay)</option>
@@ -781,27 +988,103 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               <div className="space-y-3">
                 <div>
                   <label className="label">
-                    API key {form.proxy_provider === "kiotproxy" ? "KiotProxy" : "TMProxy"}
+                    Key {form.proxy_provider === "kiotproxy" ? "KiotProxy" : "TMProxy"}
                   </label>
-                  <input
-                    className="input font-mono"
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={providerKey}
-                    onChange={(e) => {
-                      setProviderKey(e.target.value);
-                      setProviderTest(null);
-                      setProviderTestError(null);
-                    }}
-                    placeholder={
-                      profile?.proxy_provider === form.proxy_provider &&
-                      profile?.proxy_provider_key_set
-                        ? `Đã lưu: ${profile.proxy_provider_key_masked ?? "•••"} · nhập để thay`
-                        : "Nhập API key của nhà cung cấp"
-                    }
-                  />
+                  <select
+                    className="input"
+                    value={selectedSavedMissing ? "__missing" : keyChoice}
+                    onChange={(e) => chooseKey(e.target.value)}
+                  >
+                    <option value="random">
+                      Ngẫu nhiên key còn trống (mỗi lần mở)
+                    </option>
+                    {groupedKeyOptions.map((group) => (
+                      <optgroup key={group.id} label={group.label}>
+                        {group.options.map((option) => {
+                          if (option.error) {
+                            return (
+                              <option
+                                key={`${option.account_id}-error`}
+                                value={`__error_${option.account_id}`}
+                                disabled
+                              >
+                                {group.label}: {option.error}
+                              </option>
+                            );
+                          }
+                          const value = `${option.account_id}::${option.key_id ?? ""}`;
+                          return (
+                            <option
+                              key={value}
+                              value={value}
+                              disabled={!option.key_id || option.in_use}
+                            >
+                              {option.key_masked ?? option.key_id ?? "key"}
+                              {option.status ? ` · ${option.status}` : ""}
+                              {option.in_use ? " · đang dùng" : ""}
+                              {formatProviderExpiry(option.expiration_at)}
+                            </option>
+                          );
+                        })}
+                      </optgroup>
+                    ))}
+                    {selectedSavedMissing && (
+                      <option value="__missing">
+                        Key đã lưu (không còn khả dụng)
+                      </option>
+                    )}
+                    <option value="manual">Nhập key thủ công…</option>
+                  </select>
+                  {keyOptionsLoading && (
+                    <p className="mt-1.5 flex items-center gap-1.5 text-2xs text-fg-muted">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Đang tải key đã lưu…
+                    </p>
+                  )}
+                  {keyOptionsError && (
+                    <p className="mt-1.5 text-2xs font-medium text-danger">
+                      {keyOptionsError}
+                    </p>
+                  )}
+                  {selectedSavedMissing && (
+                    <p className="mt-1.5 text-2xs font-medium text-danger">
+                      Key đã chọn không còn trong danh sách. Chọn key khác hoặc
+                      nhập tay.
+                    </p>
+                  )}
+                  {!keyOptionsLoading &&
+                    !keyOptionsError &&
+                    keyOptions.length === 0 && (
+                      <p className="mt-1.5 text-2xs text-fg-muted">
+                        Chưa có key đã lưu. Thêm tài khoản ở mục “Nhà cung cấp”
+                        hoặc nhập key thủ công.
+                      </p>
+                    )}
                 </div>
+
+                {keyChoice === "manual" && (
+                  <div>
+                    <label className="label">API key thủ công</label>
+                    <input
+                      className="input font-mono"
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={providerKey}
+                      onChange={(e) => {
+                        setProviderKey(e.target.value);
+                        setProviderTest(null);
+                        setProviderTestError(null);
+                      }}
+                      placeholder={
+                        profile?.proxy_provider === form.proxy_provider &&
+                        profile?.proxy_provider_key_set
+                          ? `Đã lưu: ${profile.proxy_provider_key_masked ?? "•••"} · nhập để thay`
+                          : "Nhập API key của nhà cung cấp"
+                      }
+                    />
+                  </div>
+                )}
 
                 {form.proxy_provider === "kiotproxy" ? (
                   <div>
@@ -861,9 +1144,18 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   <button
                     type="button"
                     className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
-                    onClick={handleTestProvider}
-                    disabled={!providerKey.trim() || testingProvider}
-                    title="Xoay một proxy mới cho key vừa nhập (key cũ bị thay thế)"
+                    onClick={handleNewProviderProxy}
+                    disabled={
+                      testingProvider ||
+                      (keyChoice === "manual"
+                        ? !providerKey.trim()
+                        : !profile || dirty)
+                    }
+                    title={
+                      keyChoice === "manual"
+                        ? "Xoay một proxy mới cho key vừa nhập (key cũ bị thay thế)"
+                        : "Lưu hồ sơ trước, rồi lấy proxy mới cho key đã chọn"
+                    }
                   >
                     {testingProvider && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                     Lấy proxy mới
@@ -1171,6 +1463,14 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   Ghim sẽ giữ một key cho hồ sơ này; để "key trống bất kỳ" thì
                   Manager sẽ thuê key chưa dùng.
                 </p>
+                {/* A pin to a removed key blocks this profile and nothing else —
+                    the form used to show it as a blank select with no hint. */}
+                {form.license_key_id && !keys.some((entry) => entry.id === form.license_key_id) && (
+                  <p className="mt-1 text-xs font-medium text-danger">
+                    Key đã ghim không còn trong kho nên hồ sơ này không mở được.
+                    Chọn "key trống bất kỳ" hoặc một key khác rồi lưu.
+                  </p>
+                )}
               </div>
             )}
             <label className="option-row">

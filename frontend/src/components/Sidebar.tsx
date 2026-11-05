@@ -1,12 +1,13 @@
-import { Globe, KeyRound, LayoutGrid, LogOut, Power, Settings, Shield } from "lucide-react";
+import { Globe, KeyRound, LayoutGrid, LogOut, Power, Server, Settings, Shield } from "lucide-react";
 import type { SystemStatus } from "../lib/api";
 import { TIER_LABEL } from "../lib/labels";
 
-export type Page = "overview" | "proxy" | "license" | "settings";
+export type Page = "overview" | "proxy" | "providers" | "license" | "settings";
 
 export const PAGE_TITLE: Record<Page, string> = {
   overview: "Tổng quan",
   proxy: "Proxy",
+  providers: "Nhà cung cấp",
   license: "Bản quyền",
   settings: "Cài đặt",
 };
@@ -14,6 +15,7 @@ export const PAGE_TITLE: Record<Page, string> = {
 const NAV: { key: Page; label: string; icon: typeof LayoutGrid }[] = [
   { key: "overview", label: "Tổng quan", icon: LayoutGrid },
   { key: "proxy", label: "Proxy", icon: Globe },
+  { key: "providers", label: "Nhà cung cấp", icon: Server },
   { key: "license", label: "Bản quyền", icon: KeyRound },
   { key: "settings", label: "Cài đặt", icon: Settings },
 ];

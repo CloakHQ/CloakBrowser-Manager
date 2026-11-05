@@ -21,7 +21,8 @@ DB_PATH = DATA_DIR / "profiles.db"
 
 _PROFILE_COLUMNS = (
     "id", "name", "fingerprint_seed", "proxy", "proxy_provider",
-    "proxy_provider_key", "kiotproxy_region", "tmproxy_location_id",
+    "proxy_provider_key", "proxy_account_id", "proxy_key_id",
+    "kiotproxy_region", "tmproxy_location_id",
     "tmproxy_isp_id", "timezone", "locale",
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
@@ -39,6 +40,8 @@ CREATE TABLE profiles (
     proxy TEXT,
     proxy_provider TEXT NOT NULL DEFAULT 'none',
     proxy_provider_key TEXT,
+    proxy_account_id TEXT,
+    proxy_key_id TEXT,
     kiotproxy_region TEXT NOT NULL DEFAULT 'random',
     tmproxy_location_id INTEGER NOT NULL DEFAULT 0,
     tmproxy_isp_id INTEGER NOT NULL DEFAULT 0,
@@ -314,6 +317,8 @@ def create_profile(
         "proxy": fields.get("proxy"),
         "proxy_provider": fields.get("proxy_provider", "none"),
         "proxy_provider_key": fields.get("proxy_provider_key") or None,
+        "proxy_account_id": fields.get("proxy_account_id") or None,
+        "proxy_key_id": fields.get("proxy_key_id") or None,
         "kiotproxy_region": fields.get("kiotproxy_region", "random"),
         "tmproxy_location_id": fields.get("tmproxy_location_id", 0),
         "tmproxy_isp_id": fields.get("tmproxy_isp_id", 0),
@@ -405,6 +410,9 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     if "proxy_provider_key" in fields:
         # An explicit null or "" clears the provider key.
         fields["proxy_provider_key"] = fields["proxy_provider_key"] or None
+    for key in ("proxy_account_id", "proxy_key_id"):
+        if key in fields:
+            fields[key] = fields[key] or None
     update_cols = []
     update_vals = []
     for col in _PROFILE_COLUMNS:

@@ -529,13 +529,9 @@ class BrowserManager:
     def __init__(
         self,
         runtime_config: RuntimeConfig | None = None,
-        license_key: str | None = None,
         release_channel: str | None = None,
     ):
         self.runtime = runtime_config or resolve_runtime()
-        # App-wide license: passed to every launch so the wrapper downloads the
-        # Pro build and injects the key the Pro binary needs to boot + take a seat.
-        self.license_key = license_key
         self.release_channel = release_channel
         # Resolved at startup by resolve_binary_status(); read by GET /api/status.
         self.license_tier = "none"
@@ -615,17 +611,19 @@ class BrowserManager:
         tier = "none"
         version = None
 
-        # The badge describes the key a launch would actually get, so a pool-only
-        # setup reports its tier instead of claiming "no key".
+        # The badge describes the key a launch would actually get, so the pool is
+        # the source. `resolve_license_key` still covers a key supplied outside
+        # the UI (CLOAKBROWSER_LICENSE_KEY / ~/.cloakbrowser/license.key), which
+        # is how Docker and CI hand one over.
         from . import key_pool
 
         pooled = key_pool.usable_keys()
-        key = resolve_license_key(self.license_key) or (pooled[0] if pooled else None)
+        key = (pooled[0] if pooled else None) or resolve_license_key(None)
         if not key:
             self.license_tier = tier
             self.license_plan = None
             self.binary_version = None
-            logger.info("No license key set: add one in Settings to launch profiles")
+            logger.info("No license key in the pool: add one to launch profiles")
             return
 
         try:
@@ -734,10 +732,11 @@ class BrowserManager:
         """Pick the key this launch gets, and reserve it.
 
         Order: the profile's pinned key, then the first claimable key in the
-        shared pool that no other running profile holds, then the app-wide key.
-        Reserving under the manager lock is what makes N free-tier keys usable by
-        N concurrent profiles: a key is never handed to a second browser while
-        the first still holds its seat.
+        shared pool that no other running profile holds, then a key supplied
+        outside the UI (environment / license.key file). Reserving under the
+        manager lock is what makes N free-tier keys usable by N concurrent
+        profiles: a key is never handed to a second browser while the first still
+        holds its seat.
 
         A key whose browser died is not immediately claimable — the license
         server keeps counting that abandoned session for a plan-specific grace
@@ -752,6 +751,7 @@ class BrowserManager:
         launch.
         """
         from . import key_pool
+        from cloakbrowser.license import resolve_license_key
 
         profile_id = profile["id"]
         leased = self._leased_key_ids(exclude=profile_id)
@@ -813,11 +813,13 @@ class BrowserManager:
             key_pool.set_lease(profile_id, entry["id"], plan=entry.get("plan"))
             return entry["key"], entry["id"]
 
-        # Pool exhausted (or empty) — fall back to the single app-wide key, which
-        # is also leased so a pool key can never double-book the same seat.
-        app_key = self.license_key
-        if app_key:
-            app_id = key_pool.key_id(app_key)
+        # Pool exhausted (or empty) — fall back to a key handed in outside the UI
+        # (CLOAKBROWSER_LICENSE_KEY or ~/.cloakbrowser/license.key), which is how
+        # Docker and CI supply one. It is leased too, so a pool key can never
+        # double-book the same seat.
+        external_key = resolve_license_key(None)
+        if external_key:
+            app_id = key_pool.key_id(external_key)
             if app_id in leased or app_id in reserved:
                 holders = self._profile_names(
                     [owner for owner, key_id in self._key_leases.items()
@@ -825,18 +827,18 @@ class BrowserManager:
                 )
                 pins = self._profile_names(self._pin_owner_ids(app_id, exclude=profile_id))
                 who = ", ".join(
-                    [f"{name} (đang chạy)" for name in holders]
-                    + [f"{name} (ghim key)" for name in pins]
+                    [f"{name} (running)" for name in holders]
+                    + [f"{name} (pinned to it, not running)" for name in pins]
                 )
                 raise CloakBrowserLicenseError(
-                    "CloakBrowser Pro: session limit reached — the app-wide license "
-                    f"key is already held by {who or 'another profile'}. Stop that "
-                    "profile, clear its pin, or add a key to the pool so profiles can "
-                    "run side by side."
+                    "CloakBrowser Pro: session limit reached — the license key from "
+                    f"the environment is already held by {who or 'another profile'}. "
+                    "Stop that profile, clear its pin, or add a key to the pool so "
+                    "profiles can run side by side."
                 )
             self._key_leases[profile_id] = app_id
             key_pool.set_lease(profile_id, app_id, plan=self.license_plan)
-            return app_key, app_id
+            return external_key, app_id
         pooled = key_pool.entries()
         if pooled and not key_pool.usable_keys():
             # Every pooled key was rejected. That is a dead pool, not a busy one,
@@ -965,6 +967,17 @@ class BrowserManager:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         return f"{provider}:{digest}"
 
+    async def proxy_key_fingerprints(
+        self, *, exclude_profile: str | None = None
+    ) -> set[str]:
+        """Fingerprints currently leased, optionally ignoring one profile."""
+        async with self._lock:
+            return {
+                fingerprint
+                for owner, fingerprint in self._proxy_leases.items()
+                if owner != exclude_profile
+            }
+
     async def _claim_proxy(
         self, profile: dict[str, Any]
     ) -> tuple[dict[str, Any] | None, str | None, str | None, str | None]:
@@ -974,25 +987,61 @@ class BrowserManager:
         racing on the same key cannot both receive a proxy. A failed fetch
         releases the reservation again.
         """
-        from . import proxy_providers
+        from . import proxy_key_source, proxy_providers
 
         provider = (profile.get("proxy_provider") or "none").strip().lower()
         if provider not in ("kiotproxy", "tmproxy"):
             return None, None, None, None
-        key = (profile.get("proxy_provider_key") or "").strip()
-        if not key:
-            raise ValueError(f"{provider} is selected but no API key is configured")
-        fingerprint = self._proxy_fingerprint(provider, key)
         profile_id = profile["id"]
+        key = (profile.get("proxy_provider_key") or "").strip()
 
-        async with self._lock:
-            for owner, held in self._proxy_leases.items():
-                if held == fingerprint and owner != profile_id:
-                    raise ValueError(
-                        f"The {provider} key is already in use by running profile {owner}. "
-                        "Each provider key can hand out one proxy at a time; use another key."
+        if not proxy_key_source.uses_saved_selection(profile):
+            if not key:
+                raise ValueError(
+                    f"{provider} is selected but no API key is configured"
+                )
+            fingerprint = self._proxy_fingerprint(provider, key)
+            async with self._lock:
+                for owner, held in self._proxy_leases.items():
+                    if held == fingerprint and owner != profile_id:
+                        raise ValueError(
+                            f"The {provider} key is already in use by running profile {owner}. "
+                            "Each provider key can hand out one proxy at a time; use another key."
+                        )
+                self._proxy_leases[profile_id] = fingerprint
+        else:
+            selected = False
+            for _ in range(3):
+                exclude = await self.proxy_key_fingerprints(exclude_profile=profile_id)
+                try:
+                    key = await proxy_key_source.resolve_profile_key(
+                        profile, exclude_fingerprints=exclude
                     )
-            self._proxy_leases[profile_id] = fingerprint
+                except proxy_key_source.NoAvailableProxyKey as exc:
+                    raise ValueError(str(exc)) from exc
+                except proxy_providers.ProxyProviderError as exc:
+                    raise ValueError(str(exc)) from exc
+                fingerprint = self._proxy_fingerprint(provider, key)
+                async with self._lock:
+                    conflict = any(
+                        held == fingerprint and owner != profile_id
+                        for owner, held in self._proxy_leases.items()
+                    )
+                    if conflict and proxy_key_source.is_random_selection(profile):
+                        continue
+                    if conflict:
+                        raise ValueError(
+                            f"The selected {provider} key is already in use by "
+                            "another running profile. Pick another key or use random."
+                        )
+                    self._proxy_leases[profile_id] = fingerprint
+                    selected = True
+                    break
+            if not selected:
+                raise ValueError(
+                    f"No free {provider} key is available. Every key is expired or "
+                    "already used by another running profile."
+                )
 
         try:
             info = await proxy_providers.new_for(

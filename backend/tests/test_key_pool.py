@@ -345,10 +345,15 @@ async def test_a_seat_denial_does_not_retire_the_key(pool, monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_app_wide_key_is_leased_when_the_pool_is_empty(pool, monkeypatch, tmp_path: Path):
+async def test_an_external_key_is_leased_when_the_pool_is_empty(
+    pool, monkeypatch, tmp_path: Path
+):
+    """A key handed over via env/file (Docker, CI) is still honoured."""
     from backend import browser_manager as module
+    import cloakbrowser.license as license_module
 
-    manager = BrowserManager(NATIVE_RUNTIME, license_key="cb_appwide")
+    monkeypatch.setattr(license_module, "resolve_license_key", lambda key=None: "cb_appwide")
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
 
     async def launch(**kwargs):
@@ -375,8 +380,14 @@ def _fake_seats(monkeypatch, *, state="ok", active=0, limit=1, calls=None):
     monkeypatch.setattr(license_module, "get_session_seats", fake)
 
 
-async def _launching_manager(module, monkeypatch, *, license_key=None):
-    manager = BrowserManager(NATIVE_RUNTIME, license_key=license_key)
+async def _launching_manager(module, monkeypatch, *, external_key=None):
+    if external_key is not None:
+        import cloakbrowser.license as license_module
+
+        monkeypatch.setattr(
+            license_module, "resolve_license_key", lambda key=None: external_key
+        )
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
 
     async def launch(**kwargs):
@@ -526,7 +537,7 @@ async def test_a_stale_pin_to_a_removed_key_does_not_block_other_profiles(
     live_id = pool.key_id("cb_live")
 
     db.create_profile(name="stale", profile_id="stale", license_key_id="deadbeef0000")
-    manager = await _launching_manager(module, monkeypatch, license_key="cb_live")
+    manager = await _launching_manager(module, monkeypatch, external_key="cb_live")
 
     # The stale pin's owner is still refused for its own (explained) reason...
     stale = _profile(tmp_path, "stale")
@@ -546,7 +557,7 @@ async def test_a_seat_refusal_names_the_profile_holding_the_app_wide_key(
 ):
     from backend import browser_manager as module
 
-    manager = await _launching_manager(module, monkeypatch, license_key="cb_appwide")
+    manager = await _launching_manager(module, monkeypatch, external_key="cb_appwide")
     owner = _profile(tmp_path, "owner")
     running = await manager.launch(owner)
 

@@ -84,8 +84,6 @@ vi.mock("../lib/api", () => ({ api: apiMock }));
 beforeEach(() => {
   vi.clearAllMocks();
   const settings: ManagerSettings = {
-    license_key_set: true,
-    license_key_masked: "cb_abc…wxyz",
     release_channel: "stable",
     key_pool_size: 3,
   };
@@ -309,11 +307,11 @@ describe("ProfileTable", () => {
 });
 
 describe("LicensePage", () => {
-  it("shows the tier, pool size and the masked shared key", async () => {
+  it("shows the tier and pool size", async () => {
     render(<LicensePage status={status} onStatusChange={() => {}} />);
 
     expect(screen.getByText("Key miễn phí")).toBeTruthy();
-    expect(await screen.findByText("cb_abc…wxyz")).toBeTruthy();
+    expect(await screen.findByText("3")).toBeTruthy();
     await waitFor(() => expect(apiMock.getSettings).toHaveBeenCalled());
   });
 });

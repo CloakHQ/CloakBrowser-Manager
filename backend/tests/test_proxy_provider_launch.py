@@ -34,6 +34,8 @@ def _profile(tmp_path: Path, name: str, provider: str = "kiotproxy") -> dict:
         "set_google_default": False,
         "proxy_provider": provider,
         "proxy_provider_key": f"{provider}-key",
+        "proxy_account_id": None,
+        "proxy_key_id": None,
         "kiotproxy_region": "bac",
         "tmproxy_location_id": 9,
         "tmproxy_isp_id": 1,
@@ -165,3 +167,130 @@ async def test_failed_launch_releases_the_provider_proxy(tmp_db, monkeypatch, tm
 
     release.assert_awaited_once_with("kiotproxy", "kiotproxy-key")
     assert manager._proxy_leases == {}
+
+
+@pytest.mark.asyncio
+async def test_launch_resolves_a_random_saved_key(
+    tmp_db, monkeypatch, tmp_path: Path
+):
+    from backend import proxy_accounts, proxy_key_source
+
+    account = proxy_accounts.add_account("kiotproxy", "api-token", "saved")
+    keys = [
+        {
+            "id": "busy",
+            "value": "busy-key",
+            "value_masked": "busy…-key",
+            "status": "ACTIVE",
+            "expiration_at": None,
+            "deleted": False,
+        },
+        {
+            "id": "free",
+            "value": "free-key",
+            "value_masked": "free…-key",
+            "status": "ACTIVE",
+            "expiration_at": None,
+            "deleted": False,
+        },
+    ]
+    monkeypatch.setattr(
+        proxy_providers, "kiotproxy_keys", AsyncMock(return_value=keys)
+    )
+    new_proxy = AsyncMock(
+        return_value={
+            "provider": "kiotproxy",
+            "http": "http://1.2.3.4:1",
+            "socks5": None,
+            "host": "1.2.3.4",
+            "real_ip": "1.2.3.4",
+            "location": "Hà Nội",
+            "isp": None,
+            "expires_at": None,
+            "ttl": None,
+            "ttc": None,
+            "next_request_at": None,
+            "raw": {},
+        }
+    )
+    monkeypatch.setattr(proxy_providers, "new_for", new_proxy)
+    monkeypatch.setattr(proxy_providers, "release_for", AsyncMock())
+    monkeypatch.setattr(
+        module, "launch_persistent_context_async", AsyncMock(return_value=_fake_context())
+    )
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+
+    profile = _profile(tmp_path, "random", provider="kiotproxy")
+    profile["proxy_provider_key"] = None
+    profile["proxy_account_id"] = account["id"]
+    profile["proxy_key_id"] = "random"
+
+    running = await manager.launch(profile)
+
+    selected = new_proxy.await_args.args[1]
+    assert selected in {"busy-key", "free-key"}
+    assert running.proxy_provider_key == selected
+    assert manager._proxy_leases["random"] == proxy_key_source.key_fingerprint(
+        "kiotproxy", selected
+    )
+
+
+@pytest.mark.asyncio
+async def test_random_launch_skips_a_key_held_by_another_profile(
+    tmp_db, monkeypatch, tmp_path: Path
+):
+    from backend import proxy_accounts
+
+    account = proxy_accounts.add_account("kiotproxy", "api-token", "saved")
+    keys = [
+        {
+            "id": "one",
+            "value": "key-one",
+            "value_masked": "key…-one",
+            "status": "ACTIVE",
+            "expiration_at": None,
+            "deleted": False,
+        }
+    ]
+    monkeypatch.setattr(
+        proxy_providers, "kiotproxy_keys", AsyncMock(return_value=keys)
+    )
+    monkeypatch.setattr(
+        proxy_providers,
+        "new_for",
+        AsyncMock(
+            return_value={
+                "provider": "kiotproxy",
+                "http": "http://1.2.3.4:1",
+                "socks5": None,
+                "host": "1.2.3.4",
+                "real_ip": "1.2.3.4",
+                "location": "Hà Nội",
+                "isp": None,
+                "expires_at": None,
+                "ttl": None,
+                "ttc": None,
+                "next_request_at": None,
+                "raw": {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        module, "launch_persistent_context_async", AsyncMock(return_value=_fake_context())
+    )
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+
+    first = _profile(tmp_path, "first")
+    first["proxy_provider_key"] = None
+    first["proxy_account_id"] = account["id"]
+    first["proxy_key_id"] = "one"
+    await manager.launch(first)
+
+    second = _profile(tmp_path, "second")
+    second["proxy_provider_key"] = None
+    second["proxy_account_id"] = account["id"]
+    second["proxy_key_id"] = "random"
+    with pytest.raises(ValueError, match="No free KiotProxy key"):
+        await manager.launch(second)

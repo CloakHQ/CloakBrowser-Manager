@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from starlette.testclient import TestClient
 
 from backend import database as db
+from backend import key_pool
 from backend import main
 from backend.models import ProfileDuplicateRequest
 from backend.browser_manager import BrowserManager, RunningProfile
@@ -731,61 +732,50 @@ def settings_env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_db / "settings.json"
     monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
     monkeypatch.setattr(main.browser_mgr, "resolve_binary_status", MagicMock())
-    # Known baseline so masking/clearing is deterministic.
-    monkeypatch.setattr(main.browser_mgr, "license_key", None)
     monkeypatch.setattr(main.browser_mgr, "release_channel", "stable")
     return path
 
 
-def test_get_settings_no_key(app_client: TestClient, settings_env: Path):
+def test_get_settings_reports_the_pool(app_client: TestClient, settings_env: Path):
+    key_pool.add("cb_one\ncb_two")
     resp = app_client.get("/api/settings")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["license_key_set"] is False
-    assert data["license_key_masked"] is None
+    assert "license_key_set" not in data
+    assert "license_key_masked" not in data
+    assert data["key_pool_size"] == 2
     assert data["release_channel"] == "stable"
 
 
-def test_get_settings_masks_key(app_client: TestClient, settings_env: Path):
-    main.browser_mgr.license_key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    resp = app_client.get("/api/settings")
-    data = resp.json()
-    assert data["license_key_set"] is True
-    masked = data["license_key_masked"]
-    # Recognisable but not the whole key.
-    assert masked == "cb_ba…63aa"
-    assert "b142a68bc3088" not in masked
+def test_put_settings_sets_channel(app_client: TestClient, settings_env: Path):
+    resp = app_client.put("/api/settings", json={"release_channel": "preview"})
+    assert resp.status_code == 200
+    assert main.browser_mgr.release_channel == "preview"
+    import json
+
+    assert json.loads(settings_env.read_text())["release_channel"] == "preview"
 
 
-def test_put_settings_persists_and_hot_applies(
+def test_lifespan_seeds_the_pool_from_the_legacy_settings_key(
     app_client: TestClient, settings_env: Path
 ):
-    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    resp = app_client.put("/api/settings", json={"license_key": key})
-    assert resp.status_code == 200
-    # Hot-applied to the live browser manager.
-    assert main.browser_mgr.license_key == key
-    main.browser_mgr.resolve_binary_status.assert_called_once()
-    # Persisted to settings.json.
-    import json
-
-    assert json.loads(settings_env.read_text())["license_key"] == key
+    """An upgrade from the app-wide key keeps working without user action."""
+    settings_env.write_text('{"license_key": "cb_carried_over"}')
+    main._seed_legacy_keys_into_pool()
+    assert [entry["key"] for entry in key_pool.entries()] == ["cb_carried_over"]
 
 
-def test_put_settings_clears_key(app_client: TestClient, settings_env: Path):
-    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    main.browser_mgr.license_key = key
-    settings_env.write_text('{"license_key": "%s"}' % key)
+def test_lifespan_seeds_the_pool_from_the_environment(
+    app_client: TestClient, settings_env: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Docker/CI hand a key over via env; it must still reach the pool."""
+    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", "cb_from_env")
+    main._seed_legacy_keys_into_pool()
+    assert [entry["key"] for entry in key_pool.entries()] == ["cb_from_env"]
+    # Re-running on every start is a no-op, not a duplicate.
+    main._seed_legacy_keys_into_pool()
+    assert len(key_pool.entries()) == 1
 
-    resp = app_client.put("/api/settings", json={"license_key": ""})
-    assert resp.status_code == 200
-    assert main.browser_mgr.license_key is None
-    import json
-
-    assert "license_key" not in json.loads(settings_env.read_text())
-
-
-def test_put_settings_sets_channel(app_client: TestClient, settings_env: Path):
     resp = app_client.put("/api/settings", json={"release_channel": "preview"})
     assert resp.status_code == 200
     assert main.browser_mgr.release_channel == "preview"
@@ -1016,6 +1006,150 @@ def test_profile_current_proxy_needs_a_stored_key(app_client: TestClient):
 
 def test_profile_current_proxy_404s_for_an_unknown_profile(app_client: TestClient):
     assert app_client.post("/api/profiles/nope/proxy/current").status_code == 404
+
+
+def test_profile_saved_key_selection_resolves_at_use(app_client: TestClient, monkeypatch):
+    """A saved profile keeps ids, not the secret; the resolver supplies the key."""
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    key_row = {
+        "id": "key-1",
+        "value": "Kraw-secret",
+        "value_masked": "Kraw…cret",
+        "status": "ACTIVE",
+        "expiration_at": int(time.time() * 1000) + 86_400_000,
+        "deleted": False,
+    }
+    monkeypatch.setattr(
+        main.proxy_providers, "kiotproxy_keys", AsyncMock(return_value=[key_row])
+    )
+    account = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    created = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "saved",
+            "proxy_provider": "kiotproxy",
+            "proxy_account_id": account["id"],
+            "proxy_key_id": "key-1",
+        },
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["proxy_account_id"] == account["id"]
+    assert body["proxy_key_id"] == "key-1"
+    assert body["proxy_provider_key_set"] is False
+
+    seen: dict[str, str] = {}
+
+    async def fake_current(provider: str, key: str):
+        seen["provider"], seen["key"] = provider, key
+        return {"provider": provider, "host": "1.2.3.4:8000"}
+
+    monkeypatch.setattr(main.proxy_providers, "current_for", fake_current)
+    resp = app_client.post(f"/api/profiles/{body['id']}/proxy/current")
+    assert resp.status_code == 200
+    assert seen == {"provider": "kiotproxy", "key": "Kraw-secret"}
+
+
+def test_random_key_has_no_current_proxy_before_launch(app_client: TestClient):
+    profile_id = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "random",
+            "proxy_provider": "kiotproxy",
+            "proxy_key_id": "random",
+        },
+    ).json()["id"]
+
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 400
+    assert "random key" in resp.json()["detail"]
+
+
+def test_available_keys_endpoint_hides_raw_values(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "key-1",
+                    "value": "Kraw-secret",
+                    "value_masked": "Kraw…cret",
+                    "status": "ACTIVE",
+                    "expiration_at": int(time.time() * 1000) + 86_400_000,
+                    "deleted": False,
+                },
+                {
+                    "id": "key-2",
+                    "value": "Kexpired",
+                    "value_masked": "Kexpi…ired",
+                    "status": "ACTIVE",
+                    "expiration_at": 1,
+                    "deleted": False,
+                },
+            ]
+        ),
+    )
+    account = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    resp = app_client.get("/api/proxy-providers/kiotproxy/available-keys")
+    assert resp.status_code == 200
+    options = resp.json()
+    assert [option["key_id"] for option in options] == ["key-1"]
+    assert options[0]["account_id"] == account["id"]
+    assert options[0]["key_masked"] == "Kraw…cret"
+    assert "value" not in options[0]
+
+
+def test_update_profile_switches_between_saved_and_manual_keys(
+    app_client: TestClient, monkeypatch
+):
+    created = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "switch",
+            "proxy_provider": "kiotproxy",
+            "proxy_provider_key": "manual-secret",
+        },
+    ).json()
+
+    saved = app_client.put(
+        f"/api/profiles/{created['id']}",
+        json={"proxy_account_id": "acct", "proxy_key_id": "random"},
+    ).json()
+    assert saved["proxy_account_id"] == "acct"
+    assert saved["proxy_key_id"] == "random"
+    assert saved["proxy_provider_key_set"] is False
+
+    manual = app_client.put(
+        f"/api/profiles/{created['id']}",
+        json={"proxy_provider_key": "new-manual-secret"},
+    ).json()
+    assert manual["proxy_account_id"] is None
+    assert manual["proxy_key_id"] is None
+    assert manual["proxy_provider_key_set"] is True
+
+    disabled = app_client.put(
+        f"/api/profiles/{created['id']}", json={"proxy_provider": "none"}
+    ).json()
+    assert disabled["proxy_provider_key_set"] is False
+    assert disabled["proxy_account_id"] is None
+    assert disabled["proxy_key_id"] is None
+
 
 
 def test_bundle_dir_is_repo_root_when_unfrozen():
@@ -1739,3 +1873,182 @@ def test_renaming_while_running_leaves_the_name_unchanged(app_client: TestClient
     resp = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Live 2"})
     assert resp.status_code == 409
     assert app_client.get(f"/api/profiles/{created['id']}").json()["name"] == "Live"
+
+
+# ── Proxy provider accounts ──────────────────────────────────────────────────
+
+
+def test_proxy_account_add_list_and_delete(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_stats",
+        AsyncMock(return_value={"plan": "VIP", "expired_at": "2026-01-01T00:00:00Z"}),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts",
+        json={"provider": "tmproxy", "secret": "tm-secret-key", "label": "chính"},
+    )
+    assert created.status_code == 201
+    data = created.json()
+    assert data["provider"] == "tmproxy"
+    assert data["label"] == "chính"
+    assert data["secret_masked"] == "tm-se…-key"
+    assert "secret" not in data
+
+    listed = app_client.get("/api/proxy-accounts")
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [data["id"]]
+
+    assert app_client.delete(f"/api/proxy-accounts/{data['id']}").status_code == 200
+    assert app_client.get("/api/proxy-accounts").json() == []
+
+
+def test_proxy_account_rejects_bad_credential(app_client: TestClient, monkeypatch):
+    from backend.proxy_providers import ProxyProviderError
+
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_stats",
+        AsyncMock(side_effect=ProxyProviderError("tmproxy", "tmproxy: invalid key")),
+    )
+
+    resp = app_client.post(
+        "/api/proxy-accounts", json={"provider": "tmproxy", "secret": "bad"}
+    )
+    assert resp.status_code == 502
+    assert "invalid key" in resp.json()["detail"]
+
+
+def test_kiotproxy_account_sync_hides_raw_key(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(
+            return_value={
+                "id": "user-1",
+                "username": "demo",
+                "max_key": 10,
+                "balance": 50000,
+                "paid": 0,
+                "keys": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "key-1",
+                    "value": "Ksecret123456",
+                    "value_masked": "Ksecr…3456",
+                    "status": "ACTIVE",
+                    "effective_at": 1793863073683,
+                    "expiration_at": 1793949473683,
+                    "package_id": "pkg",
+                    "package_period_id": None,
+                    "quantity_day": 30,
+                    "description": None,
+                    "deleted": False,
+                }
+            ]
+        ),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    )
+    assert created.status_code == 201
+
+    synced = app_client.post(f"/api/proxy-accounts/{created.json()['id']}/sync")
+    assert synced.status_code == 200
+    body = synced.json()
+    assert body["user"]["username"] == "demo"
+    assert body["keys"][0]["key_masked"] == "Ksecr…3456"
+    assert "value" not in body["keys"][0]
+
+
+def test_kiotproxy_account_reveal_returns_the_selected_key(
+    app_client: TestClient, monkeypatch
+):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_find_key",
+        AsyncMock(
+            return_value={
+                "id": "key-1",
+                "value": "Kraw-value",
+                "value_masked": "Kraw…alue",
+                "expiration_at": 1793872080308,
+            }
+        ),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    resp = app_client.post(
+        f"/api/proxy-accounts/{created['id']}/keys/key-1/reveal"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    body = resp.json()
+    assert body["key"] == "Kraw-value"
+    assert body["key_masked"] == "Kraw…alue"
+    assert body["expiration_at"] == 1793872080308
+
+
+def test_tmproxy_account_reveal_returns_the_account_key(
+    app_client: TestClient, monkeypatch
+):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_stats",
+        AsyncMock(return_value={"plan": "VIP"}),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts",
+        json={"provider": "tmproxy", "secret": "tm-secret-key"},
+    ).json()
+
+    resp = app_client.post(
+        f"/api/proxy-accounts/{created['id']}/keys/{created['id']}/reveal"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.json()["key"] == "tm-secret-key"
+
+
+def test_kiotproxy_account_extend_resolves_key_by_id(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_find_key",
+        AsyncMock(return_value={"id": "key-1", "value": "Kraw-value"}),
+    )
+    extend = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.proxy_providers, "kiotproxy_extend_key", extend)
+
+    created = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    resp = app_client.post(
+        f"/api/proxy-accounts/{created['id']}/keys/key-1/extend",
+        json={"number_of_periods": 2},
+    )
+    assert resp.status_code == 200
+    extend.assert_awaited_once_with("api-token", "Kraw-value", 2)

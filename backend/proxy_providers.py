@@ -35,6 +35,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 
 KIOTPROXY_API_BASE = "https://api.kiotproxy.com/api/v1"
+KIOTPROXY_PUBLIC_BASE = "https://api.kiotproxy.com/api/public"
 TMPROXY_API_BASE = "https://tmproxy.com/api/proxy"
 
 # KiotProxy regions, exactly as the API spells them.
@@ -87,16 +88,20 @@ async def _request_json(
     provider: str,
     params: dict[str, Any] | None = None,
     json: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Call a provider endpoint and return its decoded JSON object.
 
     Network errors, non-2xx responses and non-object bodies all become a
     :class:`ProxyProviderError`, so callers have one failure path.
     """
+    request_headers = {"Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
     try:
         async with httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT,
-            headers={"Accept": "application/json"},
+            headers=request_headers,
         ) as client:
             response = await client.request(method, url, params=params, json=json)
     except httpx.HTTPError as exc:
@@ -156,6 +161,56 @@ def _prefixed(scheme: str, value: str | None) -> str | None:
     if not value:
         return None
     return value if "://" in value else f"{scheme}://{value}"
+
+
+def _mask_key(key: str | None) -> str | None:
+    """Show enough of a key/token to recognise it, never the whole value."""
+    if not key:
+        return None
+    if len(key) <= 9:
+        return "•" * len(key)
+    return f"{key[:5]}…{key[-4:]}"
+
+
+def _kiotproxy_key_info(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one key row from the KiotProxy account API."""
+    return {
+        "id": data.get("id"),
+        "value": data.get("value"),
+        "value_masked": _mask_key(data.get("value")),
+        "status": data.get("status"),
+        "effective_at": data.get("effectiveAt"),
+        "expiration_at": data.get("expirationAt"),
+        "description": data.get("description"),
+        "package_id": data.get("packageId"),
+        "package_period_id": data.get("packagePeriodId"),
+        "quantity_day": data.get("quantityDay"),
+        "deleted": bool(data.get("deleted")),
+        "http_static_proxy": data.get("httpStaticProxy"),
+        "socks5_static_proxy": data.get("socks5StaticProxy"),
+    }
+
+
+def public_key_info(key: dict[str, Any]) -> dict[str, Any]:
+    """Strip the raw key value before handing a key row to the UI."""
+    return {
+        "id": key.get("id"),
+        "key_masked": key.get("value_masked"),
+        "status": key.get("status"),
+        "effective_at": key.get("effective_at"),
+        "expiration_at": key.get("expiration_at"),
+        "description": key.get("description"),
+        "package_id": key.get("package_id"),
+        "package_period_id": key.get("package_period_id"),
+        "quantity_day": key.get("quantity_day"),
+        "deleted": key.get("deleted"),
+    }
+
+
+def _require_kiotproxy_success(payload: dict[str, Any]) -> Any:
+    if payload.get("success") is not True:
+        raise _provider_error("kiotproxy", payload)
+    return payload.get("data")
 
 
 def _kiotproxy_info(data: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +392,201 @@ async def tmproxy_isps() -> list[dict[str, Any]]:
         for item in isps
         if isinstance(item, dict)
     ]
+
+
+# ── KiotProxy account API (Api-token, not the proxy key) ────────────────────
+# These endpoints manage the keys themselves: list, extend, buy, delete. They
+# authenticate with the account's API token from the KiotProxy dashboard, which
+# is a different secret from the proxy key a profile uses.
+
+
+def _kiotproxy_account_headers(api_token: str) -> dict[str, str]:
+    return {"Api-token": api_token}
+
+
+async def kiotproxy_user_info(api_token: str) -> dict[str, Any]:
+    payload = await _request_json(
+        "GET",
+        f"{KIOTPROXY_PUBLIC_BASE}/get-user-info",
+        provider="kiotproxy",
+        headers=_kiotproxy_account_headers(api_token),
+    )
+    data = _require_kiotproxy_success(payload)
+    if not isinstance(data, dict):
+        raise _provider_error("kiotproxy", payload)
+    return {
+        "id": data.get("id"),
+        "username": data.get("username"),
+        "max_key": data.get("maxKey"),
+        "balance": data.get("balance"),
+        "paid": data.get("paid"),
+        "keys": [
+            _kiotproxy_key_info(item)
+            for item in data.get("keys") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+async def kiotproxy_keys(api_token: str) -> list[dict[str, Any]]:
+    payload = await _request_json(
+        "GET",
+        f"{KIOTPROXY_PUBLIC_BASE}/keys",
+        provider="kiotproxy",
+        headers=_kiotproxy_account_headers(api_token),
+    )
+    data = _require_kiotproxy_success(payload)
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise _provider_error("kiotproxy", payload)
+    return [_kiotproxy_key_info(item) for item in data if isinstance(item, dict)]
+
+
+async def kiotproxy_key_detail(api_token: str, key_id: str) -> dict[str, Any]:
+    payload = await _request_json(
+        "GET",
+        f"{KIOTPROXY_PUBLIC_BASE}/keys/{quote(key_id, safe='')}",
+        provider="kiotproxy",
+        headers=_kiotproxy_account_headers(api_token),
+    )
+    data = _require_kiotproxy_success(payload)
+    if not isinstance(data, dict):
+        raise _provider_error("kiotproxy", payload)
+    return _kiotproxy_key_info(data)
+
+
+async def kiotproxy_find_key(api_token: str, key_id: str) -> dict[str, Any] | None:
+    """Resolve a dashboard key id to the row holding its raw ``value``.
+
+    Actions address a key by id so the raw key never has to travel through the
+    Manager's API; KiotProxy's action endpoints take the value instead.
+    """
+    for key in await kiotproxy_keys(api_token):
+        if key.get("id") == key_id:
+            return key
+    return None
+
+
+async def kiotproxy_extend_key(
+    api_token: str, key_value: str, number_of_periods: int
+) -> bool:
+    payload = await _request_json(
+        "POST",
+        f"{KIOTPROXY_PUBLIC_BASE}/keys/{quote(key_value, safe='')}/extend",
+        provider="kiotproxy",
+        json={"numberOfPeriods": int(number_of_periods)},
+        headers=_kiotproxy_account_headers(api_token),
+    )
+    _require_kiotproxy_success(payload)
+    return True
+
+
+async def kiotproxy_delete_key(api_token: str, key_value: str) -> bool:
+    payload = await _request_json(
+        "POST",
+        f"{KIOTPROXY_PUBLIC_BASE}/keys/{quote(key_value, safe='')}/delete",
+        provider="kiotproxy",
+        headers=_kiotproxy_account_headers(api_token),
+    )
+    _require_kiotproxy_success(payload)
+    return True
+
+
+async def kiotproxy_order_keys(
+    api_token: str,
+    *,
+    quantity: int,
+    number_of_periods: int,
+    package_id: str,
+    package_period_id: str | None = None,
+    coupon_code: str | None = None,
+) -> list[dict[str, Any]]:
+    body: dict[str, Any] = {
+        "quantity": int(quantity),
+        "numberOfPeriods": int(number_of_periods),
+        "packageId": package_id,
+    }
+    if package_period_id:
+        body["packagePeriodId"] = package_period_id
+    if coupon_code:
+        body["couponCode"] = coupon_code
+    payload = await _request_json(
+        "POST",
+        f"{KIOTPROXY_PUBLIC_BASE}/keys/order",
+        provider="kiotproxy",
+        json=body,
+        headers=_kiotproxy_account_headers(api_token),
+    )
+    data = _require_kiotproxy_success(payload)
+    if not isinstance(data, list):
+        raise _provider_error("kiotproxy", payload)
+    return [_kiotproxy_key_info(item) for item in data if isinstance(item, dict)]
+
+
+async def kiotproxy_packages() -> list[dict[str, Any]]:
+    payload = await _request_json(
+        "GET", f"{KIOTPROXY_PUBLIC_BASE}/packages", provider="kiotproxy"
+    )
+    data = _require_kiotproxy_success(payload)
+    if not isinstance(data, list):
+        raise _provider_error("kiotproxy", payload)
+    return [item for item in data if isinstance(item, dict)]
+
+
+async def kiotproxy_package_periods(package_id: str) -> list[dict[str, Any]]:
+    payload = await _request_json(
+        "GET",
+        f"{KIOTPROXY_PUBLIC_BASE}/packages/{quote(package_id, safe='')}/package-periods",
+        provider="kiotproxy",
+    )
+    data = _require_kiotproxy_success(payload)
+    if not isinstance(data, list):
+        raise _provider_error("kiotproxy", payload)
+    return [item for item in data if isinstance(item, dict)]
+
+
+# ── TMProxy account API ─────────────────────────────────────────────────────
+# TMProxy has no buy/renew/delete endpoint; the key's plan is renewed on the
+# website. Stats is the authoritative source for the key's own expiry.
+
+
+async def tmproxy_stats(api_key: str) -> dict[str, Any]:
+    payload = await _request_json(
+        "POST",
+        f"{TMPROXY_API_BASE}/stats",
+        provider="tmproxy",
+        json={"api_key": api_key},
+    )
+    if payload.get("code") != 0:
+        raise _provider_error("tmproxy", payload)
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise _provider_error("tmproxy", payload)
+    return {
+        "id_isp": data.get("id_isp"),
+        "id_location": data.get("id_location"),
+        "expired_at": data.get("expired_at"),
+        "plan": data.get("plan"),
+        "price_per_day": data.get("price_per_day"),
+        "timeout": data.get("timeout"),
+        "base_next_request": data.get("base_next_request"),
+        "max_ip_per_day": data.get("max_ip_per_day"),
+        "ip_used_today": data.get("ip_used_today"),
+        "note": data.get("note"),
+    }
+
+
+async def tmproxy_set_note(api_key: str, note: str) -> bool:
+    payload = await _request_json(
+        "POST",
+        f"{TMPROXY_API_BASE}/note",
+        provider="tmproxy",
+        json={"api_key": api_key, "note": note},
+    )
+    if payload.get("code") != 0:
+        raise _provider_error("tmproxy", payload)
+    return True
 
 
 async def current_for(provider: str, key: str) -> dict[str, Any]:

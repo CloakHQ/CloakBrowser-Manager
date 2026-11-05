@@ -20,6 +20,10 @@ class ProfileCreate(BaseModel):
     # echoed back by the API; see proxy_provider_key_masked on the response.
     proxy_provider: Literal["none", "kiotproxy", "tmproxy"] = "none"
     proxy_provider_key: str | None = None
+    # Saved account/key selection. ``proxy_key_id="random"`` picks a free key
+    # at launch; a concrete id pins one key. Null on both = use the raw key.
+    proxy_account_id: str | None = None
+    proxy_key_id: str | None = None
     kiotproxy_region: Literal["bac", "trung", "nam", "random"] = "random"
     tmproxy_location_id: int = 0
     tmproxy_isp_id: int = 0
@@ -58,6 +62,9 @@ class ProfileUpdate(BaseModel):
     proxy_provider: Literal["none", "kiotproxy", "tmproxy"] | None = None
     # Omitted = unchanged; null/"" = clear the provider key.
     proxy_provider_key: str | None = Field(default=None)
+    # Omitted = unchanged; null/"" = clear the saved account/key selection.
+    proxy_account_id: str | None = Field(default=None)
+    proxy_key_id: str | None = Field(default=None)
     kiotproxy_region: Literal["bac", "trung", "nam", "random"] | None = None
     tmproxy_location_id: int | None = None
     tmproxy_isp_id: int | None = None
@@ -139,6 +146,8 @@ class ProfileResponse(BaseModel):
     proxy_provider: str = "none"
     proxy_provider_key_set: bool = False
     proxy_provider_key_masked: str | None = None
+    proxy_account_id: str | None = None
+    proxy_key_id: str | None = None
     kiotproxy_region: str = "random"
     tmproxy_location_id: int = 0
     tmproxy_isp_id: int = 0
@@ -222,11 +231,9 @@ class UpdateCheckResponse(BaseModel):
 
 
 class SettingsResponse(BaseModel):
-    license_key_set: bool
-    license_key_masked: str | None = None
     release_channel: str = "stable"
-    # Size of the shared key pool (see /api/keys). Informational: a key in the
-    # pool is used before the app-wide key.
+    # Size of the shared key pool (see /api/keys). The pool is the only place
+    # keys live now; every launch leases one from it.
     key_pool_size: int = 0
 
 
@@ -271,8 +278,6 @@ class LicenseKeyCheckResult(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    # None = leave unchanged; "" = clear the license key.
-    license_key: str | None = None
     release_channel: str | None = None
 
 
@@ -340,6 +345,124 @@ class ProxyProviderInfo(BaseModel):
 class TmProxyOption(BaseModel):
     id: int
     name: str | None = None
+
+
+class ProxyAccountCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider: Literal["kiotproxy", "tmproxy"]
+    # KiotProxy: the account API token from the dashboard, not a proxy key.
+    # TMProxy: the API key itself.
+    secret: str = Field(min_length=1, max_length=1024)
+    label: str | None = Field(default=None, max_length=200)
+
+
+class ProxyAccountResponse(BaseModel):
+    id: str
+    provider: str
+    label: str | None = None
+    secret_masked: str | None = None
+    added_at: str
+    checked_at: str | None = None
+
+
+class KiotProxyKey(BaseModel):
+    id: str | None = None
+    key_masked: str | None = None
+    status: str | None = None
+    # The public API documents ISO strings but live responses use epoch millis.
+    effective_at: int | str | None = None
+    expiration_at: int | str | None = None
+    description: str | None = None
+    package_id: str | None = None
+    package_period_id: str | None = None
+    quantity_day: int | None = None
+    deleted: bool = False
+
+
+class KiotProxyUserInfo(BaseModel):
+    id: str | None = None
+    username: str | None = None
+    max_key: int | None = None
+    balance: float | None = None
+    paid: float | None = None
+    keys: list[KiotProxyKey] = Field(default_factory=list)
+
+
+class TmProxyStats(BaseModel):
+    id_isp: int | None = None
+    id_location: int | None = None
+    expired_at: int | str | None = None
+    plan: str | None = None
+    price_per_day: float | None = None
+    timeout: int | None = None
+    base_next_request: int | None = None
+    max_ip_per_day: int | None = None
+    ip_used_today: int | None = None
+    note: str | None = None
+
+
+class ProxyAccountSync(BaseModel):
+    account: ProxyAccountResponse
+    provider: str
+    user: KiotProxyUserInfo | None = None
+    keys: list[KiotProxyKey] | None = None
+    tmproxy: TmProxyStats | None = None
+
+
+class ProxyKeyOption(BaseModel):
+    """One selectable saved key for the profile picker.
+
+    Account-level failures surface as an option with ``error`` set and no
+    ``key_id`` so the UI can explain why a provider has no usable keys.
+    """
+
+    account_id: str
+    account_label: str | None = None
+    account_masked: str | None = None
+    key_id: str | None = None
+    key_masked: str | None = None
+    status: str | None = None
+    expiration_at: int | str | None = None
+    in_use: bool = False
+    error: str | None = None
+
+
+class ProxyKeyExtendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    number_of_periods: int = Field(ge=1, le=365)
+
+
+class ProxyKeyOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    package_id: str = Field(min_length=1, max_length=128)
+    quantity: int = Field(ge=1, le=100)
+    number_of_periods: int = Field(ge=1, le=365)
+    package_period_id: str | None = Field(default=None, max_length=128)
+    coupon_code: str | None = Field(default=None, max_length=64)
+
+
+class ProxyKeyNoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    note: str = Field(max_length=500)
+
+
+class ProxyAccountRotateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    location_id: int = Field(default=0, ge=0)
+    isp_id: int = Field(default=0, ge=0)
+
+
+class ProxyKeyRevealResponse(BaseModel):
+    key: str
+    provider: str
+    label: str | None = None
+    key_masked: str | None = None
+    expiration_at: int | None = None
+
+
+class ProxyKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    region: Literal["bac", "trung", "nam", "random"] = "random"
 
 
 class LoginRequest(BaseModel):

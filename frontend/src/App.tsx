@@ -14,6 +14,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
 import { LicensePage } from "./components/LicensePage";
 import { ProxyPage } from "./components/ProxyPage";
+import { ProxyProvidersPanel } from "./components/ProxyProvidersPanel";
 import { SettingsPage } from "./components/SettingsPage";
 import { PAGE_TITLE, Sidebar, type Page } from "./components/Sidebar";
 import { LoginPage } from "./components/LoginPage";
@@ -24,7 +25,11 @@ type AuthState = "checking" | "required" | "ok" | "error";
 type View = Page | "create" | "edit" | "view";
 
 const isPage = (view: View): view is Page =>
-  view === "overview" || view === "proxy" || view === "license" || view === "settings";
+  view === "overview" ||
+  view === "proxy" ||
+  view === "providers" ||
+  view === "license" ||
+  view === "settings";
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -504,7 +509,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                   onStop={handleStop}
                 />
               )}
-              {isPage(view) && view !== "overview" && (
+              {isPage(view) && view !== "overview" && view !== "providers" && (
                 <button onClick={handleNew} className="btn-primary h-8 px-3 text-xs">
                   <Plus className="h-3.5 w-3.5" />
                   Hồ sơ mới
@@ -560,6 +565,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             {view === "proxy" && (
               <ProxyPage profiles={profiles} onEdit={handleEditById} onApplied={refresh} />
             )}
+
+            {view === "providers" && <ProxyProvidersPanel />}
 
             {view === "license" && (
               <LicensePage status={systemStatus} onStatusChange={refreshStatus} />

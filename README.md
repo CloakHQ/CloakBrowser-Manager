@@ -60,7 +60,7 @@ Download the installer from the [latest **official** release](https://github.com
 
 No Python, Node, or git required. The Manager starts on `127.0.0.1:8090` and opens in your default browser. On first launch it downloads the CloakBrowser engine. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
 
-Open **Settings** (gear icon, top right) to add your license key and pick the Stable or Preview channel.
+Open **Settings** (gear icon, top right) to add your license key to the pool and pick the Stable or Preview channel.
 
 #### Run from source (developers)
 
@@ -96,12 +96,11 @@ The Manager runs on the CloakBrowser engine, so it needs a key.<br>
 [Get a free one by email](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
 [Paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time, from a handful to thousands.
 
-Add your key once and every profile uses it — or, to run profiles side by side, add
-several keys to the **key pool** (see below).
+Add your key once to the **key pool** — every launch leases a key from it (see below).
 
-**Native app (Windows/macOS):** open **Settings** (gear icon, top right), paste your key, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
+**Native app (Windows/macOS):** open **Settings** (gear icon, top right), add your key to the pool, choose the Stable or Preview channel, and Save. It applies immediately, no restart. The badge in the top bar shows which tier and binary version are active.
 
-**Docker:** open **Settings** (gear icon, top right) the same way, paste your key, and Save. It applies immediately and is stored in the mounted `/data` volume, so it persists across restarts and image updates. For automated or headless setups, pass it at `docker run` instead:
+**Docker:** open **Settings** (gear icon, top right) the same way, add your key, and Save. It applies immediately and is stored in the mounted `/data` volume, so it persists across restarts and image updates. For automated or headless setups, pass it at `docker run` instead:
 
 ```bash
 docker run -p 127.0.0.1:8090:8090 -v cloakprofiles:/data \
@@ -122,13 +121,13 @@ CLOAKBROWSER_LICENSE_KEY=cb_your_key_here
 CLOAKBROWSER_RELEASE_CHANNEL=stable   # or: preview
 ```
 
-The file is loaded automatically at startup (`docker compose` reads it too); restart the Manager after changing it. An environment variable overrides the in-app setting.
+The file is loaded automatically at startup (`docker compose` reads it too); restart the Manager after changing it. A key passed this way is seeded into the pool at startup, so it behaves like any other pooled key — if you later add the same key again by hand, it is not duplicated.
 
 ### Key pool: one key per concurrent profile
 
-A free key allows **one concurrent browser**. The app-wide key is therefore a
-single seat: launch a second profile on it and the license server denies it. That
-denial is not a bug in the Manager — it is the plan working as sold.
+A free key allows **one concurrent browser**: launch a second profile on the same
+key and the license server denies it. That denial is not a bug in the Manager —
+it is the plan working as sold.
 
 To run N profiles at once you need N keys, each from its own account. Add them in
 **Settings → Key pool**, one per line; they are validated on add, so a dead key is
@@ -137,14 +136,15 @@ later.
 
 | Situation | Keys needed |
 |-----------|-------------|
-| One profile at a time | 1 (the app-wide key is enough) |
+| One profile at a time | 1 |
 | 5 profiles running together | 5, one leased per profile |
 | 20 profiles, 5 at a time | 5 — keys are released when a profile stops |
 
 How leasing works:
 
 - A launch leases the profile's **pinned** key if it has one, otherwise the first
-  free key in the pool, otherwise the app-wide key.
+  free key in the pool. A key handed over by environment/file counts as a pool
+  key too (see above).
 - A key is reserved for as long as its browser runs. **Stopping** a profile hands
   the key straight back. A browser that **dies** (crash, window closed, killed) or
   a launch that **fails** does not: the license server keeps counting that

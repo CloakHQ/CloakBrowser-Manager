@@ -40,6 +40,8 @@ load_env_file()
 from . import artifacts
 from . import database as db
 from . import key_pool
+from . import proxy_accounts
+from . import proxy_key_source
 from . import proxy_providers
 from .proxy_providers import ProxyProviderError
 from cloakbrowser.license import CloakBrowserLicenseError
@@ -65,13 +67,26 @@ from .models import (
     LoginRequest,
     ProfileCreate,
     ProfileDuplicateRequest,
+    KiotProxyKey,
+    KiotProxyUserInfo,
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ProxyAccountCreate,
+    ProxyAccountResponse,
+    ProxyAccountRotateRequest,
+    ProxyAccountSync,
+    ProxyKeyExtendRequest,
+    ProxyKeyNoteRequest,
+    ProxyKeyOption,
+    ProxyKeyOrderRequest,
+    ProxyKeyRevealResponse,
+    ProxyKeyRotateRequest,
     ProxyProviderInfo,
     ProxyTestRequest,
     ProxyTestResponse,
     ReorderRequest,
+    TmProxyStats,
     SettingsResponse,
     SettingsUpdate,
     StatusResponse,
@@ -132,13 +147,10 @@ diagnostics.install_stderr_tee()
 # token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
-# App-wide CloakBrowser Pro license. One key per Manager instance — the
-# concurrency-seat pool is per-license, so every launched profile shares it.
 # Release channel picks Stable vs Preview builds.
 #
 # Precedence: environment (incl. values load_env_file pulled from a .env) wins,
-# then the in-app Settings (settings.json). Native users have no .env and set
-# the key in the Settings UI; Docker/CI keep overriding via env vars.
+# then the in-app Settings (settings.json).
 _STORED_SETTINGS = load_settings()
 
 
@@ -146,7 +158,6 @@ def _resolve_setting(env_key: str, settings_key: str) -> str | None:
     return os.environ.get(env_key) or _STORED_SETTINGS.get(settings_key) or None
 
 
-LICENSE_KEY: str | None = _resolve_setting("CLOAKBROWSER_LICENSE_KEY", "license_key")
 RELEASE_CHANNEL: str | None = _resolve_setting(
     "CLOAKBROWSER_RELEASE_CHANNEL", "release_channel"
 )
@@ -307,7 +318,7 @@ class AuthMiddleware:
 
 
 # Singleton browser manager
-browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CHANNEL)
+browser_mgr = BrowserManager(release_channel=RELEASE_CHANNEL)
 
 # Frontend build directory (React production build). bundle_dir() resolves to
 # the PyInstaller extraction root when frozen, else the manager repo root.
@@ -506,10 +517,33 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
     return bytes(result)
 
 
+def _seed_legacy_keys_into_pool() -> None:
+    """Seed the pool from the two legacy, non-pool places a key can come from.
+
+    Older builds kept one app-wide key in the settings file, and Docker/CI still
+    hand one over via ``CLOAKBROWSER_LICENSE_KEY``. The pool is now the only
+    place keys live, so both are added to it at startup and only when the pool
+    does not already hold them (re-adding is a no-op, not an error). The env var
+    is the managed-in-Docker path and must keep working; the stored key is left
+    in settings.json, harmless.
+    """
+    candidates = [os.environ.get("CLOAKBROWSER_LICENSE_KEY"), load_settings().get("license_key")]
+    for candidate in candidates:
+        key = (candidate or "").strip()
+        if not key:
+            continue
+        try:
+            if key_pool.add(key)["added"]:
+                logger.info("Seeded license key %s into the key pool", key_pool.mask_key(key))
+        except OSError as exc:
+            logger.warning("Could not seed license key %s into the pool: %s", key_pool.mask_key(key), exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    _seed_legacy_keys_into_pool()
     # Leases on disk are orphans now — no browser survives a restart. Cool those
     # keys down and ask the server which seats are already free before anything
     # auto-launches onto them.
@@ -586,6 +620,57 @@ async def auth_logout(request: Request, response: Response):
 
 
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
+
+
+def _normalize_profile_proxy_selection(
+    data: dict, existing: dict | None = None
+) -> None:
+    """Keep raw keys and saved account/key selections mutually exclusive."""
+    provider = data.get(
+        "proxy_provider", (existing or {}).get("proxy_provider", "none")
+    )
+    raw = data.get("proxy_provider_key")
+    if provider == "none":
+        data["proxy_provider_key"] = None
+        data["proxy_account_id"] = None
+        data["proxy_key_id"] = None
+        return
+
+    if isinstance(raw, str) and raw.strip():
+        data["proxy_provider_key"] = raw.strip()
+        data["proxy_account_id"] = None
+        data["proxy_key_id"] = None
+        return
+
+    has_selection = "proxy_account_id" in data or "proxy_key_id" in data
+    if not has_selection:
+        if (
+            existing
+            and "proxy_provider" in data
+            and data["proxy_provider"] != existing.get("proxy_provider")
+        ):
+            data["proxy_provider_key"] = None
+            data["proxy_account_id"] = None
+            data["proxy_key_id"] = None
+        return
+
+    account_id = data.get(
+        "proxy_account_id", (existing or {}).get("proxy_account_id")
+    )
+    key_id = data.get("proxy_key_id", (existing or {}).get("proxy_key_id"))
+    if not account_id and not key_id:
+        data["proxy_account_id"] = None
+        data["proxy_key_id"] = None
+        return
+    key_id = (key_id or proxy_key_source.RANDOM_KEY).strip()
+    if key_id != proxy_key_source.RANDOM_KEY and not account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="A specific proxy key requires its saved account",
+        )
+    data["proxy_account_id"] = account_id or None
+    data["proxy_key_id"] = key_id
+    data["proxy_provider_key"] = None
 
 
 def _profile_response(profile: dict) -> ProfileResponse:
@@ -677,6 +762,67 @@ async def tmproxy_current_endpoint(req: TmProxyRequest):
     return _provider_info_response(info)
 
 
+@app.get(
+    "/api/proxy-providers/{provider}/available-keys",
+    response_model=list[ProxyKeyOption],
+)
+async def available_proxy_keys(provider: str, exclude_profile: str | None = None):
+    """Saved keys the profile picker can offer for one provider."""
+    provider = (provider or "").strip().lower()
+    if provider not in proxy_accounts.PROVIDERS:
+        raise HTTPException(status_code=404, detail="Unknown proxy provider")
+    used = await browser_mgr.proxy_key_fingerprints(exclude_profile=exclude_profile)
+    options = await proxy_key_source.available_options(provider, in_use=used)
+    return [ProxyKeyOption(**option) for option in options]
+
+
+async def _profile_provider_key(
+    profile: dict, *, allow_random: bool
+) -> tuple[str, str]:
+    """Resolve the provider key for an API action, using the running lease if any."""
+    provider = (profile.get("proxy_provider") or "none").strip().lower()
+    if provider not in ("kiotproxy", "tmproxy"):
+        raise HTTPException(status_code=400, detail="Profile has no proxy provider")
+
+    running = browser_mgr.running.get(profile["id"])
+    if (
+        running is not None
+        and running.proxy_provider == provider
+        and running.proxy_provider_key
+    ):
+        return provider, running.proxy_provider_key
+
+    if proxy_key_source.uses_saved_selection(profile):
+        if proxy_key_source.is_random_selection(profile) and not allow_random:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This profile picks a random key per launch; start it first "
+                    "to inspect its current proxy."
+                ),
+            )
+        exclude = await browser_mgr.proxy_key_fingerprints(
+            exclude_profile=profile["id"]
+        )
+        try:
+            key = await proxy_key_source.resolve_profile_key(
+                profile, exclude_fingerprints=exclude
+            )
+        except proxy_key_source.NoAvailableProxyKey as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ProxyProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return provider, key
+
+    key = (profile.get("proxy_provider_key") or "").strip()
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider} is selected but no API key is stored",
+        )
+    return provider, key
+
+
 @app.post(
     "/api/profiles/{profile_id}/proxy/current", response_model=ProxyProviderInfo
 )
@@ -691,17 +837,33 @@ async def profile_current_proxy_endpoint(profile_id: str):
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    provider = (profile.get("proxy_provider") or "none").strip().lower()
-    key = (profile.get("proxy_provider_key") or "").strip()
-    if provider not in ("kiotproxy", "tmproxy"):
-        raise HTTPException(status_code=400, detail="Profile has no proxy provider")
-    if not key:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{provider} is selected but no API key is stored",
-        )
+    provider, key = await _profile_provider_key(profile, allow_random=False)
     try:
         info = await proxy_providers.current_for(provider, key)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.post(
+    "/api/profiles/{profile_id}/proxy/new", response_model=ProxyProviderInfo
+)
+async def profile_new_proxy_endpoint(profile_id: str):
+    """Fetch a fresh proxy for the profile without launching its browser."""
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    provider, key = await _profile_provider_key(
+        profile, allow_random=True
+    )
+    try:
+        info = await proxy_providers.new_for(
+            provider,
+            key,
+            region=profile.get("kiotproxy_region") or "random",
+            location_id=int(profile.get("tmproxy_location_id") or 0),
+            isp_id=int(profile.get("tmproxy_isp_id") or 0),
+        )
     except ProxyProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return _provider_info_response(info)
@@ -727,9 +889,270 @@ async def tmproxy_isps_endpoint():
     return [TmProxyOption(id=item["id_isp"], name=item.get("name")) for item in isps]
 
 
+# ── Proxy provider accounts (key management) ─────────────────────────────────
+# Separate from a profile's proxy key: these are account-level credentials used
+# to list, inspect and operate on the keys themselves (KiotProxy API token or a
+# TMProxy API key). Secrets are stored locally and never echoed back.
+
+
+def _proxy_account_response(account: dict) -> ProxyAccountResponse:
+    return ProxyAccountResponse(**proxy_accounts.public_account(account))
+
+
+async def _validate_proxy_account(provider: str, secret: str) -> None:
+    """Reject a credential the provider does not recognise before storing it."""
+    if provider == "kiotproxy":
+        await proxy_providers.kiotproxy_user_info(secret)
+    else:
+        await proxy_providers.tmproxy_stats(secret)
+
+
+@app.get("/api/proxy-accounts", response_model=list[ProxyAccountResponse])
+async def list_proxy_accounts():
+    return [
+        _proxy_account_response(account)
+        for account in proxy_accounts.list_accounts()
+    ]
+
+
+@app.post(
+    "/api/proxy-accounts", response_model=ProxyAccountResponse, status_code=201
+)
+async def create_proxy_account(req: ProxyAccountCreate):
+    try:
+        await _validate_proxy_account(req.provider, req.secret)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    account = proxy_accounts.add_account(req.provider, req.secret, req.label)
+    return _proxy_account_response(account)
+
+
+@app.delete("/api/proxy-accounts/{account_id}")
+async def delete_proxy_account(account_id: str):
+    if not proxy_accounts.delete_account(account_id):
+        raise HTTPException(status_code=404, detail="Proxy account not found")
+    return {"ok": True}
+
+
+@app.post(
+    "/api/proxy-accounts/{account_id}/sync", response_model=ProxyAccountSync
+)
+async def sync_proxy_account(account_id: str):
+    account = proxy_accounts.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Proxy account not found")
+    provider = account["provider"]
+    secret = account["secret"]
+    try:
+        if provider == "kiotproxy":
+            info, keys = await asyncio.gather(
+                proxy_providers.kiotproxy_user_info(secret),
+                proxy_providers.kiotproxy_keys(secret),
+            )
+            user = KiotProxyUserInfo(
+                **{**info, "keys": []},
+            )
+            proxy_accounts.touch_account(account_id)
+            return ProxyAccountSync(
+                account=_proxy_account_response(
+                    {**account, "checked_at": proxy_accounts.get_account(account_id)["checked_at"]}
+                ),
+                provider=provider,
+                user=user,
+                keys=[
+                    KiotProxyKey(**proxy_providers.public_key_info(key))
+                    for key in keys
+                ],
+            )
+        stats = await proxy_providers.tmproxy_stats(secret)
+        proxy_accounts.touch_account(account_id)
+        return ProxyAccountSync(
+            account=_proxy_account_response(
+                {**account, "checked_at": proxy_accounts.get_account(account_id)["checked_at"]}
+            ),
+            provider=provider,
+            tmproxy=TmProxyStats(**stats),
+        )
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/proxy-accounts/{account_id}/keys/{key_id}/reveal",
+    response_model=ProxyKeyRevealResponse,
+)
+async def reveal_proxy_key(account_id: str, key_id: str, response: Response):
+    """Return a stored key so the profile form can use it without retyping.
+
+    The profile stores the key itself, so this is an explicit user action in
+    the local UI; the response is marked no-store and never cached.
+    """
+    account = proxy_accounts.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Proxy account not found")
+    response.headers["Cache-Control"] = "no-store"
+    if account["provider"] == "kiotproxy":
+        try:
+            key = await proxy_providers.kiotproxy_find_key(
+                account["secret"], key_id
+            )
+        except ProxyProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if not key or not key.get("value"):
+            raise HTTPException(status_code=404, detail="Key not found")
+        expiration_at = key.get("expiration_at")
+        return ProxyKeyRevealResponse(
+            key=key["value"],
+            provider="kiotproxy",
+            label=account.get("label"),
+            key_masked=key.get("value_masked"),
+            expiration_at=(
+                expiration_at if isinstance(expiration_at, int) else None
+            ),
+        )
+    if key_id not in (account_id, "default"):
+        raise HTTPException(status_code=404, detail="Key not found")
+    return ProxyKeyRevealResponse(
+        key=account["secret"],
+        provider="tmproxy",
+        label=account.get("label"),
+        key_masked=proxy_accounts.mask_secret(account["secret"]),
+    )
+
+
+@app.post("/api/proxy-accounts/{account_id}/keys/{key_id}/extend")
+async def extend_proxy_key(
+    account_id: str, key_id: str, req: ProxyKeyExtendRequest
+):
+    account = proxy_accounts.get_account(account_id)
+    if not account or account["provider"] != "kiotproxy":
+        raise HTTPException(status_code=404, detail="KiotProxy account not found")
+    secret = account["secret"]
+    try:
+        key = await proxy_providers.kiotproxy_find_key(secret, key_id)
+        if not key or not key.get("value"):
+            raise HTTPException(status_code=404, detail="Key not found")
+        await proxy_providers.kiotproxy_extend_key(
+            secret, key["value"], req.number_of_periods
+        )
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/proxy-accounts/{account_id}/keys/{key_id}/delete")
+async def delete_proxy_key(account_id: str, key_id: str):
+    account = proxy_accounts.get_account(account_id)
+    if not account or account["provider"] != "kiotproxy":
+        raise HTTPException(status_code=404, detail="KiotProxy account not found")
+    secret = account["secret"]
+    try:
+        key = await proxy_providers.kiotproxy_find_key(secret, key_id)
+        if not key or not key.get("value"):
+            raise HTTPException(status_code=404, detail="Key not found")
+        await proxy_providers.kiotproxy_delete_key(secret, key["value"])
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post(
+    "/api/proxy-accounts/{account_id}/keys/{key_id}/rotate",
+    response_model=ProxyProviderInfo,
+)
+async def rotate_proxy_key(
+    account_id: str, key_id: str, req: ProxyKeyRotateRequest
+):
+    account = proxy_accounts.get_account(account_id)
+    if not account or account["provider"] != "kiotproxy":
+        raise HTTPException(status_code=404, detail="KiotProxy account not found")
+    secret = account["secret"]
+    try:
+        key = await proxy_providers.kiotproxy_find_key(secret, key_id)
+        if not key or not key.get("value"):
+            raise HTTPException(status_code=404, detail="Key not found")
+        info = await proxy_providers.kiotproxy_new(key["value"], req.region)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.post("/api/proxy-accounts/{account_id}/keys/order")
+async def order_proxy_keys(account_id: str, req: ProxyKeyOrderRequest):
+    account = proxy_accounts.get_account(account_id)
+    if not account or account["provider"] != "kiotproxy":
+        raise HTTPException(status_code=404, detail="KiotProxy account not found")
+    try:
+        keys = await proxy_providers.kiotproxy_order_keys(
+            account["secret"],
+            quantity=req.quantity,
+            number_of_periods=req.number_of_periods,
+            package_id=req.package_id,
+            package_period_id=req.package_period_id,
+            coupon_code=req.coupon_code,
+        )
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "keys": [proxy_providers.public_key_info(key) for key in keys],
+    }
+
+
+@app.post(
+    "/api/proxy-accounts/{account_id}/rotate",
+    response_model=ProxyProviderInfo,
+)
+async def rotate_proxy_account(account_id: str, req: ProxyAccountRotateRequest):
+    """Rotate the proxy of a TMProxy key stored as an account."""
+    account = proxy_accounts.get_account(account_id)
+    if not account or account["provider"] != "tmproxy":
+        raise HTTPException(status_code=404, detail="TMProxy account not found")
+    try:
+        info = await proxy_providers.tmproxy_new(
+            account["secret"], req.location_id, req.isp_id
+        )
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.post("/api/proxy-accounts/{account_id}/note")
+async def set_proxy_account_note(account_id: str, req: ProxyKeyNoteRequest):
+    account = proxy_accounts.get_account(account_id)
+    if not account or account["provider"] != "tmproxy":
+        raise HTTPException(status_code=404, detail="TMProxy account not found")
+    try:
+        await proxy_providers.tmproxy_set_note(account["secret"], req.note)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.get("/api/proxy-providers/kiotproxy/packages")
+async def kiotproxy_packages_endpoint():
+    try:
+        return await proxy_providers.kiotproxy_packages()
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/proxy-providers/kiotproxy/packages/{package_id}/periods"
+)
+async def kiotproxy_package_periods_endpoint(package_id: str):
+    try:
+        return await proxy_providers.kiotproxy_package_periods(package_id)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
 async def create_profile(req: ProfileCreate):
     data = req.model_dump()
+    _normalize_profile_proxy_selection(data)
     tags = data.pop("tags", None)
     if tags:
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
@@ -763,6 +1186,7 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     before = db.get_profile(profile_id)
     if not before:
         raise HTTPException(status_code=404, detail="Profile not found")
+    _normalize_profile_proxy_selection(data, before)
 
     # A rename carries the folder with it, so the directory on disk keeps
     # telling you which profile it is. Only a folder that already matched the
@@ -1494,19 +1918,8 @@ async def check_keys(payload: LicenseKeyCheck):
     return [LicenseKeyCheckResult(**result) for result in results]
 
 
-def _mask_key(key: str | None) -> str | None:
-    """Show enough of a license key to recognise it, never the whole thing."""
-    if not key:
-        return None
-    if len(key) <= 9:
-        return "…"
-    return f"{key[:5]}…{key[-4:]}"
-
-
 def _settings_response() -> SettingsResponse:
     return SettingsResponse(
-        license_key_set=bool(browser_mgr.license_key),
-        license_key_masked=_mask_key(browser_mgr.license_key),
         release_channel=(browser_mgr.release_channel or "stable"),
         key_pool_size=len(key_pool.entries()),
     )
@@ -1550,22 +1963,14 @@ async def get_settings():
 
 @app.put("/api/settings", response_model=StatusResponse)
 async def update_settings(payload: SettingsUpdate):
-    """Persist license key / release channel and hot-apply without a restart.
+    """Persist the release channel and hot-apply without a restart.
 
+    Keys live in the pool now, so this no longer touches a license key.
     Returns the refreshed system status (tier + resolved binary version) so the
     top-bar badge updates immediately. Re-resolving may download the Pro build,
     so it runs off the event loop; the request completes when it's ready.
     """
     stored = load_settings()
-
-    if payload.license_key is not None:
-        key = payload.license_key.strip()
-        if key:
-            stored["license_key"] = key
-            browser_mgr.license_key = key
-        else:  # empty string = clear the key
-            stored.pop("license_key", None)
-            browser_mgr.license_key = None
 
     if payload.release_channel is not None:
         channel = payload.release_channel.strip().lower()

@@ -29,6 +29,8 @@ export interface Profile {
   proxy_provider: ProxyProvider;
   proxy_provider_key_set: boolean;
   proxy_provider_key_masked: string | null;
+  proxy_account_id: string | null;
+  proxy_key_id: string | null;
   kiotproxy_region: "bac" | "trung" | "nam" | "random";
   tmproxy_location_id: number;
   tmproxy_isp_id: number;
@@ -82,6 +84,8 @@ export interface ProfileCreateData {
   proxy?: string | null;
   proxy_provider?: ProxyProvider;
   proxy_provider_key?: string | null;
+  proxy_account_id?: string | null;
+  proxy_key_id?: string | null;
   kiotproxy_region?: "bac" | "trung" | "nam" | "random";
   tmproxy_location_id?: number;
   tmproxy_isp_id?: number;
@@ -146,6 +150,101 @@ export interface TmProxyOption {
   name: string | null;
 }
 
+export interface ProxyAccount {
+  id: string;
+  provider: "kiotproxy" | "tmproxy";
+  label: string | null;
+  secret_masked: string | null;
+  added_at: string;
+  checked_at: string | null;
+}
+
+export interface ProxyKeyOption {
+  account_id: string;
+  account_label: string | null;
+  account_masked: string | null;
+  key_id: string | null;
+  key_masked: string | null;
+  status: string | null;
+  expiration_at: number | string | null;
+  in_use: boolean;
+  error: string | null;
+}
+
+export interface KiotProxyKeyInfo {
+  id: string | null;
+  key_masked: string | null;
+  status: string | null;
+  effective_at: number | string | null;
+  expiration_at: number | string | null;
+  description: string | null;
+  package_id: string | null;
+  package_period_id: string | null;
+  quantity_day: number | null;
+  deleted: boolean;
+}
+
+export interface KiotProxyUserInfo {
+  id: string | null;
+  username: string | null;
+  max_key: number | null;
+  balance: number | null;
+  paid: number | null;
+  keys: KiotProxyKeyInfo[];
+}
+
+export interface TmProxyStatsInfo {
+  id_isp: number | null;
+  id_location: number | null;
+  expired_at: number | string | null;
+  plan: string | null;
+  price_per_day: number | null;
+  timeout: number | null;
+  base_next_request: number | null;
+  max_ip_per_day: number | null;
+  ip_used_today: number | null;
+  note: string | null;
+}
+
+export interface ProxyAccountSync {
+  account: ProxyAccount;
+  provider: "kiotproxy" | "tmproxy";
+  user: KiotProxyUserInfo | null;
+  keys: KiotProxyKeyInfo[] | null;
+  tmproxy: TmProxyStatsInfo | null;
+}
+
+export interface ProxyKeyReveal {
+  key: string;
+  provider: "kiotproxy" | "tmproxy";
+  label: string | null;
+  key_masked: string | null;
+  expiration_at: number | null;
+}
+
+export interface KiotProxyPackage {
+  id: string;
+  name: string;
+  code: string | null;
+  description: string | null;
+  price: number | null;
+  ttl: number | null;
+  ttc: number | null;
+  maxIpPerDay: number | null;
+}
+
+export interface KiotProxyPackagePeriod {
+  id: string;
+  packageId: string;
+  quantity: number | null;
+  period: string | null;
+  name: string | null;
+  code: string | null;
+  description: string | null;
+  price: number | null;
+  unitPrice: number | null;
+}
+
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
@@ -168,8 +267,6 @@ export interface UpdateInfo {
 }
 
 export interface ManagerSettings {
-  license_key_set: boolean;
-  license_key_masked: string | null;
   release_channel: string; // "stable" | "preview"
   key_pool_size: number;
 }
@@ -198,7 +295,6 @@ export interface LicenseKeyCheckResult {
 }
 
 export interface SettingsUpdate {
-  license_key?: string | null; // omit = unchanged; "" = clear
   release_channel?: string | null;
 }
 
@@ -232,7 +328,7 @@ async function request<T>(
   if (!res.ok) {
     if (res.status === 401 && _onUnauthorized) {
       _onUnauthorized();
-      throw new ApiError(401, "Chưa được xác thực");
+        throw new ApiError(401, "Chưa được xác thực");
     }
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = body.detail;
@@ -296,9 +392,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ key }),
     }),
-  /** The provider proxy this profile's *stored* key holds — no key input needed. */
+  /** The provider proxy this profile's stored/saved key holds — no key input needed. */
   profileCurrentProxy: (profileId: string) =>
     request<ProxyProviderInfo>(`/api/profiles/${profileId}/proxy/current`, {
+      method: "POST",
+    }),
+  profileNewProxy: (profileId: string) =>
+    request<ProxyProviderInfo>(`/api/profiles/${profileId}/proxy/new`, {
       method: "POST",
     }),
   kiotproxyOut: (key: string) =>
@@ -319,6 +419,81 @@ export const api = {
   tmproxyLocations: () =>
     request<TmProxyOption[]>("/api/proxy-providers/tmproxy/locations"),
   tmproxyIsps: () => request<TmProxyOption[]>("/api/proxy-providers/tmproxy/isps"),
+
+  // ── Provider account / key management ──────────────────────────────────
+  listProxyAccounts: () => request<ProxyAccount[]>("/api/proxy-accounts"),
+  availableProxyKeys: (provider: "kiotproxy" | "tmproxy", profileId?: string) =>
+    request<ProxyKeyOption[]>(
+      `/api/proxy-providers/${provider}/available-keys` +
+        (profileId ? `?exclude_profile=${encodeURIComponent(profileId)}` : ""),
+    ),
+  createProxyAccount: (data: {
+    provider: "kiotproxy" | "tmproxy";
+    secret: string;
+    label?: string | null;
+  }) =>
+    request<ProxyAccount>("/api/proxy-accounts", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deleteProxyAccount: (id: string) =>
+    request<{ ok: boolean }>(`/api/proxy-accounts/${id}`, { method: "DELETE" }),
+  syncProxyAccount: (id: string) =>
+    request<ProxyAccountSync>(`/api/proxy-accounts/${id}/sync`, { method: "POST" }),
+  revealProxyKey: (accountId: string, keyId: string) =>
+    request<ProxyKeyReveal>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/reveal`,
+      { method: "POST" },
+    ),
+  extendProxyKey: (accountId: string, keyId: string, numberOfPeriods: number) =>
+    request<{ ok: boolean }>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/extend`,
+      { method: "POST", body: JSON.stringify({ number_of_periods: numberOfPeriods }) },
+    ),
+  deleteProxyKey: (accountId: string, keyId: string) =>
+    request<{ ok: boolean }>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/delete`,
+      { method: "POST" },
+    ),
+  rotateProxyKey: (
+    accountId: string,
+    keyId: string,
+    region: "bac" | "trung" | "nam" | "random",
+  ) =>
+    request<ProxyProviderInfo>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/rotate`,
+      { method: "POST", body: JSON.stringify({ region }) },
+    ),
+  orderProxyKeys: (
+    accountId: string,
+    data: {
+      package_id: string;
+      quantity: number;
+      number_of_periods: number;
+      package_period_id?: string | null;
+      coupon_code?: string | null;
+    },
+  ) =>
+    request<{ ok: boolean; keys: KiotProxyKeyInfo[] }>(
+      `/api/proxy-accounts/${accountId}/keys/order`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+  rotateProxyAccount: (accountId: string, locationId = 0, ispId = 0) =>
+    request<ProxyProviderInfo>(`/api/proxy-accounts/${accountId}/rotate`, {
+      method: "POST",
+      body: JSON.stringify({ location_id: locationId, isp_id: ispId }),
+    }),
+  setProxyAccountNote: (accountId: string, note: string) =>
+    request<{ ok: boolean }>(`/api/proxy-accounts/${accountId}/note`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    }),
+  kiotproxyPackages: () =>
+    request<KiotProxyPackage[]>("/api/proxy-providers/kiotproxy/packages"),
+  kiotproxyPackagePeriods: (packageId: string) =>
+    request<KiotProxyPackagePeriod[]>(
+      `/api/proxy-providers/kiotproxy/packages/${packageId}/periods`,
+    ),
 
   updateProfile: (id: string, data: Partial<ProfileCreateData>) =>
     request<Profile>(`/api/profiles/${id}`, {
@@ -355,7 +530,7 @@ export const api = {
     if (!res.ok) {
       if (res.status === 401 && _onUnauthorized) {
         _onUnauthorized();
-        throw new ApiError(401, "Chưa được xác thực");
+      throw new ApiError(401, "Chưa được xác thực");
       }
       const body = await res.json().catch(() => ({ detail: res.statusText }));
       const detail = typeof body.detail === "string" ? body.detail : "Yêu cầu thất bại";
@@ -420,3 +595,4 @@ export const api = {
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
 };
+

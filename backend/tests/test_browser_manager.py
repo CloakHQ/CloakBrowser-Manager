@@ -20,6 +20,7 @@ from backend.browser_manager import (
     RunningProfile,
     SEARCH_ENGINE_MARKER,
 )
+from backend import key_pool
 from backend.runtime import RuntimeConfig
 
 DOCKER_RUNTIME = RuntimeConfig(
@@ -363,11 +364,10 @@ async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path, tmp_
 async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
     from backend import browser_manager as module
 
+    key_pool.add("cb_test")
     context = MagicMock(pages=[])
     context.add_init_script = AsyncMock()
-    manager = BrowserManager(
-        NATIVE_RUNTIME, license_key="cb_test", release_channel="preview"
-    )
+    manager = BrowserManager(NATIVE_RUNTIME, release_channel="preview")
     manager._wait_for_cdp = AsyncMock()
     launch = AsyncMock(return_value=context)
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
@@ -402,7 +402,8 @@ async def test_launch_writes_its_keys_install_id_before_spawning(monkeypatch, tm
 
     context = MagicMock(pages=[])
     context.add_init_script = AsyncMock()
-    manager = BrowserManager(NATIVE_RUNTIME, license_key="cb_test")
+    key_pool.add("cb_test")
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
     seen: list[str] = []
 
@@ -533,7 +534,8 @@ async def test_launch_restores_machine_install_id_after_checks_in(monkeypatch, t
 
     context = MagicMock(pages=[])
     context.add_init_script = AsyncMock()
-    manager = BrowserManager(NATIVE_RUNTIME, license_key="cb_restore")
+    key_pool.add("cb_restore")
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
     seen: list[str] = []
 

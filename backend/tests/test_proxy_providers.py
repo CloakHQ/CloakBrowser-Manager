@@ -142,6 +142,90 @@ async def test_tmproxy_locations_and_isps_parse_lists(monkeypatch):
     assert await pp.tmproxy_isps() == [{"id_isp": 0, "name": "Random"}]
 
 
+@pytest.mark.asyncio
+async def test_kiotproxy_account_lists_keys_with_api_token_header(monkeypatch):
+    request = AsyncMock(
+        return_value={
+            "success": True,
+            "code": 200,
+            "data": [
+                {
+                    "id": "key-uuid",
+                    "value": "Kabcdef1234567890",
+                    "status": "ACTIVE",
+                    "effectiveAt": "2025-01-01T00:00:00Z",
+                    "expirationAt": "2025-02-01T00:00:00Z",
+                    "packageId": "pkg",
+                    "quantityDay": 30,
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(pp, "_request_json", request)
+
+    keys = await pp.kiotproxy_keys("account-token")
+
+    assert request.await_args.kwargs["headers"] == {"Api-token": "account-token"}
+    assert request.await_args.args[1].endswith("/api/public/keys")
+    assert keys[0]["value"] == "Kabcdef1234567890"
+    assert keys[0]["value_masked"] == "Kabcd…7890"
+    assert pp.public_key_info(keys[0])["key_masked"] == "Kabcd…7890"
+    assert "value" not in pp.public_key_info(keys[0])
+
+
+@pytest.mark.asyncio
+async def test_kiotproxy_extend_posts_periods_by_key_value(monkeypatch):
+    request = AsyncMock(return_value={"success": True, "data": True})
+    monkeypatch.setattr(pp, "_request_json", request)
+
+    assert await pp.kiotproxy_extend_key("token", "K/with space", 2) is True
+
+    assert request.await_args.kwargs["json"] == {"numberOfPeriods": 2}
+    assert request.await_args.kwargs["headers"] == {"Api-token": "token"}
+    assert "K%2Fwith%20space" in request.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_tmproxy_stats_returns_key_expiry(monkeypatch):
+    monkeypatch.setattr(
+        pp,
+        "_request_json",
+        AsyncMock(
+            return_value={
+                "code": 0,
+                "data": {
+                    "api_key": "secret",
+                    "expired_at": "2026-01-01T00:00:00Z",
+                    "plan": "VIP",
+                    "price_per_day": 12000,
+                    "timeout": 1800,
+                    "max_ip_per_day": 100,
+                    "ip_used_today": 4,
+                },
+            }
+        ),
+    )
+
+    stats = await pp.tmproxy_stats("secret")
+
+    assert stats["expired_at"] == "2026-01-01T00:00:00Z"
+    assert stats["plan"] == "VIP"
+    assert stats["ip_used_today"] == 4
+    assert "api_key" not in stats
+
+
+@pytest.mark.asyncio
+async def test_tmproxy_set_note(monkeypatch):
+    request = AsyncMock(return_value={"code": 0, "message": "ok"})
+    monkeypatch.setattr(pp, "_request_json", request)
+
+    assert await pp.tmproxy_set_note("secret", "nhóm Shopee") is True
+    assert request.await_args.kwargs["json"] == {
+        "api_key": "secret",
+        "note": "nhóm Shopee",
+    }
+
+
 def test_public_info_strips_credentials_and_raw_payload():
     info = {
         "provider": "tmproxy",
