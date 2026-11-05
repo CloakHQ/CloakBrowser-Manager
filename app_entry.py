@@ -4,7 +4,7 @@ This is the PyInstaller target. Unlike run.py (the dev-from-source launcher,
 which shells out to `uvicorn backend.main:app`), a frozen bundle cannot resolve
 the "backend.main:app" import string, so uvicorn is run in-process here.
 
-Serves on 127.0.0.1:8080. The UI is shown in one of two shells, chosen by the
+Serves on 127.0.0.1:8090. The UI is shown in one of two shells, chosen by the
 CLOAKBROWSER_MANAGER_UI env var:
   - "webview" — a dedicated native app window (WKWebView on macOS, WebView2 on
     Windows) via pywebview. No browser chrome, its own Dock/taskbar entry.
@@ -25,10 +25,10 @@ import time
 import urllib.request
 import webbrowser
 
-SERVER_URL = "http://127.0.0.1:8080"
+SERVER_URL = "http://127.0.0.1:8090"
 HOST = "127.0.0.1"
-PORT = 8080
-WINDOW_TITLE = "CloakBrowser Manager"
+PORT = 8090
+WINDOW_TITLE = "CloakBrowser Manager (Custom)"
 
 
 def _port_available() -> bool:
@@ -215,7 +215,7 @@ def _run_webview(server) -> int:
             import ctypes
 
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "dev.cloakbrowser.manager"
+                "dev.cloakbrowsercustom.manager"
             )
         except Exception:
             pass

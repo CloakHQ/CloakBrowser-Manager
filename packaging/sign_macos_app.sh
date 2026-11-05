@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inside-out hardened-runtime codesign of a CloakBrowser Manager .app.
+# Inside-out hardened-runtime codesign of a CloakBrowser Manager (Custom) .app.
 #
 # Standalone, used by the GitHub Actions release workflow. This DELIBERATELY
 # duplicates the signing block in build_macos.sh rather than sharing code with
@@ -7,7 +7,7 @@
 # change here can never destabilise the local fallback. Keep the two in sync by
 # hand if the entitlements/flags ever change.
 #
-# Usage: sign_macos_app.sh "/path/to/CloakBrowser Manager.app"
+# Usage: sign_macos_app.sh "/path/to/CloakBrowser Manager (Custom).app"
 # Requires env: CB_SIGN_IDENTITY (e.g. "Developer ID Application: Your Name (TEAMID)")
 # Optional env: KEYCHAIN (keychain to sign against; codesign uses the search list otherwise)
 set -euo pipefail

@@ -77,9 +77,9 @@ def default_data_dir(
     if host_os == "windows":
         local_app_data = env.get("LOCALAPPDATA")
         base = Path(local_app_data) if local_app_data else user_home / "AppData" / "Local"
-        return base / "CloakBrowser Manager"
+        return base / "CloakBrowser Manager (Custom)"
     if host_os == "macos":
-        return user_home / "Library" / "Application Support" / "CloakBrowser Manager"
+        return user_home / "Library" / "Application Support" / "CloakBrowser Manager (Custom)"
     return Path("/data")
 
 

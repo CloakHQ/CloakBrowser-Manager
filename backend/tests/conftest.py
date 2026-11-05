@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from collections import namedtuple
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -33,6 +34,15 @@ _mock_license.CloakBrowserLicenseError = type(  # type: ignore[attr-defined]
 )
 _mock_license.license_error_for_code = lambda code: None  # type: ignore[attr-defined]
 _mock_license.read_denial_file = lambda path: None  # type: ignore[attr-defined]
+# Seat lookups are only imported lazily inside functions, so the mock needs the
+# attribute but no test exercises the network. Unknown/empty by default: every
+# probe keeps a key cooling unless a test overrides it.
+_mock_license.SessionSeats = namedtuple(  # type: ignore[attr-defined]
+    "SessionSeats",
+    "state active limit reason",
+    defaults=("unknown", None, None, None),
+)
+_mock_license.get_session_seats = lambda key: _mock_license.SessionSeats()  # type: ignore[attr-defined]
 
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
 sys.modules.setdefault("cloakbrowser.download", _mock_download)
@@ -86,15 +96,22 @@ def app_client(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_home(tmp_path_factory, monkeypatch: pytest.MonkeyPatch):
-    """Keep the suite out of the developer's real ``$HOME``.
+    """Keep the suite out of the developer's real ``$HOME`` and data directory.
 
     On Linux the Manager resolves to the Docker runtime, where it writes a GTK bookmarks file
     into ``$HOME`` so the guest's file chooser can reach a profile's uploads. A test run must
-    never clobber a real one.
+    never clobber a real one. The data directory matters for the same reason: the license
+    pool persists leases there, so a launch under test would otherwise write into — and cool
+    down — the keys a real install is using.
+
+    ``tmp_db`` runs after this and points both at its own ``tmp_path``.
     """
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    data_dir = tmp_path_factory.mktemp("data")
+    monkeypatch.setattr(db, "DATA_DIR", data_dir)
+    monkeypatch.setattr(db, "DB_PATH", data_dir / "profiles.db")
     return home
 
 

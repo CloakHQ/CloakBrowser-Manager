@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / ".venv"
 SETUP_MARKER = VENV_DIR / ".manager-setup.json"
 FRONTEND_DIR = ROOT / "frontend"
-SERVER_URL = "http://127.0.0.1:8080"
+SERVER_URL = "http://127.0.0.1:8090"
 
 
 def _venv_python() -> Path:
@@ -91,10 +91,10 @@ def _ensure_environment() -> Path:
 def _ensure_server_port_available() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         try:
-            server_socket.bind(("127.0.0.1", 8080))
+            server_socket.bind(("127.0.0.1", 8090))
         except OSError as exc:
             raise RuntimeError(
-                "Port 8080 is already in use; stop the existing Manager or service"
+                "Port 8090 is already in use; stop the existing Manager or service"
             ) from exc
 
 

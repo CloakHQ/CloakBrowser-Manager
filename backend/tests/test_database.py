@@ -353,7 +353,7 @@ def test_create_profile_honours_explicit_id(tmp_db: Path):
     pid = db.new_profile_id()
     p = db.create_profile(name="Pre-minted", profile_id=pid)
     assert p["id"] == pid
-    assert p["user_data_dir"] == db.user_data_dir_for(pid)
+    assert Path(p["user_data_dir"]).name == "Pre-minted"
     assert db.get_profile(pid)["name"] == "Pre-minted"
 
 
@@ -372,4 +372,4 @@ def test_duplicate_profile_honours_new_id(tmp_db: Path):
     clone = db.duplicate_profile(src["id"], new_id=pid)
     assert clone["id"] == pid
     assert clone["fingerprint_seed"] == 7
-    assert clone["user_data_dir"] == db.user_data_dir_for(pid)
+    assert Path(clone["user_data_dir"]).name == "Src (copy)"

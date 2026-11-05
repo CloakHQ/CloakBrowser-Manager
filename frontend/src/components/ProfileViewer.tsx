@@ -103,11 +103,11 @@ export function ProfileViewer({
         });
 
         rfb.addEventListener("securityfailure", (e: any) => {
-          setError(`Security failure: ${e.detail.reason}`);
+          setError(`Lỗi bảo mật: ${e.detail.reason}`);
         });
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to connect");
+          setError(err instanceof Error ? err.message : "Kết nối thất bại");
         }
       }
     }
@@ -289,10 +289,13 @@ export function ProfileViewer({
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <p className="text-red-400 text-sm mb-2">Connection failed</p>
-          <p className="text-gray-500 text-xs">{error}</p>
+      <div className="flex items-center justify-center h-full p-6">
+        <div className="card max-w-sm w-full p-6 text-center">
+          <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-danger/10 border border-danger/25 text-danger">
+            <AlertCircle className="h-5 w-5" />
+          </div>
+          <p className="text-fg font-semibold text-sm mb-1">Kết nối thất bại</p>
+          <p className="text-fg-muted text-xs">{error}</p>
         </div>
       </div>
     );
@@ -301,14 +304,14 @@ export function ProfileViewer({
   return (
     <div className="relative h-full flex flex-col">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border">
+      <div className="flex items-center justify-between px-4 py-2 bg-surface-1/95 border-b border-line">
         <div className="flex items-center gap-2">
-          <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-yellow-400 animate-pulse"}`} />
-          <span className="text-xs text-gray-400">
-            {connected ? "Connected" : "Connecting..."}
+          <span className={`h-2 w-2 rounded-full ${connected ? "bg-success shadow-[0_0_8px_rgba(16,185,129,0.6)]" : "bg-warning animate-pulse"}`} />
+          <span className="text-xs font-medium text-fg-secondary">
+            {connected ? "Đã kết nối" : "Đang kết nối..."}
           </span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 rounded-lg border border-line bg-surface-0/60 p-0.5">
           <CdpEndpointButton cdpUrl={cdpUrl} />
           <ProfileFilesButton
             profileId={profileId}
@@ -323,21 +326,24 @@ export function ProfileViewer({
           />
           <button
             onClick={toggleClipboardSync}
-            className={`p-1 ${clipboardSync ? "text-accent" : "text-gray-500 hover:text-gray-300"}`}
-            title={clipboardSync ? "Disable clipboard sync" : "Enable clipboard sync"}
+            className={`inline-flex items-center justify-center rounded-md p-1.5 transition-colors ${
+              clipboardSync
+                ? "bg-brand-subtle text-brand"
+                : "text-fg-muted hover:bg-surface-3 hover:text-fg"
+            }`}
+            title={clipboardSync ? "Tắt đồng bộ clipboard" : "Bật đồng bộ clipboard"}
           >
             <ClipboardCopy className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={toggleFullscreen}
-            className="text-gray-500 hover:text-gray-300 p-1"
-            title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+            className="inline-flex items-center justify-center rounded-md p-1.5 text-fg-muted hover:bg-surface-3 hover:text-fg transition-colors"
+            title={fullscreen ? "Thoát toàn màn hình" : "Toàn màn hình"}
           >
             {fullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
           </button>
         </div>
       </div>
-
       {/* VNC canvas container, doubling as a drop target for file uploads */}
       <div
         ref={stageRef}
@@ -357,33 +363,33 @@ export function ProfileViewer({
               <div
                 key={transfer.id}
                 role={transfer.state === "failed" ? "alert" : "status"}
-                className="flex items-start gap-2 rounded-md border border-border bg-surface-2/95 px-3 py-2 shadow-lg"
+                className="flex items-start gap-2 rounded-md border border-line bg-surface-2/95 px-3 py-2 shadow-lg"
               >
                 {transfer.state === "uploading" ? (
-                  <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-accent" />
+                  <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-brand" />
                 ) : transfer.state === "done" ? (
-                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" />
                 ) : (
-                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-danger" />
                 )}
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm text-gray-200" title={transfer.name}>
+                  <div className="truncate text-sm text-fg" title={transfer.name}>
                     {transfer.name}
                   </div>
-                  <div className="text-xs text-gray-400">
+                  <div className="text-xs text-fg-secondary">
                     {transfer.state === "uploading"
-                      ? "Uploading to this profile..."
+                      ? "Đang tải lên hồ sơ này..."
                       : transfer.state === "done"
-                        ? `In profile files — pick it from Uploads — ${profileName} in the page's file dialog`
+                        ? `Đã vào tệp của hồ sơ — chọn từ Uploads — ${profileName} trong hộp thoại tệp của trang`
                         : transfer.error}
                   </div>
                   {transfer.state === "failed" && (
                     <button
                       type="button"
                       onClick={() => void files.retryTransfer(transfer.id)}
-                      className="mt-1 text-xs text-accent hover:underline"
+                      className="mt-1 text-xs text-brand hover:underline"
                     >
-                      Retry
+                      Thử lại
                     </button>
                   )}
                 </div>
@@ -391,8 +397,8 @@ export function ProfileViewer({
                   <button
                     type="button"
                     onClick={() => files.dismissTransfer(transfer.id)}
-                    className="p-0.5 text-gray-500 hover:text-gray-300"
-                    aria-label={`Dismiss ${transfer.name}`}
+                    className="p-0.5 text-fg-muted hover:text-fg"
+                    aria-label={`Bỏ qua ${transfer.name}`}
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
@@ -403,11 +409,11 @@ export function ProfileViewer({
         )}
 
         {dragging && (
-          <div className="pointer-events-none absolute inset-0 z-10 m-2 flex items-center justify-center rounded-md border-2 border-dashed border-accent bg-black/70">
+          <div className="pointer-events-none absolute inset-0 z-10 m-2 flex items-center justify-center rounded-md border-2 border-dashed border-brand bg-black/70">
             <div className="text-center">
-              <p className="text-sm font-medium text-gray-100">Drop to upload to this profile</p>
-              <p className="mt-1 text-xs text-gray-400">
-                Then pick it from Uploads — {profileName} in the page's file dialog
+              <p className="text-sm font-medium text-fg">Thả để tải lên hồ sơ này</p>
+              <p className="mt-1 text-xs text-fg-secondary">
+                Sau đó chọn từ Uploads — {profileName} trong hộp thoại tệp của trang
               </p>
             </div>
           </div>

@@ -58,7 +58,7 @@ Download the installer from the [latest **official** release](https://github.com
 - **macOS** — open the `.dmg` and drag **CloakBrowser Manager** into Applications. (Unsigned during early access — on first launch, run `xattr -rc "/Applications/CloakBrowser Manager.app"` in Terminal, or approve it under **System Settings → Privacy & Security → Open Anyway**.)
 - **Windows** — run the setup `.exe`. (Unsigned during early access — if SmartScreen warns, click **More info → Run anyway**.)
 
-No Python, Node, or git required. The Manager starts on `127.0.0.1:8080` and opens in your default browser. On first launch it downloads the CloakBrowser engine. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
+No Python, Node, or git required. The Manager starts on `127.0.0.1:8090` and opens in your default browser. On first launch it downloads the CloakBrowser engine. Profiles are stored in `%LOCALAPPDATA%\CloakBrowser Manager` on Windows and `~/Library/Application Support/CloakBrowser Manager` on macOS; a `logs/manager.log` in that folder records what happened if you need it.
 
 Open **Settings** (gear icon, top right) to add your license key and pick the Stable or Preview channel.
 
@@ -75,7 +75,7 @@ This path requires Python 3.10+ and Node 18+; the first run creates a local Pyth
 ### Linux server
 
 ```bash
-docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
+docker run -p 127.0.0.1:8090:8090 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
 ```
 
 Or build from source:
@@ -86,7 +86,7 @@ cd CloakBrowser-Manager
 docker compose up --build
 ```
 
-Open [http://localhost:8080](http://localhost:8080), create a profile, and click Launch.
+Open [http://localhost:8090](http://localhost:8090), create a profile, and click Launch.
 
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues) and attach the log so we can help. On Windows/macOS it's `logs/manager.log` in the data folder (`%LOCALAPPDATA%\CloakBrowser Manager` / `~/Library/Application Support/CloakBrowser Manager`); on Linux/Docker use `docker logs <container>`.
 
@@ -104,7 +104,7 @@ several keys to the **key pool** (see below).
 **Docker:** open **Settings** (gear icon, top right) the same way, paste your key, and Save. It applies immediately and is stored in the mounted `/data` volume, so it persists across restarts and image updates. For automated or headless setups, pass it at `docker run` instead:
 
 ```bash
-docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data \
+docker run -p 127.0.0.1:8090:8090 -v cloakprofiles:/data \
   -e CLOAKBROWSER_LICENSE_KEY=cb_your_key_here \
   -e CLOAKBROWSER_RELEASE_CHANNEL=preview \
   cloakhq/cloakbrowser-manager
@@ -145,12 +145,19 @@ How leasing works:
 
 - A launch leases the profile's **pinned** key if it has one, otherwise the first
   free key in the pool, otherwise the app-wide key.
-- A key is reserved for as long as its browser runs and released on stop, crash,
-  or a failed launch — so a small pool can rotate through many profiles as long
-  as they are not all running at once.
+- A key is reserved for as long as its browser runs. **Stopping** a profile hands
+  the key straight back. A browser that **dies** (crash, window closed, killed) or
+  a launch that **fails** does not: the license server keeps counting that
+  abandoned session for a while (4 minutes on free, 15 on team, 30 on business),
+  so the key cools down for that window before the pool may hand it to anyone
+  else. The pool asks the license server, which costs no seat, and releases the
+  key early the moment the server reports the seat free — the full window is only
+  the fallback when the server cannot be asked. The key list shows `cooling down`
+  while that lasts.
 - If every key is already leased, the launch is refused **before** the browser
   starts, with the same "session limit reached" message the server would have
-  produced a second later. Nothing is left half-started.
+  produced a second later — plus how long the earliest cooling key still needs.
+  Nothing is left half-started.
 - A key the binary rejects (exit code 77: invalid or expired) is marked invalid
   and drops out of rotation. An *out of seats* denial (76) does not retire the
   key — it is healthy, just busy.
@@ -160,6 +167,23 @@ How leasing works:
 
 Pinning a key to a profile (in the profile form) reserves that key for it, so a
 pooled key cannot be consumed by whichever profile happens to launch first.
+
+**Each key gets its own device identity.** The Pro binary stamps every session
+with a device id (`~/.cloakbrowser/install_id`). Left alone, all your keys report
+the same id and the server sees one machine running several keys — exactly what a
+farming ring looks like. The Manager therefore derives a stable UUID per key and
+writes it just before that key's browser starts, so the server sees each key on
+its own machine. Keyless launches keep the machine's original id. Changing the
+pool or restarting does not shuffle ids: they are a pure function of the key.
+
+**The exit IP is spoofed too.** By default the license/session calls go straight
+to cloakbrowser.dev, which would still expose your real IP for every key. On a
+proxied profile the Manager adds `--license-route=proxy` so those calls leave
+through the profile's own proxy and each key checks in from its own exit IP. This
+needs a binary that understands the flag (155+) and a proxy the browser reaches
+via `--proxy-server` — SOCKS5, or an HTTP proxy with a username and password. A
+plain no-auth HTTP proxy stays on the direct path, because the binary would
+otherwise refuse to start.
 
 **Keys do not create identities.** Each key is a seat, not a fingerprint: profiles
 that must look unrelated still need their own proxy and their own browser process.
@@ -186,6 +210,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Unlimited profiles, no per-profile tax** — create as many identities as you want. You pay only for how many run at the same time, not how many you keep. Dormant accounts cost nothing.
 - **Each profile is a different machine** — its own fingerprint seed, GPU family, screen, cookies, localStorage, cache, and history, persistent across restarts
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
+- **Rotating proxy providers** — pull a fresh proxy from KiotProxy or TMProxy on every launch instead of pasting one by hand
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
 - **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage
@@ -215,7 +240,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-uvicorn backend.main:app --reload --host 127.0.0.1 --port 8080
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8090
 ```
 
 ### Frontend
@@ -262,7 +287,7 @@ Pull the latest image and recreate the container:
 docker pull cloakhq/cloakbrowser-manager
 docker stop <container-id>
 docker rm <container-id>
-docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
+docker run -p 127.0.0.1:8090:8090 -v cloakprofiles:/data cloakhq/cloakbrowser-manager
 ```
 
 Profiles and session data remain in the native application-data directory or the `cloakprofiles` Docker volume across updates.
@@ -276,7 +301,7 @@ from playwright.async_api import async_playwright
 
 async with async_playwright() as pw:
     browser = await pw.chromium.connect_over_cdp(
-        "http://localhost:8080/api/profiles/<profile-id>/cdp"
+        "http://localhost:8090/api/profiles/<profile-id>/cdp"
     )
     page = browser.contexts[0].pages[0]
     await page.goto("https://example.com")
@@ -286,7 +311,7 @@ async with async_playwright() as pw:
 const { chromium } = require("playwright");
 
 const browser = await chromium.connectOverCDP(
-  "http://localhost:8080/api/profiles/<profile-id>/cdp"
+  "http://localhost:8090/api/profiles/<profile-id>/cdp"
 );
 const page = browser.contexts()[0].pages()[0];
 await page.goto("https://example.com");
@@ -302,15 +327,15 @@ the guest's file dialog, and anything the browser downloads is trapped in the co
 
 ```bash
 # Put a file where the profile's browser can use it: the body is the file, the header its name
-curl --data-binary @report.csv -H "X-File-Name: report.csv" http://localhost:8080/api/profiles/<id>/files
+curl --data-binary @report.csv -H "X-File-Name: report.csv" http://localhost:8090/api/profiles/<id>/files
 
 # What this profile holds
-curl http://localhost:8080/api/profiles/<id>/files
+curl http://localhost:8090/api/profiles/<id>/files
 
 # Fetch one back (also serves what the browser downloaded)
-curl -OJ http://localhost:8080/api/profiles/<id>/files/<artifact-id>
+curl -OJ http://localhost:8090/api/profiles/<id>/files/<artifact-id>
 
-curl -X DELETE http://localhost:8080/api/profiles/<id>/files/<artifact-id>
+curl -X DELETE http://localhost:8090/api/profiles/<id>/files/<artifact-id>
 ```
 
 The upload body is the file itself, not a form: it streams straight into the profile's store,
@@ -355,17 +380,17 @@ to make room.
 The container binds to localhost only. To access from a remote server:
 
 ```bash
-ssh -L 8080:localhost:8080 your-server
+ssh -L 8090:localhost:8090 your-server
 ```
 
-Then open `http://localhost:8080`.
+Then open `http://localhost:8090`.
 
 ## Authentication
 
 By default, there is no authentication (ideal for local use). To protect the web UI and API when hosting on a network, set the `AUTH_TOKEN` environment variable:
 
 ```bash
-docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data -e AUTH_TOKEN=your-secret-token cloakhq/cloakbrowser-manager
+docker run -p 127.0.0.1:8090:8090 -v cloakprofiles:/data -e AUTH_TOKEN=your-secret-token cloakhq/cloakbrowser-manager
 ```
 
 Or in `docker-compose.yml`:

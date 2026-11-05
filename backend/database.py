@@ -5,7 +5,9 @@ from __future__ import annotations
 import datetime
 import json
 import random
+import re
 import sqlite3
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,7 +20,9 @@ DATA_DIR = RUNTIME.data_dir
 DB_PATH = DATA_DIR / "profiles.db"
 
 _PROFILE_COLUMNS = (
-    "id", "name", "fingerprint_seed", "proxy", "timezone", "locale",
+    "id", "name", "fingerprint_seed", "proxy", "proxy_provider",
+    "proxy_provider_key", "kiotproxy_region", "tmproxy_location_id",
+    "tmproxy_isp_id", "timezone", "locale",
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
@@ -33,6 +37,11 @@ CREATE TABLE profiles (
     name TEXT NOT NULL,
     fingerprint_seed INTEGER NOT NULL,
     proxy TEXT,
+    proxy_provider TEXT NOT NULL DEFAULT 'none',
+    proxy_provider_key TEXT,
+    kiotproxy_region TEXT NOT NULL DEFAULT 'random',
+    tmproxy_location_id INTEGER NOT NULL DEFAULT 0,
+    tmproxy_isp_id INTEGER NOT NULL DEFAULT 0,
     timezone TEXT,
     locale TEXT,
     screen_width INTEGER DEFAULT 1920,
@@ -200,25 +209,84 @@ def new_profile_id() -> str:
     return str(uuid.uuid4())
 
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def user_data_dir_for(profile_id: str) -> str:
-    """Where a profile keeps its Chrome user data. The one place this layout lives."""
+    """Legacy UUID-based location, kept for profiles created before name folders."""
     return str(DATA_DIR / "profiles" / profile_id)
 
 
+def _profile_folder_name(name: str) -> str:
+    value = unicodedata.normalize("NFKC", name or "").strip()
+    value = "".join(ch for ch in value if unicodedata.category(ch)[0] != "C")
+    value = re.sub(r'[<>:"/\\|?*]', "-", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    if not value or value in {".", ".."}:
+        value = "profile"
+    if value.upper() in _WINDOWS_RESERVED_NAMES:
+        value = f"{value}-profile"
+    return value[:80].rstrip(" .") or "profile"
+
+
+def _profile_dir_is_taken(path: Path) -> bool:
+    if path.exists():
+        return True
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM profiles WHERE lower(user_data_dir) = lower(?)",
+                (str(path),),
+            ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def user_data_dir_for_name(name: str) -> str:
+    """A readable profile directory, with a numeric suffix when the name is taken."""
+    base = _profile_folder_name(name)
+    profiles_dir = DATA_DIR / "profiles"
+    candidate = base
+    index = 2
+    while _profile_dir_is_taken(profiles_dir / candidate):
+        candidate = f"{base} ({index})"
+        index += 1
+    return str(profiles_dir / candidate)
+
+
 def create_profile(
-    name: str, fingerprint_seed: int | None = None, *, profile_id: str | None = None, **fields: Any
+    name: str,
+    fingerprint_seed: int | None = None,
+    *,
+    profile_id: str | None = None,
+    user_data_dir: str | None = None,
+    **fields: Any,
 ) -> dict[str, Any]:
-    """Insert a new profile. ``profile_id`` lets a caller mint the id (and so the
-    user_data_dir) ahead of the row — used to fill a clone's directory BEFORE it
-    becomes visible, so a half-built profile is never listed."""
+    """Insert a new profile.
+
+    ``profile_id`` lets a caller mint the id ahead of the row. ``user_data_dir``
+    lets duplicate fill a clone's directory before it becomes visible; otherwise
+    the directory is derived from the profile name.
+    """
     profile_id = profile_id or new_profile_id()
     seed = fingerprint_seed if fingerprint_seed is not None else random.randint(10000, 99999)
-    user_data_dir = user_data_dir_for(profile_id)
+    user_data_dir = user_data_dir or user_data_dir_for_name(name)
     now = _now()
     tags = fields.pop("tags", None) or []
     values = {
         "id": profile_id, "name": name, "fingerprint_seed": seed,
-        "proxy": fields.get("proxy"), "timezone": fields.get("timezone"), "locale": fields.get("locale"),
+        "proxy": fields.get("proxy"),
+        "proxy_provider": fields.get("proxy_provider", "none"),
+        "proxy_provider_key": fields.get("proxy_provider_key") or None,
+        "kiotproxy_region": fields.get("kiotproxy_region", "random"),
+        "tmproxy_location_id": fields.get("tmproxy_location_id", 0),
+        "tmproxy_isp_id": fields.get("tmproxy_isp_id", 0),
+        "timezone": fields.get("timezone"), "locale": fields.get("locale"),
         "screen_width": fields.get("screen_width", 1920), "screen_height": fields.get("screen_height", 1080),
         "gpu_family": fields.get("gpu_family", "auto"), "humanize": fields.get("humanize", False),
         "human_preset": fields.get("human_preset", "default"), "geoip": fields.get("geoip", True),
@@ -300,6 +368,12 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     for key in ("launch_args", "extension_paths"):
         if key in fields:
             fields[key] = json.dumps(fields[key] or [])
+    if "license_key_id" in fields:
+        # An explicit null or "" both clear the pin, matching create_profile.
+        fields["license_key_id"] = fields["license_key_id"] or None
+    if "proxy_provider_key" in fields:
+        # An explicit null or "" clears the provider key.
+        fields["proxy_provider_key"] = fields["proxy_provider_key"] or None
     update_cols = []
     update_vals = []
     for col in _PROFILE_COLUMNS:
@@ -348,7 +422,12 @@ def reset_profile(profile_id: str) -> dict[str, Any] | None:
     return get_profile(profile_id)
 
 
-def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str, Any] | None:
+def duplicate_profile(
+    profile_id: str,
+    *,
+    new_id: str | None = None,
+    user_data_dir: str | None = None,
+) -> dict[str, Any] | None:
     """Clone a profile's config into a brand-new profile. Returns it or None.
 
     Config-only clone: every setting, the tags, notes, and the SAME
@@ -373,6 +452,8 @@ def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str
         name=f"{src['name']} (copy)",
         fingerprint_seed=src["fingerprint_seed"],
         profile_id=new_id,
+        # The caller may have filled this dir already (duplicate with state).
+        user_data_dir=user_data_dir,
         tags=src.get("tags"),
         **fields,
     )

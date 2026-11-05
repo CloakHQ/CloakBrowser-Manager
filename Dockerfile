@@ -51,10 +51,10 @@ COPY backend/ /app/backend/
 # Frontend build from stage 1
 COPY --from=frontend-builder /build/dist /app/frontend/dist
 
-EXPOSE 8080
+EXPOSE 8090
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')" || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8090/api/health')" || exit 1
 
 VOLUME /data
 

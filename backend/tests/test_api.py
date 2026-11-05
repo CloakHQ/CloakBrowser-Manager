@@ -892,6 +892,35 @@ def test_delete_unknown_key_is_404(app_client: TestClient, keys_env):
     assert app_client.delete("/api/keys/nope").status_code == 404
 
 
+def test_list_keys_exposes_the_cooldown(app_client: TestClient, keys_env):
+    keys_env.add("cb_cooling")
+    entry_id = keys_env.key_id("cb_cooling")
+    keys_env.stamp_cooldown(entry_id, 120)
+    key = keys_env.entries()[0]["cooldown_until"]
+    data = app_client.get("/api/keys").json()
+    assert data[0]["available_at"] == key
+    assert data[0]["available_at"] is not None
+
+
+def test_delete_key_refused_while_cooling_down(app_client: TestClient, keys_env):
+    keys_env.add("cb_cooling")
+    entry_id = keys_env.key_id("cb_cooling")
+    keys_env.stamp_cooldown(entry_id, 120)
+    resp = app_client.delete(f"/api/keys/{entry_id}")
+    assert resp.status_code == 409
+    assert "cooling down" in resp.json()["detail"]
+
+
+def test_delete_key_allowed_once_the_cooldown_is_cleared(
+    app_client: TestClient, keys_env
+):
+    keys_env.add("cb_cooling")
+    entry_id = keys_env.key_id("cb_cooling")
+    keys_env.stamp_cooldown(entry_id, 120)
+    keys_env.clear_cooldown(entry_id)
+    assert app_client.delete(f"/api/keys/{entry_id}").status_code == 200
+
+
 def test_check_keys_validates_the_whole_pool(app_client: TestClient, keys_env):
     keys_env.add("cb_one\ncb_two")
     data = app_client.post("/api/keys/check", json={}).json()
@@ -900,6 +929,40 @@ def test_check_keys_validates_the_whole_pool(app_client: TestClient, keys_env):
 
 def test_check_keys_rejects_an_unknown_id(app_client: TestClient, keys_env):
     assert app_client.post("/api/keys/check", json={"ids": ["nope"]}).status_code == 404
+
+
+def test_check_keys_empty_ids_validates_the_whole_pool(app_client: TestClient, keys_env):
+    # The UI's "check all" button sends an empty list.
+    keys_env.add("cb_one\ncb_two")
+    resp = app_client.post("/api/keys/check", json={"ids": []})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+
+def test_check_keys_rejects_null_ids(app_client: TestClient, keys_env):
+    # ids is a list, not Optional: the client must send [] for "all", never null.
+    assert app_client.post("/api/keys/check", json={"ids": None}).status_code == 422
+
+
+@pytest.mark.parametrize("cleared", ["", None])
+def test_update_profile_clears_the_key_pin(app_client: TestClient, keys_env, cleared):
+    keys_env.add("cb_pinned")
+    entry_id = keys_env.key_id("cb_pinned")
+    profile_id = app_client.post("/api/profiles", json={"name": "pinned"}).json()["id"]
+    pinned = app_client.put(f"/api/profiles/{profile_id}", json={"license_key_id": entry_id})
+    assert pinned.json()["license_key_id"] == entry_id
+    resp = app_client.put(f"/api/profiles/{profile_id}", json={"license_key_id": cleared})
+    assert resp.status_code == 200
+    assert resp.json()["license_key_id"] is None
+
+
+def test_update_profile_without_the_field_keeps_the_key_pin(app_client: TestClient, keys_env):
+    keys_env.add("cb_pinned")
+    entry_id = keys_env.key_id("cb_pinned")
+    profile_id = app_client.post("/api/profiles", json={"name": "pinned"}).json()["id"]
+    app_client.put(f"/api/profiles/{profile_id}", json={"license_key_id": entry_id})
+    resp = app_client.put(f"/api/profiles/{profile_id}", json={"name": "renamed"})
+    assert resp.json()["license_key_id"] == entry_id
 
 
 def test_settings_report_the_pool_size(app_client: TestClient, settings_env, keys_env):
@@ -1110,7 +1173,7 @@ def test_duplicate_profile_leaves_nothing_behind_when_copy_fails(
     assert "disk full" in resp.json()["detail"]
     # No clone row was ever written, and the clone directory does not linger
     assert [p["id"] for p in app_client.get("/api/profiles").json()] == [src["id"]]
-    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [Path(src["user_data_dir"]).name]
     # The source is untouched and can still be launched (the hold was released)
     assert not main.browser_mgr._held
 
@@ -1184,7 +1247,7 @@ async def test_duplicate_state_refuses_a_launching_source(tmp_db: Path):
     finally:
         main.browser_mgr._launching.discard(src["id"])
     assert [p["id"] for p in db.list_profiles()] == [src["id"]]
-    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [Path(src["user_data_dir"]).name]
 
 
 async def test_duplicate_state_refuses_a_source_still_closing(tmp_db: Path, real_lifecycle, monkeypatch: pytest.MonkeyPatch):
@@ -1474,3 +1537,109 @@ def test_a_proxy_that_never_reached_the_browser_does_not_re_arm(app_client: Test
 ])
 def test_only_download_behaviour_commands_for_the_profile_context_count(frame: str, expected: bool):
     assert main._sets_download_behaviour(frame) is expected
+
+
+# ── Proxy providers ──────────────────────────────────────────────────────────
+
+
+def test_profile_provider_fields_round_trip_but_key_is_masked(app_client: TestClient):
+    created = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "Kiot",
+            "proxy_provider": "kiotproxy",
+            "proxy_provider_key": "kiot-secret-key-123",
+            "kiotproxy_region": "nam",
+        },
+    )
+    assert created.status_code == 201
+    data = created.json()
+    assert data["proxy_provider"] == "kiotproxy"
+    assert data["proxy_provider_key_set"] is True
+    assert data["proxy_provider_key_masked"] == "kiot-…-123"
+    assert "proxy_provider_key" not in data
+    assert data["kiotproxy_region"] == "nam"
+
+
+def test_profile_provider_key_can_be_replaced_and_cleared(app_client: TestClient):
+    pid = app_client.post(
+        "/api/profiles",
+        json={"name": "TM", "proxy_provider": "tmproxy", "proxy_provider_key": "old-key"},
+    ).json()["id"]
+
+    replaced = app_client.put(
+        f"/api/profiles/{pid}", json={"proxy_provider_key": "new-key"}
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["proxy_provider_key_set"] is True
+
+    cleared = app_client.put(f"/api/profiles/{pid}", json={"proxy_provider_key": ""})
+    assert cleared.status_code == 200
+    assert cleared.json()["proxy_provider_key_set"] is False
+
+
+def test_kiotproxy_endpoint_returns_sanitised_info(app_client: TestClient, monkeypatch):
+    async def fake_new(key: str, region: str):
+        assert key == "kiot-key"
+        assert region == "bac"
+        return {
+            "provider": "kiotproxy",
+            "http": "http://1.2.3.4:8080",
+            "socks5": "socks5://1.2.3.4:8081",
+            "host": "1.2.3.4",
+            "real_ip": "1.2.3.4",
+            "location": "Hà Nội",
+            "isp": None,
+            "expires_at": 1,
+            "ttl": 60,
+            "ttc": 10,
+            "next_request_at": 2,
+            "raw": {"secret": "do-not-leak"},
+        }
+
+    monkeypatch.setattr(main.proxy_providers, "kiotproxy_new", fake_new)
+    resp = app_client.post(
+        "/api/proxy-providers/kiotproxy/new",
+        json={"key": "kiot-key", "region": "bac"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["real_ip"] == "1.2.3.4"
+    assert data["location"] == "Hà Nội"
+    assert "http" not in data
+    assert "raw" not in data
+
+
+def test_kiotproxy_endpoint_maps_provider_failure_to_502(app_client: TestClient, monkeypatch):
+    async def fake_new(key: str, region: str):
+        raise main.ProxyProviderError("kiotproxy", "kiotproxy: Key not found", code=40400006)
+
+    monkeypatch.setattr(main.proxy_providers, "kiotproxy_new", fake_new)
+    resp = app_client.post(
+        "/api/proxy-providers/kiotproxy/new",
+        json={"key": "missing", "region": "random"},
+    )
+    assert resp.status_code == 502
+    assert "Key not found" in resp.json()["detail"]
+
+
+def test_tmproxy_options_endpoints(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_locations",
+        AsyncMock(return_value=[{"id_location": 9, "name": "TP Ho Chi Minh"}]),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_isps",
+        AsyncMock(return_value=[{"id_isp": 1, "name": "Viettel"}]),
+    )
+
+    locations = app_client.get("/api/proxy-providers/tmproxy/locations")
+    isps = app_client.get("/api/proxy-providers/tmproxy/isps")
+
+    assert locations.status_code == 200
+    assert locations.json() == [{"id": 9, "name": "TP Ho Chi Minh"}]
+    assert isps.status_code == 200
+    assert isps.json() == [{"id": 1, "name": "Viettel"}]
+

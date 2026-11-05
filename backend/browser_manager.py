@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import logging
 import os
 import socket
+import sqlite3
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +45,11 @@ def is_seat_limit_error(exc: BaseException) -> bool:
     return "session limit reached" in str(exc).lower()
 
 
+def is_cooldown_error(exc: BaseException) -> bool:
+    """True when the refusal is a local cool-down wait, not a spent seat pool."""
+    return "cooling down" in str(exc).lower()
+
+
 def license_error_detail(exc: BaseException) -> dict[str, str]:
     """Build the structured launch-error payload the frontend renders.
 
@@ -60,16 +68,75 @@ def license_error_detail(exc: BaseException) -> dict[str, str]:
     return detail
 
 
+# The Pro binary identifies the machine by a UUID kept at ~/.cloakbrowser/install_id
+# and sends it on every session/start. Left alone, every key shares one value and
+# the server reads multiple keys on one box as farming. Give each key its own
+# stable UUID and point the file at it right before spawning so each key looks
+# like it runs on a separate machine.
+INSTALL_ID_NAMESPACE = uuid.UUID("5a7d2b8e-9c41-4f0a-8b3d-2c1e6f9a0d47")
+INSTALL_ID_FILENAME = "install_id"
+
+
+def install_id_path() -> Path:
+    return Path.home() / ".cloakbrowser" / INSTALL_ID_FILENAME
+
+
+def install_id_for(key: str | None) -> str:
+    """Stable per-key install id (the device UUID the binary reports)."""
+    return str(uuid.uuid5(INSTALL_ID_NAMESPACE, f"cloakbrowser-install:{key}"))
+
+
+def write_install_id(value: str) -> None:
+    """Atomically put ``value`` in the file the binary reads on next spawn."""
+    path = install_id_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(value, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        # Best-effort: a read-only home just falls back to the on-disk value.
+        logger.warning("could not write install id at %s", path)
+
+
+# The license/session calls normally go straight to cloakbrowser.dev, so the
+# server sees the host's real IP for every key no matter what proxy the page
+# uses — one more shared identity across an otherwise separate key. The Pro
+# binary can route them through --proxy-server instead; first build that has it.
+LICENSE_ROUTE_MIN_VERSION = "155.0"
+
+
+def _version_tuple(value: str) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(part) for part in value.split("."))
+    except (AttributeError, ValueError):
+        return None
+
+
+def supports_license_route(binary_version: str | None) -> bool:
+    """Whether the resolved binary knows --license-route.
+
+    Older builds ignore the flag (the calls stay direct), so it is only added
+    where it actually takes effect.
+    """
+    current = _version_tuple(binary_version or "")
+    floor = _version_tuple(LICENSE_ROUTE_MIN_VERSION)
+    return current is not None and floor is not None and current >= floor
+
+
 def _normalize_proxy(raw: str) -> str:
     """Convert common proxy formats to http://user:pass@host:port.
 
     Accepts:
       - http://user:pass@host:port  (already valid)
+      - user:pass@host:port
       - host:port:user:pass
       - host:port
     """
     if raw.startswith(("http://", "https://", "socks5://")):
         return raw
+    if "@" in raw and "://" not in raw:
+        return f"http://{raw}"
     parts = raw.split(":")
     if len(parts) == 4:
         host, port, user, passwd = parts
@@ -232,6 +299,12 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
     # BrowserManager._ensure_search_engine() (see that method).
 
 
+# License-seat probing. Read-only and free, so the pool can ask the server
+# whether a cooling key's seat is really free before re-issuing it.
+SEAT_PROBE_TIMEOUT = 12      # per seat lookup; this is the network, not CPU
+SEAT_POLL_INTERVAL = 1.0     # poll cadence while waiting for a seat release
+SEARCH_ENGINE_SEAT_WAIT_S = 20
+
 CDP_START_ATTEMPTS = 3
 CDP_READY_TIMEOUT = 10.0
 
@@ -344,6 +417,13 @@ class RunningProfile:
     # Pooled key id this browser was launched with (None for a keyless launch).
     # A denial for this launch is recorded against that key in the pool.
     license_key_id: str | None = None
+    # Proxy provider lease for this launch (KiotProxy/TMProxy), if any. The raw
+    # provider key is kept only so KiotProxy can be detached when the browser
+    # stops; it is never returned by the status API.
+    proxy_provider: str | None = None
+    proxy_provider_key: str | None = None
+    proxy_provider_fingerprint: str | None = None
+    proxy_info: dict[str, Any] | None = None
 
 
 class BrowserManager:
@@ -382,10 +462,33 @@ class BrowserManager:
         # running. One key per running browser: two free-tier keys can't share a
         # seat, so a key already leased is never handed to a second launch.
         self._key_leases: dict[str, str] = {}
+        # profile_id -> fingerprint of the proxy-provider key that profile's
+        # browser is using. A KiotProxy/TMProxy key hands out one proxy at a
+        # time, so it must not be shared by two running profiles.
+        self._proxy_leases: dict[str, str] = {}
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
+        # Serializes spawns: the install-id file is process-global, so a spawn must
+        # hold this from writing its key's id until the browser has sent
+        # session/start — otherwise a racing launch overwrites it first.
+        self._spawn_lock = asyncio.Lock()
+        # Keyless launches have no key to derive an id from; keep the machine's
+        # existing value (or mint one) so they don't churn the file per launch.
+        self._default_install_id = self._read_default_install_id()
         self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _read_default_install_id() -> str:
+        path = install_id_path()
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        return value or str(uuid.uuid4())
+
+    def _install_id_for_key(self, key: str | None) -> str:
+        return install_id_for(key) if key else self._default_install_id
 
     def resolve_binary_status(self) -> None:
         """Resolve the license tier + binary version and pre-download the binary.
@@ -454,14 +557,45 @@ class BrowserManager:
             key_id for owner, key_id in self._key_leases.items() if owner != exclude
         }
 
-    def _claim_license_key(self, profile: dict[str, Any]) -> tuple[str | None, str | None]:
+    def _reserved_key_ids(self, exclude: str | None = None) -> set[str]:
+        """Key ids pinned by a profile, optionally ignoring one.
+
+        A pin is a reservation even while its profile is stopped: otherwise an
+        unpinned launch would happily lease the key a profile is pinned to, and
+        that profile would then be refused as "already in use" when it starts.
+        The pinned profile itself is excluded because the caller handles its own
+        pin before falling back to the shared pool.
+        """
+        from . import database as db
+
+        try:
+            profiles = db.list_profiles()
+        except sqlite3.OperationalError:
+            # No schema yet (a launch in a fresh data dir): nothing can be pinned.
+            return set()
+        return {
+            profile["license_key_id"]
+            for profile in profiles
+            if profile.get("license_key_id") and profile["id"] != exclude
+        }
+
+    async def _claim_license_key(
+        self, profile: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
         """Pick the key this launch gets, and reserve it.
 
-        Order: the profile's pinned key, then the first usable key in the shared
-        pool that no other running profile holds, then the app-wide key. Reserving
-        under the manager lock is what makes N free-tier keys usable by N
-        concurrent profiles: a key is never handed to a second browser while the
-        first still holds its seat.
+        Order: the profile's pinned key, then the first claimable key in the
+        shared pool that no other running profile holds, then the app-wide key.
+        Reserving under the manager lock is what makes N free-tier keys usable by
+        N concurrent profiles: a key is never handed to a second browser while
+        the first still holds its seat.
+
+        A key whose browser died is not immediately claimable — the license
+        server keeps counting that abandoned session for a plan-specific grace
+        window, and re-issuing it inside that window is exactly the exit-76
+        denial. Rather than always waiting the full window out, the pool asks the
+        server (a read-only seat lookup) and only then re-checks. One probe per
+        claim, never more.
 
         Raises CloakBrowserLicenseError ("session limit reached", so the UI offers
         the upgrade CTA) when every key is already leased — that is exactly the
@@ -472,9 +606,10 @@ class BrowserManager:
 
         profile_id = profile["id"]
         leased = self._leased_key_ids(exclude=profile_id)
+        reserved = self._reserved_key_ids(exclude=profile_id)
         pinned = profile.get("license_key_id")
         if pinned:
-            entry = next((e for e in key_pool.entries() if e["id"] == pinned), None)
+            entry = key_pool.find_by_id(pinned)
             if entry is None:
                 raise CloakBrowserLicenseError(
                     f"CloakBrowser Pro: this profile is pinned to license key {pinned}, "
@@ -493,13 +628,40 @@ class BrowserManager:
                     "another running profile. Stop it, or unpin the key so this profile "
                     "can lease a free one."
                 )
+            if not key_pool.claimable(entry):
+                await self._probe_cooled_keys([entry])
+                # The probe writes the file only, so re-read before judging: a
+                # freed seat must be believed, and the message needs live numbers.
+                entry = key_pool.find_by_id(pinned) or entry
+                if not key_pool.claimable(entry):
+                    raise CloakBrowserLicenseError(
+                        "CloakBrowser Pro: session limit reached — pinned key "
+                        f"({key_pool.mask_key(entry['key'])}) is cooling down, the "
+                        "license server still counts its last session; retry in "
+                        f"{key_pool.cooldown_remaining(entry)}s, or unpin the key."
+                    )
             self._key_leases[profile_id] = pinned
+            key_pool.set_lease(profile_id, pinned, plan=entry.get("plan"))
             return entry["key"], pinned
 
-        for entry in key_pool.entries():
-            if entry["state"] == "invalid" or entry["id"] in leased:
-                continue
+        entry = self._first_claimable(leased, reserved)
+        if entry is None:
+            # Nothing free right now. If the only thing standing in the way is a
+            # cool-down, ask the server whether those seats are actually free
+            # yet, then look once more.
+            cooling = [
+                candidate
+                for candidate in key_pool.entries()
+                if candidate["id"] not in leased
+                and candidate["id"] not in reserved
+                and key_pool.cooldown_remaining(candidate) > 0
+            ]
+            if cooling:
+                await self._probe_cooled_keys(cooling)
+                entry = self._first_claimable(leased, reserved)
+        if entry is not None:
             self._key_leases[profile_id] = entry["id"]
+            key_pool.set_lease(profile_id, entry["id"], plan=entry.get("plan"))
             return entry["key"], entry["id"]
 
         # Pool exhausted (or empty) — fall back to the single app-wide key, which
@@ -507,13 +669,15 @@ class BrowserManager:
         app_key = self.license_key
         if app_key:
             app_id = key_pool.key_id(app_key)
-            if app_id in leased:
+            if app_id in leased or app_id in reserved:
                 raise CloakBrowserLicenseError(
                     "CloakBrowser Pro: session limit reached — the app-wide license "
-                    "key is already in use by a running profile. Add a key to the "
-                    "pool so profiles can run side by side, or stop that profile."
+                    "key is already in use by, or reserved for, another profile. Add "
+                    "a key to the pool so profiles can run side by side, or stop that "
+                    "profile."
                 )
             self._key_leases[profile_id] = app_id
+            key_pool.set_lease(profile_id, app_id, plan=self.license_plan)
             return app_key, app_id
         pooled = key_pool.entries()
         if pooled and not key_pool.usable_keys():
@@ -528,20 +692,182 @@ class BrowserManager:
             )
             return None, None
         if pooled:
+            waiting = [
+                key_pool.cooldown_remaining(candidate)
+                for candidate in pooled
+                if candidate["id"] not in leased
+                and candidate["id"] not in reserved
+                and key_pool.cooldown_remaining(candidate) > 0
+            ]
+            suffix = (
+                f" (cooling down: {min(waiting)}s until the server stops counting "
+                "an abandoned session)"
+                if waiting
+                else ""
+            )
+            reserved_note = (
+                " Some keys are reserved by another profile's pin; unpin one."
+                if any(entry["id"] in reserved for entry in pooled)
+                else ""
+            )
             raise CloakBrowserLicenseError(
                 "CloakBrowser Pro: session limit reached — every license key in the "
-                "pool is already in use by a running profile. Stop one, or add "
-                "another key."
+                "pool is already in use or reserved. Stop one, or add "
+                f"another key.{reserved_note}{suffix}"
             )
         return None, None
 
-    def _release_license_key(self, profile_id: str) -> None:
-        """Free the key a profile held, so the next launch can lease it."""
+    def _first_claimable(
+        self, leased: set[str], reserved: set[str] | None = None
+    ) -> dict | None:
+        """First pooled key nothing else holds, pins included, and may hand out."""
+        from . import key_pool
+
+        reserved = reserved or set()
+        for entry in key_pool.entries():
+            if (
+                entry["id"] in leased
+                or entry["id"] in reserved
+                or not key_pool.claimable(entry)
+            ):
+                continue
+            return entry
+        return None
+
+    async def _probe_cooled_keys(self, entries: list[dict]) -> None:
+        """Ask the server whether cooling keys' seats are free yet.
+
+        The local grace window is a guess; the seat list is the truth. A key the
+        server reports below its cap is released early. Everything else — still
+        busy, probe failed, server flaky — keeps cooling, so the grace window
+        stays the fallback. Probes run concurrently: a claim holds the manager
+        lock and N keys must not add up to N timeouts.
+
+        Never raises.
+        """
+        from . import key_pool
+
+        targets = [entry for entry in entries if key_pool.cooldown_remaining(entry) > 0]
+        if not targets:
+            return
+        await asyncio.gather(*(self._probe_one(entry) for entry in targets))
+
+    async def _probe_one(self, entry: dict) -> None:
+        """Probe one cooling key; clear its cool-down when the seat is free."""
+        from cloakbrowser.license import get_session_seats
+
+        from . import key_pool
+
+        try:
+            seats = await asyncio.wait_for(
+                asyncio.to_thread(get_session_seats, entry["key"]), SEAT_PROBE_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001 — a probe never blocks a launch
+            logger.debug(
+                "Seat probe failed for %s: %s", key_pool.mask_key(entry["key"]), exc
+            )
+            return
+        if seats.state == "ok" and (seats.active or 0) < (seats.limit or 1):
+            key_pool.clear_cooldown(entry["id"])
+            logger.debug(
+                "Seat probe: %s is free again (active=%s limit=%s)",
+                key_pool.mask_key(entry["key"]),
+                seats.active,
+                seats.limit,
+            )
+        else:
+            logger.debug(
+                "Seat probe: %s still busy (state=%s active=%s limit=%s)",
+                key_pool.mask_key(entry["key"]),
+                seats.state,
+                seats.active,
+                seats.limit,
+            )
+
+    def _release_license_key(self, profile_id: str, *, cooldown: int = 0) -> str | None:
+        """Free the key a profile held, cooling it when the seat is not really free.
+
+        ``cooldown`` is the plan's reclaim window: a browser that died leaves the
+        server still counting its session, so the key must sit out that window
+        before the pool hands it to anyone. ``stop()`` passes 0 — a clean stop
+        says the seat was given back. Returns the key id that was held.
+        """
+        from . import key_pool
+
         self._key_leases.pop(profile_id, None)
+        return key_pool.clear_lease(profile_id, cooldown=cooldown)
 
     def leased_keys(self) -> dict[str, str]:
         """profile_id → key id for every running profile that holds a key."""
         return dict(self._key_leases)
+
+    @staticmethod
+    def _proxy_fingerprint(provider: str, key: str) -> str:
+        """Stable, non-secret handle for a provider key (in-memory lease only)."""
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return f"{provider}:{digest}"
+
+    async def _claim_proxy(
+        self, profile: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, str | None, str | None, str | None]:
+        """Fetch a fresh proxy from the profile's provider, or return no proxy.
+
+        The provider key is reserved before the network call so two launches
+        racing on the same key cannot both receive a proxy. A failed fetch
+        releases the reservation again.
+        """
+        from . import proxy_providers
+
+        provider = (profile.get("proxy_provider") or "none").strip().lower()
+        if provider not in ("kiotproxy", "tmproxy"):
+            return None, None, None, None
+        key = (profile.get("proxy_provider_key") or "").strip()
+        if not key:
+            raise ValueError(f"{provider} is selected but no API key is configured")
+        fingerprint = self._proxy_fingerprint(provider, key)
+        profile_id = profile["id"]
+
+        async with self._lock:
+            for owner, held in self._proxy_leases.items():
+                if held == fingerprint and owner != profile_id:
+                    raise ValueError(
+                        f"The {provider} key is already in use by running profile {owner}. "
+                        "Each provider key can hand out one proxy at a time; use another key."
+                    )
+            self._proxy_leases[profile_id] = fingerprint
+
+        try:
+            info = await proxy_providers.new_for(
+                provider,
+                key,
+                region=profile.get("kiotproxy_region") or "random",
+                location_id=int(profile.get("tmproxy_location_id") or 0),
+                isp_id=int(profile.get("tmproxy_isp_id") or 0),
+            )
+        except proxy_providers.ProxyProviderError as exc:
+            self._proxy_leases.pop(profile_id, None)
+            raise ValueError(str(exc)) from exc
+        except BaseException:
+            self._proxy_leases.pop(profile_id, None)
+            raise
+        if not info.get("http"):
+            self._proxy_leases.pop(profile_id, None)
+            raise ValueError(f"{provider} did not return an HTTP proxy")
+        return info, provider, key, fingerprint
+
+    async def _release_proxy(
+        self, profile_id: str, provider: str | None, key: str | None
+    ) -> None:
+        """Detach the provider proxy (KiotProxy) and free its in-memory lease."""
+        from . import proxy_providers
+
+        try:
+            if provider and key:
+                await proxy_providers.release_for(provider, key)
+        except Exception as exc:  # noqa: BLE001 - teardown must never fail on this
+            logger.warning("Could not release %s proxy for %s: %s", provider, profile_id, exc)
+        finally:
+            self._proxy_leases.pop(profile_id, None)
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
@@ -580,7 +906,7 @@ class BrowserManager:
             # Reserve a license key while still holding the lock: two launches
             # racing here must never lease the same key.
             try:
-                launch_key, launch_key_id = self._claim_license_key(profile)
+                launch_key, launch_key_id = await self._claim_license_key(profile)
             except BaseException:
                 self._launching.discard(profile_id)
                 raise
@@ -589,6 +915,15 @@ class BrowserManager:
         ws_port: int | None = None
         cdp_port: int | None = None
         context: Any | None = None
+        # Whether every context this launch opened really closed. The CDP retry
+        # loop drops its half-started context per attempt, so a failed close
+        # there has to survive as a flag: the seat may still be held.
+        context_closed_cleanly = True
+        # Provider proxy lease, kept here so a failed launch can release it too.
+        proxy_info: dict[str, Any] | None = None
+        proxy_provider: str | None = None
+        proxy_provider_key: str | None = None
+        proxy_provider_fingerprint: str | None = None
         try:
             if self.runtime.viewer_mode == "vnc":
                 display, ws_port = await self.vnc.allocate()
@@ -603,12 +938,28 @@ class BrowserManager:
 
             _init_profile_defaults(user_data_dir)
 
+            # A provider (KiotProxy/TMProxy) takes precedence over the manual
+            # proxy field. Claimed before anything that spawns a browser so the
+            # one-time search-engine launch rides the same exit IP as the real
+            # launch — and keeps the lease in this launch's failure path.
+            proxy_info, proxy_provider, proxy_provider_key, proxy_provider_fingerprint = (
+                await self._claim_proxy(profile)
+            )
+            raw_proxy = (proxy_info or {}).get("http") or profile.get("proxy") or None
+            proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
+            if proxy:
+                _validate_proxy(proxy)
+            if profile.get("transparent_proxy"):
+                _validate_transparent_proxy(proxy)
+
             # One-time per profile (opt-out via set_google_default): make Google
             # the default search engine. Runs before the user-facing launch;
             # reports "initializing" via get_status while it works (one short
             # headless launch). Never fatal.
             if profile.get("set_google_default", True):
-                await self._ensure_search_engine(profile_id, user_data_dir, launch_key)
+                await self._ensure_search_engine(
+                    profile_id, user_data_dir, launch_key, proxy
+                )
 
             if display is not None and ws_port is not None:
                 await self.vnc.start_vnc(
@@ -632,17 +983,14 @@ class BrowserManager:
             extra_args = self._build_fingerprint_args(profile)
             extra_args += user_launch_args
             extra_args.append("--remote-debugging-address=127.0.0.1")
+            # Send the license/session calls out through the profile's proxy when
+            # the binary understands the flag, so the license server does not see
+            # every key on this machine's one real IP.
+            extra_args += self._license_route_args(proxy)
             # Reopen the tabs the user had open when the profile was last stopped.
             # Chrome's persistent session is saved on disk but only restored when told to.
             if profile.get("restore_session", True):
                 extra_args.append("--restore-last-session")
-
-            raw_proxy = profile.get("proxy") or None
-            proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
-            if proxy:
-                _validate_proxy(proxy)
-            if profile.get("transparent_proxy"):
-                _validate_transparent_proxy(proxy)
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
@@ -674,7 +1022,12 @@ class BrowserManager:
                     f"--remote-debugging-port={cdp_port}",
                 ]
                 try:
-                    context = await launch_persistent_context_async(**launch_options)
+                    # Hold the spawn lock from writing this key's install id until
+                    # the browser has sent session/start (the wrapper returns only
+                    # after spawn), so a concurrent launch can't swap the file.
+                    async with self._spawn_lock:
+                        write_install_id(self._install_id_for_key(launch_key))
+                        context = await launch_persistent_context_async(**launch_options)
                     # An over-cap/denied seat leaves the browser booting but never
                     # serving a usable CDP endpoint — so waiting on CDP would just
                     # time out (or worse). The wrapper wrote the reason to a denial
@@ -688,7 +1041,9 @@ class BrowserManager:
                     break
                 except asyncio.CancelledError:
                     if context is not None:
-                        await self._close_context(context, profile_id)
+                        context_closed_cleanly = (
+                            await self._close_context(context, profile_id)
+                        ) and context_closed_cleanly
                     self._release_cdp_port(cdp_port)
                     context = None
                     cdp_port = None
@@ -700,7 +1055,9 @@ class BrowserManager:
                     # not the license exception, so check the file explicitly.
                     dp = getattr(context, "_cloak_denial_path", None) if context is not None else None
                     if context is not None:
-                        await self._close_context(context, profile_id)
+                        context_closed_cleanly = (
+                            await self._close_context(context, profile_id)
+                        ) and context_closed_cleanly
                     self._release_cdp_port(cdp_port)
                     context = None
                     cdp_port = None
@@ -760,6 +1117,10 @@ class BrowserManager:
                 capture_preview=bool(profile.get("capture_preview", True)),
                 denial_path=getattr(context, "_cloak_denial_path", None),
                 license_key_id=launch_key_id,
+                proxy_provider=proxy_provider,
+                proxy_provider_key=proxy_provider_key,
+                proxy_provider_fingerprint=proxy_provider_fingerprint,
+                proxy_info=proxy_info,
             )
             context.on(
                 "close",
@@ -807,27 +1168,47 @@ class BrowserManager:
             # Stay "active" until the half-launched browser is really gone: swap
             # _launching for _stopping under the lock so is_active() never sees a
             # gap while a context may still be open, then clear it after cleanup.
+            from . import key_pool
+
             async with self._lock:
                 self._launching.discard(profile_id)
                 self._reserve_stopping(profile_id)
-                # The launch never took the key's seat, so hand it back. A denial
-                # that says the key itself is dead retires it from the pool first.
+                # A denial that says the key itself is dead retires it from the
+                # pool first — it must read launch_key_id while it is still valid.
                 if isinstance(_failure, CloakBrowserLicenseError):
                     self._retire_rejected_key(launch_key_id, _failure)
-                self._release_license_key(profile_id)
+                # Settle the cool-down BEFORE closing. A seat refusal (76) means
+                # the seat belongs to someone else right now, so the key must sit
+                # out its plan's reclaim window even if the close is clean; a
+                # retired key (77) never needs one. Any other failure keeps the
+                # key free only if the context really closed.
+                plan = (key_pool.find_by_id(launch_key_id) or {}).get("plan") or self.license_plan
+                grace = key_pool.grace_for(plan) if is_seat_limit_error(_failure) else 0
+            # Close outside the lock: it is a long await and nothing else needs it.
+            closed = context_closed_cleanly
             try:
                 if context is not None:
-                    await self._close_context(context, profile_id)
+                    closed = await self._close_context(context, profile_id)
+                if not closed:
+                    # The browser may still be alive holding the seat.
+                    grace = key_pool.grace_for(plan)
                 if cdp_port is not None:
                     self._release_cdp_port(cdp_port)
                 if display is not None:
                     await self.vnc.stop_vnc(display)
             finally:
+                async with self._lock:
+                    self._release_license_key(profile_id, cooldown=grace)
+                await self._release_proxy(profile_id, proxy_provider, proxy_provider_key)
                 self._release_stopping(profile_id)
             raise
 
     async def _ensure_search_engine(
-        self, profile_id: str, user_data_dir: Path, license_key: str | None = None
+        self,
+        profile_id: str,
+        user_data_dir: Path,
+        license_key: str | None = None,
+        proxy: str | None = None,
     ) -> None:
         """Make Google the default search engine, once per profile.
 
@@ -855,7 +1236,7 @@ class BrowserManager:
 
         self._initializing.add(profile_id)
         try:
-            await self._setup_google_default(user_data_dir)
+            await self._setup_google_default(user_data_dir, license_key, proxy)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("google\n")
             logger.info(
@@ -884,7 +1265,9 @@ class BrowserManager:
         finally:
             self._initializing.discard(profile_id)
 
-    async def _setup_google_default(self, user_data_dir: Path) -> None:
+    async def _setup_google_default(
+        self, user_data_dir: Path, license_key: str | None = None, proxy: str | None = None
+    ) -> None:
         """Add Google via the settings UI, then commit it as the default.
 
         Single headless launch, no file seeding. A plain Preferences write can't
@@ -894,8 +1277,13 @@ class BrowserManager:
         un-forgeable url_hash (strictly so on Windows). So we drive the real Add
         dialog — Chrome creates the row with a valid hash — then "Make default".
         Every later launch then carries Google via the profile's own files.
+
+        ``license_key`` is the key this profile already leased: the headless
+        launch is a real browser and must ride it, then the seat is waited on
+        before the user-facing launch takes it back. ``proxy`` keeps that headless
+        launch on the same exit IP as the real one.
         """
-        ctx = await self._headless_launch(user_data_dir, license_key)
+        ctx = await self._headless_launch(user_data_dir, license_key, proxy)
         try:
             page = await ctx.new_page()
             await page.goto("chrome://settings/searchEngines")
@@ -934,25 +1322,61 @@ class BrowserManager:
                 )
         finally:
             await self._close_context(ctx, "search-init")
+        if license_key and not await self._wait_for_seat_release(license_key):
+            from . import key_pool
+
+            logger.warning(
+                "Search-engine setup left its seat held for %s; launching anyway",
+                key_pool.mask_key(license_key),
+            )
         await asyncio.sleep(0.5)
 
+    async def _wait_for_seat_release(self, key: str) -> bool:
+        """Wait until the server stops counting ``key``'s last session. Best-effort.
+
+        The per-profile setup launch runs on the profile's own key; the
+        user-facing launch immediately follows on the same key, so the server
+        must have noticed the close first. A failed lookup only skips that poll —
+        the local grace window is not needed here because there is nothing else
+        to hand the key to.
+        """
+        from cloakbrowser.license import get_session_seats  # lazy
+
+        deadline = time.monotonic() + SEARCH_ENGINE_SEAT_WAIT_S
+        while time.monotonic() < deadline:
+            try:
+                seats = await asyncio.wait_for(
+                    asyncio.to_thread(get_session_seats, key), SEAT_PROBE_TIMEOUT
+                )
+            except Exception:
+                seats = None
+            if seats is not None and seats.state == "ok" and seats.active == 0:
+                return True
+            await asyncio.sleep(SEAT_POLL_INTERVAL)
+        return False
+
     async def _headless_launch(
-        self, user_data_dir: Path, license_key: str | None = None
+        self, user_data_dir: Path, license_key: str | None = None, proxy: str | None = None
     ) -> Any:
         """Short headless launch used only by the one-time search-engine setup.
 
         Takes the key the caller already leased for this profile: this is a real
         browser launch and would otherwise try to take a second seat with the
-        app-wide key, which a one-seat free plan denies.
+        app-wide key, which a one-seat free plan denies. It also takes the proxy,
+        so this launch checks in from the same exit IP as the real one.
         """
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             (user_data_dir / lock_file).unlink(missing_ok=True)
-        return await launch_persistent_context_async(
-            user_data_dir=str(user_data_dir),
-            headless=True,
-            license_key=license_key,
-            release_channel=self.release_channel,
-        )
+        async with self._spawn_lock:
+            write_install_id(self._install_id_for_key(license_key))
+            return await launch_persistent_context_async(
+                user_data_dir=str(user_data_dir),
+                headless=True,
+                proxy=proxy,
+                args=self._license_route_args(proxy),
+                license_key=license_key,
+                release_channel=self.release_channel,
+            )
 
     async def _capture_screenshot(self, running: RunningProfile) -> None:
         """Write a compressed JPEG of the profile's current page to disk.
@@ -992,42 +1416,69 @@ class BrowserManager:
         except asyncio.CancelledError:
             pass
 
-    async def _close_context(self, context: Any, profile_id: str) -> None:
+    async def _close_context(self, context: Any, profile_id: str) -> bool:
+        """Close a context. False when the close failed — the seat may still be held."""
         try:
             await context.close()
         except Exception as exc:
             logger.warning("Error closing context for %s: %s", profile_id, exc)
+            return False
+        return True
 
     async def _dispose_running(
         self,
         running: RunningProfile,
         *,
         close_context: bool,
-    ) -> None:
-        if running.screenshot_task is not None:
-            running.screenshot_task.cancel()
-        if running.download_task is not None:
-            running.download_task.cancel()
-            # Awaited, not just cancelled: the watcher owns staged download files, and
-            # disposal must not race its cleanup.
-            await asyncio.gather(running.download_task, return_exceptions=True)
-            # The browser is gone, so a transfer still marked pending can never finish.
-            # Reconciling only on the next launch would strand it while the profile is stopped.
-            try:
-                downloads.reconcile_interrupted(running.profile_id)
-            except Exception as exc:  # noqa: BLE001 — teardown must not fail on bookkeeping
-                logger.warning(
-                    "Profile %s: could not reconcile downloads on stop: %s",
-                    running.profile_id, exc,
-                )
-        if close_context:
-            await self._close_context(running.context, running.profile_id)
-        if running.display is not None:
-            await self.vnc.stop_vnc(running.display)
-        self._release_cdp_port(running.cdp_port)
-        # Both stop() and a self-close land here, and both free the seat the
-        # profile held, so the next launch can lease that key again.
-        self._release_license_key(running.profile_id)
+        grace_seconds: int = 0,
+    ) -> bool:
+        """Tear down a browser and release its key.
+
+        ``grace_seconds`` is how long the key must stay out of rotation after the
+        release — the caller passes the plan's reclaim window when the browser
+        died rather than being stopped. A failed close raises it to the full
+        window: the browser may still be alive, so the seat is certainly not
+        free. Returns whether the context actually closed.
+        """
+        from . import key_pool
+
+        plan = (
+            key_pool.find_by_id(running.license_key_id) or {}
+        ).get("plan") or self.license_plan
+        closed = True
+        try:
+            if running.screenshot_task is not None:
+                running.screenshot_task.cancel()
+            if running.download_task is not None:
+                running.download_task.cancel()
+                # Awaited, not just cancelled: the watcher owns staged download files, and
+                # disposal must not race its cleanup.
+                await asyncio.gather(running.download_task, return_exceptions=True)
+                # The browser is gone, so a transfer still marked pending can never finish.
+                # Reconciling only on the next launch would strand it while the profile is stopped.
+                try:
+                    downloads.reconcile_interrupted(running.profile_id)
+                except Exception as exc:  # noqa: BLE001 — teardown must not fail on bookkeeping
+                    logger.warning(
+                        "Profile %s: could not reconcile downloads on stop: %s",
+                        running.profile_id, exc,
+                    )
+            if close_context:
+                closed = await self._close_context(running.context, running.profile_id)
+                if not closed:
+                    grace_seconds = max(grace_seconds, key_pool.grace_for(plan))
+            if running.display is not None:
+                await self.vnc.stop_vnc(running.display)
+            self._release_cdp_port(running.cdp_port)
+            return closed
+        finally:
+            # In `finally` so a stop_vnc raise or a cancelled dispose can never
+            # strand the lease. Both stop() and a self-close land here: stop()
+            # releases the seat outright, a death cools the key down first.
+            self._release_license_key(running.profile_id, cooldown=grace_seconds)
+            await self._release_proxy(
+                running.profile_id, running.proxy_provider, running.proxy_provider_key
+            )
 
     async def _on_browser_closed(self, running: RunningProfile):
         """Release resources after a browser crash or user-initiated close.
@@ -1043,6 +1494,8 @@ class BrowserManager:
         owns the same profile_id, nor stamp a stale denial onto it.
         """
         profile_id = running.profile_id
+        from . import key_pool
+
         async with self._lock:
             if self.running.get(profile_id) is not running:
                 return  # superseded — a newer launch owns this profile now
@@ -1051,13 +1504,25 @@ class BrowserManager:
             denial = self._record_denial_if_any(profile_id, running.denial_path)
             if denial is not None:
                 self._retire_rejected_key(running.license_key_id, denial)
+            # A browser that died (crash, window closed, killed) leaves the server
+            # still counting its session, so the key cools down for the plan's
+            # reclaim window before the pool may hand it out again. A dead key is
+            # retired by _retire_rejected_key and needs no cool-down.
+            plan = (
+                key_pool.find_by_id(running.license_key_id) or {}
+            ).get("plan") or self.license_plan
+            grace = key_pool.grace_for(plan)
+            if denial is not None and not is_seat_limit_error(denial):
+                grace = 0  # a dead key is retired by _retire_rejected_key anyway
             self.running.pop(profile_id, None)
             # Same contract as stop(): active until the dispose is really done.
             self._reserve_stopping(profile_id)
 
         logger.info("Browser closed for profile %s, cleaning up", profile_id)
         try:
-            await self._dispose_running(running, close_context=True)
+            await self._dispose_running(
+                running, close_context=True, grace_seconds=grace
+            )
         finally:
             self._release_stopping(profile_id)
 
@@ -1195,6 +1660,8 @@ class BrowserManager:
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status and viewer capabilities for a profile."""
+        from . import proxy_providers
+
         running = self.running.get(profile_id)
         if running:
             state = "running"
@@ -1213,6 +1680,7 @@ class BrowserManager:
                 else None
             ),
             "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+            "active_proxy": proxy_providers.public_info(running.proxy_info) if running else None,
             # Set when the last launch closed on a license denial (post-handshake
             # out-of-seats / bad key). Only meaningful while stopped; cleared on
             # the next launch. {message, reason, upgrade_url?} or None.
@@ -1235,6 +1703,30 @@ class BrowserManager:
         """Kill orphan display processes in the Docker runtime only."""
         if self.runtime.viewer_mode == "vnc":
             await self.vnc.cleanup_stale()
+
+    async def reconcile_leases(self) -> None:
+        """Rebuild the lease book from disk after a restart. Never raises.
+
+        No browser survives a Manager restart, so every lease stored in the pool
+        is an orphan — including one whose pid happens to be reused. Each held key
+        is therefore cooled down for its plan's reclaim window before the pool may
+        hand it out, and then the license server is asked whether those seats are
+        already free again so a short-lived restart doesn't cost four minutes.
+        """
+        from . import key_pool
+
+        try:
+            freed = key_pool.drop_all_leases()
+            for entry_id in freed:
+                plan = (key_pool.find_by_id(entry_id) or {}).get("plan") or self.license_plan
+                key_pool.stamp_cooldown(entry_id, key_pool.grace_for(plan))
+            if freed:
+                logger.info(
+                    "Restart: %d leased license key(s) held out of rotation", len(freed)
+                )
+                await self._probe_cooled_keys(key_pool.entries())
+        except Exception as exc:  # noqa: BLE001 — startup must survive bookkeeping
+            logger.warning("License lease reconcile failed: %s", exc)
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
@@ -1361,3 +1853,24 @@ class BrowserManager:
             args.append(f"--fingerprint-screen-height={sh}")
 
         return args
+
+    def _license_route_args(self, proxy: str | None) -> list[str]:
+        """Route the license/session calls through the profile's own proxy.
+
+        The exit IP is an identity the server can see as readily as the install
+        id, so a proxied profile must not still check in from the host's real
+        IP. Only added when there is a proxy the wrapper will actually put in
+        `--proxy-server` and the binary knows the flag — otherwise the binary
+        exits 79 ("--license-route value is invalid... proxy with a proxy set").
+
+        The wrapper only passes `--proxy-server` for SOCKS5 and for credentialed
+        HTTP(S) proxies on binaries new enough for inline auth; a plain
+        `http://host:port` goes through Playwright's proxy dict instead, so it is
+        left on the direct path.
+        """
+        if not proxy or not supports_license_route(self.binary_version):
+            return []
+        is_socks = proxy.startswith("socks5://")
+        if not is_socks and "@" not in proxy:
+            return []
+        return ["--license-route=proxy"]

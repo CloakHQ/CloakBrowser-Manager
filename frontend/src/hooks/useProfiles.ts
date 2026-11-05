@@ -1,18 +1,26 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type Profile, type ProfileCreateData } from "../lib/api";
 
+function message(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 export function useProfiles() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // Two error channels: a poll error clears on the next good poll, an action
+  // error stays until dismissed or replaced — otherwise the 3s poll would wipe
+  // a failed save/delete before the user could read it.
+  const [pollError, setPollError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       const data = await api.listProfiles();
       setProfiles(data);
-      setError(null);
+      setPollError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch profiles");
+      setPollError(message(err, "Không tải được danh sách hồ sơ"));
     } finally {
       setLoading(false);
     }
@@ -25,30 +33,41 @@ export function useProfiles() {
     return () => clearInterval(interval);
   }, [refresh]);
 
+  const clearActionError = useCallback(() => setActionError(null), []);
+
+  // Mutations record the error for the banner AND rethrow, so callers only
+  // report success / change views when the server actually confirmed it.
+  const fail = useCallback((err: unknown, fallback: string): never => {
+    setActionError(message(err, fallback));
+    throw err;
+  }, []);
+
   const create = useCallback(
-    async (data: ProfileCreateData): Promise<Profile | undefined> => {
+    async (data: ProfileCreateData): Promise<Profile> => {
       try {
         const profile = await api.createProfile(data);
         setProfiles((prev) => [profile, ...prev]);
+        setActionError(null);
         return profile;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to create profile");
+        return fail(err, "Không tạo được hồ sơ");
       }
     },
-    [],
+    [fail],
   );
 
   const update = useCallback(
-    async (id: string, data: Partial<ProfileCreateData>) => {
+    async (id: string, data: Partial<ProfileCreateData>): Promise<Profile> => {
       try {
         const profile = await api.updateProfile(id, data);
         setProfiles((prev) => prev.map((p) => (p.id === id ? profile : p)));
+        setActionError(null);
         return profile;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to update profile");
+        return fail(err, "Không lưu được hồ sơ");
       }
     },
-    [],
+    [fail],
   );
 
   // Persist a manual order. Optimistic so the UI updates instantly; the 3s poll
@@ -64,7 +83,7 @@ export function useProfiles() {
       try {
         await api.reorderProfiles(orderedIds);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to reorder profiles");
+        setActionError(message(err, "Không lưu được thứ tự hồ sơ"));
         await refresh();
       }
     },
@@ -76,18 +95,18 @@ export function useProfiles() {
       try {
         await api.deleteProfile(id);
         setProfiles((prev) => prev.filter((p) => p.id !== id));
+        setActionError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to delete profile");
+        fail(err, "Không xóa được hồ sơ");
       }
     },
-    [],
+    [fail],
   );
 
   const launch = useCallback(
     async (id: string) => {
       // Don't swallow: a launch denial (out of seats, bad/expired key) carries a
-      // structured reason + upgrade CTA that LaunchButton renders. Re-throw so it
-      // reaches the button's own catch instead of a flat hook-level banner.
+      // structured reason + upgrade CTA that the launch banner renders.
       const result = await api.launchProfile(id);
       await refresh();
       return result;
@@ -99,27 +118,33 @@ export function useProfiles() {
     async (id: string) => {
       try {
         await api.stopProfile(id);
-        await refresh();
+        setActionError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to stop profile");
+        fail(err, "Không dừng được hồ sơ");
+      } finally {
+        await refresh();
       }
     },
-    [refresh],
+    [refresh, fail],
   );
 
   // Wipe browser state + re-roll fingerprint. Stays stopped — the profile keeps
   // its config (proxy, locale, bookmarks, default search) and takes a fresh
-  // identity; the user launches it when ready.
+  // identity; the user launches it when ready. Returns the reset profile so the
+  // form can re-sync to the new seed.
   const reset = useCallback(
-    async (id: string) => {
+    async (id: string): Promise<Profile> => {
       try {
-        await api.resetProfile(id);
+        const profile = await api.resetProfile(id);
+        setProfiles((prev) => prev.map((p) => (p.id === id ? profile : p)));
+        setActionError(null);
         await refresh();
+        return profile;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to reset profile");
+        return fail(err, "Không đặt lại được hồ sơ");
       }
     },
-    [refresh],
+    [refresh, fail],
   );
 
   // Clone a profile into a new profile (same settings + fingerprint). With
@@ -127,17 +152,36 @@ export function useProfiles() {
   // come along too, so the clone opens already signed in. Returns the clone so
   // the caller can select it.
   const duplicate = useCallback(
-    async (id: string, includeBrowserState = false): Promise<Profile | undefined> => {
+    async (id: string, includeBrowserState = false): Promise<Profile> => {
       try {
         const profile = await api.duplicateProfile(id, includeBrowserState);
         setProfiles((prev) => [profile, ...prev]);
+        setActionError(null);
         return profile;
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to duplicate profile");
+        return fail(err, "Không nhân bản được hồ sơ");
       }
     },
-    [],
+    [fail],
   );
 
-  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, duplicate };
+  const error = actionError ?? pollError;
+
+  return {
+    profiles,
+    loading,
+    error,
+    pollError,
+    actionError,
+    clearActionError,
+    refresh,
+    create,
+    update,
+    remove,
+    reorder,
+    launch,
+    stop,
+    reset,
+    duplicate,
+  };
 }

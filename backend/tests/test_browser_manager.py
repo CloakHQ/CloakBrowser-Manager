@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -370,6 +371,107 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
     assert options["release_channel"] == "preview"
     assert options["extension_paths"] == ["/tmp/extension"]
     assert options["args"].index("--raw-flag") > options["args"].index("--fingerprint-platform=windows")
+
+
+def test_install_id_is_stable_per_key_and_distinct_between_keys():
+    from backend.browser_manager import install_id_for
+
+    first = install_id_for("cb_one")
+    assert first == install_id_for("cb_one")
+    assert first != install_id_for("cb_two")
+    assert first != install_id_for("cb_three")
+    # Valid UUID that the binary will accept as-is.
+    assert str(uuid.UUID(first)) == first
+
+
+@pytest.mark.asyncio
+async def test_launch_writes_its_keys_install_id_before_spawning(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+    from backend.browser_manager import install_id_for, install_id_path
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME, license_key="cb_test")
+    manager._wait_for_cdp = AsyncMock()
+    seen: list[str] = []
+
+    async def launch(**_kwargs):
+        seen.append(install_id_path().read_text(encoding="utf-8"))
+        return context
+
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    await manager.launch(_launch_profile(tmp_path))
+
+    assert seen == [install_id_for("cb_test")]
+
+
+@pytest.mark.asyncio
+async def test_headless_setup_launch_writes_install_id_before_spawning(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+    from backend.browser_manager import install_id_for, install_id_path
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    seen: list[str] = []
+
+    async def launch(**_kwargs):
+        seen.append(install_id_path().read_text(encoding="utf-8"))
+        return context
+
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    await manager._headless_launch(tmp_path, "cb_headless")
+
+    assert seen == [install_id_for("cb_headless")]
+
+
+@pytest.mark.parametrize(
+    "version, expected", [("156.0.8078.47.1", True), ("155.0.8059.39.1", True), ("146.0.7680.177.5", False), (None, False)]
+)
+def test_license_route_supported_only_on_newer_binaries(version, expected):
+    from backend.browser_manager import supports_license_route
+
+    assert supports_license_route(version) is expected
+
+
+def test_license_route_arg_needs_a_proxy_that_reaches_proxy_server():
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager.binary_version = "156.0.8078.47.1"
+
+    # Credentialed HTTP and SOCKS5 go through --proxy-server: the flag is valid.
+    assert manager._license_route_args("http://u:p@1.2.3.4:8080") == ["--license-route=proxy"]
+    assert manager._license_route_args("socks5://1.2.3.4:1080") == ["--license-route=proxy"]
+
+    # A plain HTTP proxy only reaches Playwright's proxy dict → binary would exit 79.
+    assert manager._license_route_args("http://1.2.3.4:8080") == []
+    assert manager._license_route_args(None) == []
+
+    manager.binary_version = "146.0.7680.177.5"
+    assert manager._license_route_args("http://u:p@1.2.3.4:8080") == []
+
+
+@pytest.mark.asyncio
+async def test_launch_routes_license_calls_through_the_profile_proxy(monkeypatch, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager.binary_version = "156.0.8078.47.1"
+    manager._wait_for_cdp = AsyncMock()
+    launch = AsyncMock(return_value=context)
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+
+    profile = _launch_profile(tmp_path)
+    profile["proxy"] = "user:pass@1.2.3.4:8080"
+
+    await manager.launch(profile)
+
+    options = launch.await_args.kwargs
+    assert options["proxy"] == "http://user:pass@1.2.3.4:8080"
+    assert "--license-route=proxy" in options["args"]
 
 
 @pytest.mark.asyncio

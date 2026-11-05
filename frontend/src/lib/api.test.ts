@@ -18,6 +18,30 @@ beforeEach(() => {
   mockFetch.mockReset();
 });
 
+// ── checkKeys ───────────────────────────────────────────────────────────────
+
+describe("api.checkKeys", () => {
+  it("sends an empty list, not null, to check the whole pool", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await api.checkKeys();
+    expect(mockFetch).toHaveBeenCalledWith("/api/keys/check", {
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({ ids: [] }),
+    });
+  });
+
+  it("sends the given ids", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await api.checkKeys(["a", "b"]);
+    expect(mockFetch).toHaveBeenCalledWith("/api/keys/check", {
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({ ids: ["a", "b"] }),
+    });
+  });
+});
+
 // ── listProfiles ────────────────────────────────────────────────────────────
 
 describe("api.listProfiles", () => {

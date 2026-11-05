@@ -148,6 +148,7 @@ def test_get_status_stopped():
         "display": None,
         "cdp_url": None,
         "last_error": None,
+        "active_proxy": None,
     }
 
 
@@ -171,4 +172,5 @@ def test_get_status_running():
         "display": ":100",
         "cdp_url": "/api/profiles/abc/cdp",
         "last_error": None,
+        "active_proxy": None,
     }

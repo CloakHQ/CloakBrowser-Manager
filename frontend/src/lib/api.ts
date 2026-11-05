@@ -19,11 +19,20 @@ export interface ProfileFile {
   container_path: string;
 }
 
+export type ProxyProvider = "none" | "kiotproxy" | "tmproxy";
+
 export interface Profile {
   id: string;
   name: string;
   fingerprint_seed: number;
   proxy: string | null;
+  proxy_provider: ProxyProvider;
+  proxy_provider_key_set: boolean;
+  proxy_provider_key_masked: string | null;
+  kiotproxy_region: "bac" | "trung" | "nam" | "random";
+  tmproxy_location_id: number;
+  tmproxy_isp_id: number;
+  active_proxy: ProxyProviderInfo | null;
   timezone: string | null;
   locale: string | null;
   screen_width: number;
@@ -71,6 +80,11 @@ export interface ProfileCreateData {
   name: string;
   fingerprint_seed?: number | null;
   proxy?: string | null;
+  proxy_provider?: ProxyProvider;
+  proxy_provider_key?: string | null;
+  kiotproxy_region?: "bac" | "trung" | "nam" | "random";
+  tmproxy_location_id?: number;
+  tmproxy_isp_id?: number;
   timezone?: string | null;
   locale?: string | null;
   screen_width?: number;
@@ -115,6 +129,23 @@ export interface ProxyTestResult {
   error?: string | null;
 }
 
+export interface ProxyProviderInfo {
+  provider: string;
+  host: string | null;
+  real_ip: string | null;
+  location: string | null;
+  isp: string | null;
+  expires_at: number | string | null;
+  ttl: number | null;
+  ttc: number | null;
+  next_request_at: number | null;
+}
+
+export interface TmProxyOption {
+  id: number;
+  name: string | null;
+}
+
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
@@ -154,6 +185,9 @@ export interface LicenseKeyEntry {
   checked_at: string | null;
   // The profile currently running on this key, or null.
   leased_to: string | null;
+  // ISO UTC until which the license server still counts this key's last
+  // session. Null means the key can be leased right away.
+  available_at: string | null;
 }
 export interface LicenseKeyCheckResult {
   id: string;
@@ -198,7 +232,7 @@ async function request<T>(
   if (!res.ok) {
     if (res.status === 401 && _onUnauthorized) {
       _onUnauthorized();
-      throw new ApiError(401, "Unauthorized");
+      throw new ApiError(401, "Chưa được xác thực");
     }
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = body.detail;
@@ -212,7 +246,7 @@ async function request<T>(
         detail.upgrade_url,
       );
     }
-    throw new ApiError(res.status, detail || res.statusText);
+    throw new ApiError(res.status, detail || "Yêu cầu thất bại");
   }
   return res.json();
 }
@@ -252,6 +286,35 @@ export const api = {
       body: JSON.stringify({ proxy }),
     }),
 
+  kiotproxyNew: (key: string, region: "bac" | "trung" | "nam" | "random") =>
+    request<ProxyProviderInfo>("/api/proxy-providers/kiotproxy/new", {
+      method: "POST",
+      body: JSON.stringify({ key, region }),
+    }),
+  kiotproxyCurrent: (key: string) =>
+    request<ProxyProviderInfo>("/api/proxy-providers/kiotproxy/current", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  kiotproxyOut: (key: string) =>
+    request<{ ok: boolean }>("/api/proxy-providers/kiotproxy/out", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  tmproxyNew: (apiKey: string, locationId = 0, ispId = 0) =>
+    request<ProxyProviderInfo>("/api/proxy-providers/tmproxy/new", {
+      method: "POST",
+      body: JSON.stringify({ api_key: apiKey, location_id: locationId, isp_id: ispId }),
+    }),
+  tmproxyCurrent: (apiKey: string) =>
+    request<ProxyProviderInfo>("/api/proxy-providers/tmproxy/current", {
+      method: "POST",
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+  tmproxyLocations: () =>
+    request<TmProxyOption[]>("/api/proxy-providers/tmproxy/locations"),
+  tmproxyIsps: () => request<TmProxyOption[]>("/api/proxy-providers/tmproxy/isps"),
+
   updateProfile: (id: string, data: Partial<ProfileCreateData>) =>
     request<Profile>(`/api/profiles/${id}`, {
       method: "PUT",
@@ -287,10 +350,10 @@ export const api = {
     if (!res.ok) {
       if (res.status === 401 && _onUnauthorized) {
         _onUnauthorized();
-        throw new ApiError(401, "Unauthorized");
+        throw new ApiError(401, "Chưa được xác thực");
       }
       const body = await res.json().catch(() => ({ detail: res.statusText }));
-      const detail = typeof body.detail === "string" ? body.detail : res.statusText;
+      const detail = typeof body.detail === "string" ? body.detail : "Yêu cầu thất bại";
       throw new ApiError(res.status, detail);
     }
     return res.json();
@@ -329,10 +392,12 @@ export const api = {
     }),
   deleteKey: (id: string) =>
     request<{ ok: boolean }>(`/api/keys/${id}`, { method: "DELETE" }),
+  // No ids = re-check the whole pool. The backend field is a list, so send
+  // [] (not null) for "all" or Pydantic rejects the body with a 422.
   checkKeys: (ids?: string[]) =>
     request<LicenseKeyCheckResult[]>("/api/keys/check", {
       method: "POST",
-      body: JSON.stringify({ ids: ids ?? null }),
+      body: JSON.stringify({ ids: ids ?? [] }),
     }),
 
   updateSettings: (data: SettingsUpdate) =>

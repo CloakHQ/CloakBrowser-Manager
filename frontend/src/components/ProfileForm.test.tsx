@@ -1,6 +1,7 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+﻿import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Profile } from "../lib/api";
+import { renderWithProviders as render } from "../test/render";
 import { ProfileForm } from "./ProfileForm";
 
 function profile(status: Profile["status"]): Profile {
@@ -57,9 +58,9 @@ describe("ProfileForm duplicate split button", () => {
 
   it("Escape closes the menu and returns focus to the trigger", () => {
     renderForm("stopped");
-    const trigger = screen.getByLabelText("Duplicate options");
+    const trigger = screen.getByLabelText(/sao ch.p/i);
     fireEvent.click(trigger);
-    const item = screen.getByRole("menuitem", { name: /Settings and fingerprint only/ });
+    const item = screen.getByRole("menuitem", { name: /v.n tay/i });
     item.focus();
     expect(document.activeElement).toBe(item);
 
@@ -71,7 +72,7 @@ describe("ProfileForm duplicate split button", () => {
 
   it("closes on an outside click", () => {
     renderForm("stopped");
-    fireEvent.click(screen.getByLabelText("Duplicate options"));
+    fireEvent.click(screen.getByLabelText(/sao ch.p/i));
     expect(screen.getByRole("menu")).toBeTruthy();
     fireEvent.mouseDown(document.body);
     expect(screen.queryByRole("menu")).toBeNull();
@@ -79,25 +80,30 @@ describe("ProfileForm duplicate split button", () => {
 
   it("offers browser state only for a stopped profile", () => {
     renderForm("running");
-    fireEvent.click(screen.getByLabelText("Duplicate options"));
-    const item = screen.getByRole("menuitem", { name: /With browser state/ }) as HTMLButtonElement;
+    fireEvent.click(screen.getByLabelText(/sao ch.p/i));
+    const item = screen.getByRole("menuitem", { name: /^K.m d. li.u tr.nh duy.t/i }) as HTMLButtonElement;
     expect(item.disabled).toBe(true);
-    expect(screen.getByText("Stop the profile first")).toBeTruthy();
+    expect(screen.getByText(/D.ng h. s./i)).toBeTruthy();
   });
 
   it("the button itself is a config-only copy; the menu item asks for state", async () => {
-    vi.stubGlobal("confirm", vi.fn(() => true));
     const onDuplicate = renderForm("stopped");
-    const trigger = screen.getByLabelText("Duplicate options") as HTMLButtonElement;
+    const trigger = screen.getByLabelText(/sao ch.p/i) as HTMLButtonElement;
 
-    fireEvent.click(screen.getByTitle("Duplicate settings and fingerprint only"));
-    expect(onDuplicate).toHaveBeenLastCalledWith(false);
+    fireEvent.click(screen.getByTitle(/Ch. sao ch.p/i));
+    fireEvent.click(
+      within(screen.getByRole("alertdialog")).getByRole("button", { name: /^Sao ch.p$/i }),
+    );
+    await waitFor(() => expect(onDuplicate).toHaveBeenLastCalledWith(false));
     // Both halves are disabled while a duplicate is in flight
     await waitFor(() => expect(trigger.disabled).toBe(false));
 
     fireEvent.click(trigger);
-    fireEvent.click(screen.getByRole("menuitem", { name: /With browser state/ }));
-    expect(onDuplicate).toHaveBeenLastCalledWith(true);
+    fireEvent.click(screen.getByRole("menuitem", { name: /^K.m d. li.u tr.nh duy.t/i }));
+    fireEvent.click(
+      within(screen.getByRole("alertdialog")).getByRole("button", { name: /^Sao ch.p$/i }),
+    );
+    await waitFor(() => expect(onDuplicate).toHaveBeenLastCalledWith(true));
     expect(screen.queryByRole("menu")).toBeNull();
   });
 });

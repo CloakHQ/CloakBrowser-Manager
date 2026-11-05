@@ -40,6 +40,8 @@ load_env_file()
 from . import artifacts
 from . import database as db
 from . import key_pool
+from . import proxy_providers
+from .proxy_providers import ProxyProviderError
 from cloakbrowser.license import CloakBrowserLicenseError
 
 from .browser_manager import (
@@ -53,6 +55,8 @@ from .browser_manager import (
 from .models import (
     ArtifactResponse,
     ClipboardRequest,
+    KiotProxyNewRequest,
+    KiotProxyRequest,
     LaunchResponse,
     LicenseKeyAdd,
     LicenseKeyCheck,
@@ -64,6 +68,7 @@ from .models import (
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
+    ProxyProviderInfo,
     ProxyTestRequest,
     ProxyTestResponse,
     ReorderRequest,
@@ -71,6 +76,9 @@ from .models import (
     SettingsUpdate,
     StatusResponse,
     TagResponse,
+    TmProxyNewRequest,
+    TmProxyOption,
+    TmProxyRequest,
     UpdateCheckResponse,
 )
 from .runtime import bundle_dir
@@ -502,6 +510,10 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 async def lifespan(app: FastAPI):
     browser_mgr.vnc.validate_available()
     db.init_db()
+    # Leases on disk are orphans now — no browser survives a restart. Cool those
+    # keys down and ask the server which seats are already free before anything
+    # auto-launches onto them.
+    await browser_mgr.reconcile_leases()
     # Repair pass. A crash leaves bytes with no row, and the file-chooser view out of step
     # with the database. The bookmarks file is rebuilt once at the end rather than once per
     # profile, since each rebuild reads the whole profile list.
@@ -578,6 +590,11 @@ async def auth_logout(request: Request, response: Response):
 
 def _profile_response(profile: dict) -> ProfileResponse:
     payload = {**profile, **browser_mgr.get_status(profile["id"])}
+    # The provider key is a secret. Never echo it; expose only a masked hint and
+    # a boolean so the form can show that one is already stored.
+    provider_key = payload.pop("proxy_provider_key", None)
+    payload["proxy_provider_key_set"] = bool(provider_key)
+    payload["proxy_provider_key_masked"] = key_pool.mask_key(provider_key)
     payload["tags"] = [TagResponse(**tag) for tag in profile.get("tags", [])]
     return ProfileResponse(**payload)
 
@@ -594,6 +611,90 @@ async def test_proxy_endpoint(req: ProxyTestRequest):
         return await test_proxy(req.proxy)
     except ValueError as exc:  # bad proxy format from _validate_proxy
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ── Proxy providers (KiotProxy / TMProxy) ────────────────────────────────────
+# These endpoints are for the profile form's "test / fetch now" controls. The
+# launch path calls proxy_providers directly, so a provider is never a hard
+# dependency of simply starting a browser with a manual proxy.
+
+
+def _provider_info_response(info: dict) -> ProxyProviderInfo:
+    return ProxyProviderInfo(**proxy_providers.public_info(info))
+
+
+@app.post("/api/proxy-providers/kiotproxy/new", response_model=ProxyProviderInfo)
+async def kiotproxy_new_endpoint(req: KiotProxyNewRequest):
+    """Allocate or rotate the KiotProxy proxy for ``key``."""
+    try:
+        info = await proxy_providers.kiotproxy_new(req.key, req.region)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.post("/api/proxy-providers/kiotproxy/current", response_model=ProxyProviderInfo)
+async def kiotproxy_current_endpoint(req: KiotProxyRequest):
+    """The proxy currently assigned to ``key``."""
+    try:
+        info = await proxy_providers.kiotproxy_current(req.key)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.post("/api/proxy-providers/kiotproxy/out")
+async def kiotproxy_out_endpoint(req: KiotProxyRequest):
+    """Detach the proxy from ``key`` (KiotProxy's release endpoint)."""
+    try:
+        await proxy_providers.kiotproxy_out(req.key)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/proxy-providers/tmproxy/new", response_model=ProxyProviderInfo)
+async def tmproxy_new_endpoint(req: TmProxyNewRequest):
+    """Allocate or rotate the TMProxy proxy for ``api_key``."""
+    try:
+        info = await proxy_providers.tmproxy_new(
+            req.api_key, req.location_id, req.isp_id
+        )
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.post("/api/proxy-providers/tmproxy/current", response_model=ProxyProviderInfo)
+async def tmproxy_current_endpoint(req: TmProxyRequest):
+    """The proxy currently assigned to ``api_key``."""
+    try:
+        info = await proxy_providers.tmproxy_current(req.api_key)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
+@app.get("/api/proxy-providers/tmproxy/locations", response_model=list[TmProxyOption])
+async def tmproxy_locations_endpoint():
+    """TMProxy locations for the profile form."""
+    try:
+        locations = await proxy_providers.tmproxy_locations()
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return [TmProxyOption(id=item["id_location"], name=item.get("name")) for item in locations]
+
+
+@app.get("/api/proxy-providers/tmproxy/isps", response_model=list[TmProxyOption])
+async def tmproxy_isps_endpoint():
+    """TMProxy ISPs for the profile form."""
+    try:
+        isps = await proxy_providers.tmproxy_isps()
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return [TmProxyOption(id=item["id_isp"], name=item.get("name")) for item in isps]
 
 
 @app.post("/api/profiles", response_model=ProfileResponse, status_code=201)
@@ -807,13 +908,17 @@ async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None
     # heard of, so an unfinished clone is unreachable.
     clone_id = db.new_profile_id()
     src_dir = Path(profile["user_data_dir"])
-    dst_dir = Path(db.user_data_dir_for(clone_id))
+    # The same name-based folder the clone's row will record, so the copied
+    # state is where the clone looks for it.
+    dst_dir = Path(db.user_data_dir_for_name(f"{profile['name']} (copy)"))
     try:
         async with browser_mgr.hold_stopped(profile_id):
             if src_dir.is_dir():
                 # Off the event loop: a profile with a fat cache takes seconds to copy.
                 await _copy_browser_state_to_completion(src_dir, dst_dir)
-            clone = db.duplicate_profile(profile_id, new_id=clone_id)
+            clone = db.duplicate_profile(
+                profile_id, new_id=clone_id, user_data_dir=str(dst_dir)
+            )
     except ProfileBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except asyncio.CancelledError:
@@ -1237,6 +1342,7 @@ def _key_entry_response(entry: dict) -> LicenseKeyEntry:
         added_at=entry["added_at"],
         checked_at=entry["checked_at"],
         leased_to=_key_leased_to(entry["id"]),
+        available_at=entry.get("cooldown_until"),
     )
 
 
@@ -1264,13 +1370,22 @@ async def add_keys(payload: LicenseKeyAdd):
 
 @app.delete("/api/keys/{entry_id}")
 async def delete_key(entry_id: str):
-    """Remove a key from the pool. Refused while a profile is running on it."""
+    """Remove a key from the pool. Refused while leased or still cooling down."""
     leased_to = _key_leased_to(entry_id)
     if leased_to is not None:
         raise HTTPException(
             status_code=409,
             detail=f"Key is in use by running profile {leased_to}; stop it first",
         )
+    entry = key_pool.find_by_id(entry_id)
+    if entry is not None:
+        remaining = key_pool.cooldown_remaining(entry)
+        if remaining > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Key is cooling down for another {remaining}s; "
+                "the license server still counts its last session",
+            )
     if not key_pool.remove(entry_id):
         raise HTTPException(status_code=404, detail="Key not found")
     _refresh_binary_status_soon()
@@ -1712,7 +1827,7 @@ async def cdp_json_version(profile_id: str, request: Request):
         raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
 
     # Rewrite webSocketDebuggerUrl to point through our proxy
-    host = request.headers.get("host", "localhost:8080")
+    host = request.headers.get("host", "localhost:8090")
     ws_scheme = "wss" if _is_https(request) else "ws"
     data["webSocketDebuggerUrl"] = f"{ws_scheme}://{host}/api/profiles/{profile_id}/cdp"
     return data
@@ -1738,7 +1853,7 @@ async def cdp_json_list(profile_id: str, request: Request):
         logger.error("CDP proxy: failed to reach Chrome CDP for %s: %s", profile_id, exc)
         raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
 
-    host = request.headers.get("host", "localhost:8080")
+    host = request.headers.get("host", "localhost:8090")
     ws_scheme = "wss" if _is_https(request) else "ws"
     for entry in data:
         if "webSocketDebuggerUrl" in entry:

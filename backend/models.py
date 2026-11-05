@@ -15,6 +15,14 @@ class ProfileCreate(BaseModel):
     name: str
     fingerprint_seed: int | None = None
     proxy: str | None = None
+    # "none" = use the proxy field above; otherwise the proxy is fetched from
+    # the provider on every launch. The provider key is a secret and is never
+    # echoed back by the API; see proxy_provider_key_masked on the response.
+    proxy_provider: Literal["none", "kiotproxy", "tmproxy"] = "none"
+    proxy_provider_key: str | None = None
+    kiotproxy_region: Literal["bac", "trung", "nam", "random"] = "random"
+    tmproxy_location_id: int = 0
+    tmproxy_isp_id: int = 0
     timezone: str | None = None
     locale: str | None = None
     screen_width: int = 1920
@@ -47,6 +55,12 @@ class ProfileUpdate(BaseModel):
     name: str | None = None
     fingerprint_seed: int | None = None
     proxy: str | None = Field(default=None)
+    proxy_provider: Literal["none", "kiotproxy", "tmproxy"] | None = None
+    # Omitted = unchanged; null/"" = clear the provider key.
+    proxy_provider_key: str | None = Field(default=None)
+    kiotproxy_region: Literal["bac", "trung", "nam", "random"] | None = None
+    tmproxy_location_id: int | None = None
+    tmproxy_isp_id: int | None = None
     timezone: str | None = Field(default=None)
     locale: str | None = Field(default=None)
     screen_width: int | None = None
@@ -67,7 +81,7 @@ class ProfileUpdate(BaseModel):
     transparent_proxy: bool | None = None
     portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
-    # None = unchanged; "" = clear the pin (lease a free pooled key again).
+    # Omitted = unchanged; null or "" = clear the pin (lease a free pooled key again).
     license_key_id: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
@@ -122,6 +136,14 @@ class ProfileResponse(BaseModel):
     name: str
     fingerprint_seed: int
     proxy: str | None = None
+    proxy_provider: str = "none"
+    proxy_provider_key_set: bool = False
+    proxy_provider_key_masked: str | None = None
+    kiotproxy_region: str = "random"
+    tmproxy_location_id: int = 0
+    tmproxy_isp_id: int = 0
+    # Sanitised metadata of the proxy a running browser was launched with.
+    active_proxy: dict | None = None
     timezone: str | None = None
     locale: str | None = None
     screen_width: int = 1920
@@ -222,6 +244,9 @@ class LicenseKeyEntry(BaseModel):
     # Profile currently holding this key, if any. A key is leased to exactly one
     # running browser, so a non-null value means it cannot be handed out again.
     leased_to: str | None = None
+    # ISO UTC until which the license server still counts this key's abandoned
+    # session. Null means the key may be leased right away.
+    available_at: str | None = None
 
 
 class LicenseKeyAdd(BaseModel):
@@ -277,6 +302,44 @@ class ProxyTestResponse(BaseModel):
     timezone: str | None = None
     latency_ms: int | None = None
     error: str | None = None
+
+
+class KiotProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=512)
+
+
+class KiotProxyNewRequest(KiotProxyRequest):
+    region: Literal["bac", "trung", "nam", "random"] = "random"
+
+
+class TmProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    api_key: str = Field(min_length=1, max_length=512)
+
+
+class TmProxyNewRequest(TmProxyRequest):
+    location_id: int = 0
+    isp_id: int = 0
+
+
+class ProxyProviderInfo(BaseModel):
+    """Normalised proxy metadata. Credentials are omitted from this shape."""
+
+    provider: str
+    host: str | None = None
+    real_ip: str | None = None
+    location: str | None = None
+    isp: str | None = None
+    expires_at: int | str | None = None
+    ttl: int | None = None
+    ttc: int | None = None
+    next_request_at: int | None = None
+
+
+class TmProxyOption(BaseModel):
+    id: int
+    name: str | None = None
 
 
 class LoginRequest(BaseModel):

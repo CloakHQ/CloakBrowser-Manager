@@ -1,45 +1,41 @@
 import { AlertTriangle } from "lucide-react";
 import type { SystemStatus } from "../lib/api";
+import { TIER_LABEL } from "../lib/labels";
 
-const TIER_LABEL: Record<string, string> = {
-  pro: "Pro",
-  free: "Free key",
-  none: "No key",
+const TIER_CLASS: Record<string, string> = {
+  pro: "badge-success",
+  free: "badge-info",
+  none: "badge-warning",
 };
 
-const TIER_COLOR: Record<string, string> = {
-  pro: "text-emerald-400",
-  free: "text-sky-400",
-  none: "text-amber-400",
-};
-
-/** Small always-visible badge showing which binary/tier the Manager is running. */
+/**
+ * Compact pill in the top bar: which tier/plan the app is running and which
+ * Chromium build it resolved. The full detail lives in the StatusBar.
+ */
 export function SystemStatusBadge({ status }: { status: SystemStatus | null }) {
   if (!status) return null;
 
   const tier = status.license_tier || "none";
+  const plan = status.license_plan ?? null;
   const title =
     tier === "none"
-      ? "No license key set. Open Settings to add one (a free key works) before launching a profile."
-      : `${TIER_LABEL[tier] ?? tier} license — running ${status.binary_version}`;
+      ? "Chưa đặt key bản quyền. Mở Cài đặt để thêm key trước khi khởi chạy hồ sơ."
+      : `Giấy phép ${TIER_LABEL[tier] ?? tier}${plan ? ` (${plan === "free" ? "miễn phí" : plan})` : ""} — đang chạy ${status.binary_version}`;
 
   return (
     <span
-      className="flex items-center gap-1.5 text-xs text-gray-500"
+      className="inline-flex items-center gap-2 rounded-lg border border-line bg-surface-2/60 px-2.5 py-1 text-xs"
       title={title}
     >
-      <span className={TIER_COLOR[tier] ?? "text-gray-400"}>
-        {TIER_LABEL[tier] ?? tier}
-      </span>
-      {status.binary_version && (
-        <>
-          <span className="text-gray-600">·</span>
-          <span className="font-mono">{status.binary_version}</span>
-        </>
-      )}
+      <span className={TIER_CLASS[tier] ?? "badge-neutral"}>{TIER_LABEL[tier] ?? tier}</span>
+      <span className="font-mono text-2xs text-fg-secondary">{status.binary_version}</span>
       {status.windows_fonts_complete === false && (
-        <span className="flex items-center gap-1 text-amber-400" title={`Windows persona fonts incomplete: ${status.windows_fonts_present ?? 0}/${status.windows_fonts_required ?? 0} found`}>
-          <AlertTriangle className="h-3.5 w-3.5" /> Fonts incomplete
+        <span
+          className="flex items-center gap-1 text-warning text-2xs font-medium"
+          title={`Thiếu font Windows persona: tìm thấy ${status.windows_fonts_present ?? 0}/${status.windows_fonts_required ?? 0}`}
+        >
+          <AlertTriangle className="h-3.5 w-3.5" />
+          Thiếu font
         </span>
       )}
     </span>

@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ProfileFile } from "../lib/api";
+import { renderWithProviders as render } from "../test/render";
 import { ProfileFilesButton, formatSize } from "./ProfileFiles";
 
 const file = (over: Partial<ProfileFile> = {}): ProfileFile => ({
@@ -44,7 +45,7 @@ describe("ProfileFilesButton", () => {
 
   it("lists the files with their real names once opened", () => {
     renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
     expect(screen.getByText("weekly report.csv")).toBeTruthy();
     expect(screen.getByText("2.0 KB")).toBeTruthy();
     // The hint names the sidebar entry the page's own file dialog will show.
@@ -53,7 +54,7 @@ describe("ProfileFilesButton", () => {
 
   it("uploads every chosen file, not just the first", () => {
     const { onUpload } = renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
     const a = new File([new Uint8Array([1])], "a.csv");
     const b = new File([new Uint8Array([2])], "b.csv");
     fireEvent.change(screen.getByTestId("profile-file-input"), { target: { files: [a, b] } });
@@ -62,19 +63,19 @@ describe("ProfileFilesButton", () => {
 
   it("names itself for a screen reader without collapsing to the badge count", () => {
     renderButton();
-    expect(screen.getByLabelText("Profile files, 1 file")).toBeTruthy();
+    expect(screen.getByLabelText("Tệp của hồ sơ, 1 tệp")).toBeTruthy();
   });
 
   it("refreshes as soon as the panel opens instead of waiting for the poll", () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     renderButton({ onRefresh });
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
     expect(onRefresh).toHaveBeenCalled();
   });
 
   it("uploads the chosen file", () => {
     const { onUpload } = renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
     const chosen = new File([new Uint8Array([1])], "menu.csv", { type: "text/csv" });
     fireEvent.change(screen.getByTestId("profile-file-input"), { target: { files: [chosen] } });
     expect(onUpload).toHaveBeenCalledWith([chosen]);
@@ -82,28 +83,28 @@ describe("ProfileFilesButton", () => {
 
   it("removes a file", () => {
     const { onRemove } = renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    fireEvent.click(screen.getByLabelText("Remove weekly report.csv"));
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    fireEvent.click(screen.getByLabelText("Xóa weekly report.csv"));
     expect(onRemove).toHaveBeenCalledWith("a1");
   });
 
   it("offers a download link straight to the bytes", () => {
     renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    expect(screen.getByTitle("Download to this computer").getAttribute("href")).toBe(
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    expect(screen.getByTitle("Tải về máy này").getAttribute("href")).toBe(
       "/api/profiles/p1/files/a1",
     );
   });
 
   it("says what to do when the profile has no files", () => {
     renderButton({ files: [] });
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    expect(screen.getByText(/drop it onto the screen, or download one in the browser/)).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    expect(screen.getByText(/kéo thả vào màn hình hoặc tải xuống trong trình duyệt/)).toBeTruthy();
   });
 
   it("Escape closes the panel and returns focus to the trigger", () => {
     renderButton();
-    const trigger = screen.getByTitle("Files available to this profile");
+    const trigger = screen.getByTitle("Các tệp của hồ sơ này");
     fireEvent.click(trigger);
     expect(screen.getByRole("dialog")).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
@@ -113,39 +114,39 @@ describe("ProfileFilesButton", () => {
 
   it("shows a download still in flight, with no way to fetch it yet", () => {
     renderButton({ files: [file({ kind: "download", state: "pending", size: 0, name: "export.xlsx" })] });
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    expect(screen.getByText("Downloading...")).toBeTruthy();
-    expect(screen.queryByTitle("Download to this computer")).toBeNull();
-    expect(screen.getByLabelText("Downloaded by the browser")).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    expect(screen.getByText("Đang tải xuống...")).toBeTruthy();
+    expect(screen.queryByTitle("Tải về máy này")).toBeNull();
+    expect(screen.getByLabelText("Trình duyệt đã tải xuống")).toBeTruthy();
   });
 
   it("shows a failed download", () => {
     renderButton({ files: [file({ kind: "download", state: "failed" })] });
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    expect(screen.getByText("Download failed")).toBeTruthy();
-    expect(screen.queryByTitle("Download to this computer")).toBeNull();
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    expect(screen.getByText("Tải xuống thất bại")).toBeTruthy();
+    expect(screen.queryByTitle("Tải về máy này")).toBeNull();
   });
 
   it("marks an uploaded file differently from a downloaded one", () => {
     renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    expect(screen.getByLabelText("Uploaded")).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    expect(screen.getByLabelText("Đã tải lên")).toBeTruthy();
   });
 
 describe("panel steadiness", () => {
   it("gives its controls a real hit target, not a 14px one", () => {
     renderButton();
-    fireEvent.click(screen.getByTitle("Files available to this profile"));
-    for (const label of ["Close", "Remove weekly report.csv"]) {
+    fireEvent.click(screen.getByTitle("Các tệp của hồ sơ này"));
+    for (const label of ["Đóng", "Xóa weekly report.csv"]) {
       expect(screen.getByLabelText(label).className).toContain("p-1");
     }
   });
 
   it("Close returns focus to the trigger, like Escape does", () => {
     renderButton();
-    const trigger = screen.getByTitle("Files available to this profile");
+    const trigger = screen.getByTitle("Các tệp của hồ sơ này");
     fireEvent.click(trigger);
-    fireEvent.click(screen.getByLabelText("Close"));
+    fireEvent.click(screen.getByLabelText("Đóng"));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(trigger);
   });
