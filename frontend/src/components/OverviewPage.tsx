@@ -69,8 +69,7 @@ export function OverviewPage({
   const tmAccounts = accounts.filter((a) => a.provider === "tmproxy").length;
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-6">
-      {/* Header bar */}
+    <div className="flex w-full flex-col gap-6 px-4 sm:px-6 lg:px-8 py-5">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold tracking-tight text-fg">Tổng quan hệ thống</h1>

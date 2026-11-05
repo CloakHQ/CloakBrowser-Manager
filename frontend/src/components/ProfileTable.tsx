@@ -169,8 +169,7 @@ export function ProfileTable({
   ];
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-6 py-6">
-      {/* Header */}
+    <div className="flex w-full flex-col gap-5 px-4 sm:px-6 lg:px-8 py-5">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold tracking-tight text-fg">Hồ sơ trình duyệt</h1>
@@ -294,10 +293,10 @@ export function ProfileTable({
 
       <div className="card overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[58rem] text-left text-xs">
+          <table className="w-full text-left text-xs">
             <thead className="border-b border-line/80 bg-surface-2/60 text-[11px] font-semibold uppercase tracking-wider text-fg-muted select-none">
               <tr>
-                <th className="w-10 px-3.5 py-3">
+                <th className="w-9 px-3 py-3">
                   <input
                     type="checkbox"
                     checked={allVisibleSelected}
@@ -306,13 +305,15 @@ export function ProfileTable({
                     className="h-4 w-4 cursor-pointer rounded-md border-line-strong accent-brand"
                   />
                 </th>
-                <th className="px-4 py-3">Hồ sơ</th>
-                <th className="px-4 py-3">Trạng thái</th>
-                <th className="px-4 py-3">Nguồn</th>
-                <th className="px-4 py-3">Địa chỉ</th>
-                <th className="px-4 py-3">Khu vực</th>
-                <th className="px-4 py-3">Cập nhật</th>
-                <th className="px-4 py-3 text-right">Thao tác</th>
+                <th className="px-3 sm:px-4 py-3 min-w-[140px]">Hồ sơ</th>
+                <th className="px-2.5 sm:px-4 py-3 whitespace-nowrap">Trạng thái</th>
+                <th className="px-2.5 sm:px-4 py-3 hidden sm:table-cell whitespace-nowrap">Nguồn</th>
+                <th className="px-2.5 sm:px-4 py-3">Địa chỉ</th>
+                <th className="px-2.5 sm:px-4 py-3 hidden xl:table-cell whitespace-nowrap">Khu vực</th>
+                <th className="px-2.5 sm:px-4 py-3 hidden lg:table-cell whitespace-nowrap">Cập nhật</th>
+                <th className="px-3 sm:px-4 py-3 text-right sticky right-0 z-10 bg-surface-2/95 backdrop-blur-md shadow-[-6px_0_12px_rgba(0,0,0,0.08)] whitespace-nowrap">
+                  Thao tác
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line/60">
@@ -371,7 +372,7 @@ export function ProfileTable({
                           : "hover:bg-surface-2/70"
                     }`}
                   >
-                    <td className="px-3.5 py-3">
+                    <td className="px-3 py-3">
                       <input
                         type="checkbox"
                         checked={checked}
@@ -381,7 +382,7 @@ export function ProfileTable({
                         className="h-4 w-4 cursor-pointer rounded-md border-line-strong accent-brand"
                       />
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 sm:px-4 py-3">
                       <div className="flex items-center gap-2.5">
                         <div className={`flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg border text-xs font-mono font-bold ${
                           isRunning
@@ -390,13 +391,13 @@ export function ProfileTable({
                         }`}>
                           {p.name.charAt(0).toUpperCase()}
                         </div>
-                        <div className="min-w-0">
+                        <div className="min-w-0 max-w-[180px] sm:max-w-xs md:max-w-sm lg:max-w-none">
                           <div className="font-semibold text-fg group-hover:text-brand-fg transition-colors truncate">
                             {p.name}
                           </div>
                           <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-fg-muted">
                             <span className="font-mono">seed {p.fingerprint_seed}</span>
-                            {p.tags.slice(0, 3).map((t) => (
+                            {p.tags.slice(0, 2).map((t) => (
                               <span key={t.tag} className="badge-neutral text-[10px] px-1.5 py-0">
                                 {t.tag}
                               </span>
@@ -405,7 +406,7 @@ export function ProfileTable({
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-2.5 sm:px-4 py-3 whitespace-nowrap">
                       <span className="inline-flex items-center gap-1.5 text-xs text-fg-secondary">
                         <span
                           className={`h-2 w-2 rounded-full ${
@@ -419,24 +420,29 @@ export function ProfileTable({
                         <span className="font-medium">{STATUS_LABEL[p.status] ?? p.status}</span>
                       </span>
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-2.5 sm:px-4 py-3 hidden sm:table-cell whitespace-nowrap">
                       <span className={rotating ? "badge-info" : "badge-neutral"}>
                         {PROVIDER_LABEL[provider] ?? provider}
                       </span>
                     </td>
-                    <td className="max-w-[13rem] px-4 py-3 font-mono text-[11px] text-fg-secondary">
+                    <td className="px-2.5 sm:px-4 py-3 font-mono text-[11px] text-fg-secondary">
                       {address ? (
-                        <span className="inline-flex max-w-full items-center gap-2">
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-1 max-w-[12rem] lg:max-w-[16rem]">
                           <span className="truncate">{address}</span>
                           {shared > 1 && (
                             <span
-                              className="badge-neutral flex-shrink-0 px-1.5 py-0 font-sans text-[10px]"
+                              className="badge-neutral flex-shrink-0 px-1.5 py-0 font-sans text-[10px] w-fit"
                               title={`${shared} hồ sơ cùng dùng địa chỉ này`}
                             >
                               ×{shared}
                             </span>
                           )}
-                        </span>
+                          {region && (
+                            <span className="xl:hidden text-[10px] text-fg-muted font-sans truncate">
+                              · {region}
+                            </span>
+                          )}
+                        </div>
                       ) : (
                         <span className="inline-flex items-center gap-1.5 font-sans text-fg-muted text-[11px]">
                           <Link2Off className="h-3 w-3" />
@@ -444,11 +450,13 @@ export function ProfileTable({
                         </span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-fg-muted text-[11px]">{region ?? "—"}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-fg-muted text-[11px] font-mono">
+                    <td className="px-2.5 sm:px-4 py-3 text-fg-muted text-[11px] hidden xl:table-cell whitespace-nowrap">
+                      {region ?? "—"}
+                    </td>
+                    <td className="whitespace-nowrap px-2.5 sm:px-4 py-3 text-fg-muted text-[11px] font-mono hidden lg:table-cell">
                       {relativeTime(p.updated_at)}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 sm:px-4 py-3 sticky right-0 bg-surface-1/95 group-hover:bg-surface-2/95 transition-colors shadow-[-6px_0_12px_rgba(0,0,0,0.06)]">
                       <div
                         className="flex items-center justify-end gap-1.5"
                         onClick={(e) => e.stopPropagation()}
@@ -459,8 +467,8 @@ export function ProfileTable({
                           onClick={() => runBusy(p.id, stopped ? onLaunch : onStop)}
                           className={
                             stopped
-                              ? "btn-primary h-7 px-2.5 text-xs"
-                              : "btn-secondary h-7 px-2.5 text-xs !border-danger/30 !text-danger hover:!bg-danger/10"
+                              ? "btn-primary h-7.5 px-2.5 text-xs whitespace-nowrap"
+                              : "btn-secondary h-7.5 px-2.5 text-xs whitespace-nowrap !border-danger/30 !text-danger hover:!bg-danger/10"
                           }
                           aria-label={stopped ? `Mở ${p.name}` : `Dừng ${p.name}`}
                         >
@@ -471,16 +479,16 @@ export function ProfileTable({
                           ) : (
                             <Square className="h-3.5 w-3.5 fill-current" />
                           )}
-                          <span>{stopped ? "Mở" : "Dừng"}</span>
+                          <span className="font-semibold">{stopped ? "Mở" : "Dừng"}</span>
                         </button>
                         <button
                           type="button"
                           onClick={() => onEdit(p.id)}
-                          className="btn-secondary h-7 px-2.5 text-xs"
+                          className="btn-secondary h-7.5 px-2.5 text-xs whitespace-nowrap"
                           title="Cấu hình hồ sơ và proxy"
                         >
                           <SlidersHorizontal className="h-3.5 w-3.5" />
-                          <span>Cấu hình</span>
+                          <span className="hidden xl:inline">Cấu hình</span>
                         </button>
                         <RowMenu
                           profile={p}
