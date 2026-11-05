@@ -16,6 +16,31 @@ const STATE_STYLE: Record<string, string> = {
 const UNKNOWN_STATE = "badge badge-neutral";
 
 /**
+ * When a key expires, and how close that is.
+ *
+ * Renewal itself happens at cloakbrowser.dev — the license server has no renew
+ * endpoint, so the Manager can only make the deadline visible instead of
+ * letting a key die unnoticed between launches. A trial expiring today reads as
+ * a warning; the date is otherwise muted.
+ */
+function ExpiryNote({ expires }: { expires: string }) {
+  const when = new Date(expires);
+  if (Number.isNaN(when.getTime())) return null;
+  const days = Math.ceil((when.getTime() - Date.now()) / 86_400_000);
+  const soon = days <= 3;
+  const relative =
+    days < 0 ? "đã hết hạn" : days === 0 ? "hết hạn hôm nay" : `còn ${days} ngày`;
+  return (
+    <span
+      className={soon ? "badge badge-warning" : "text-2xs text-fg-muted"}
+      title={`Hết hạn ${when.toLocaleString("vi-VN")}`}
+    >
+      {relative}
+    </span>
+  );
+}
+
+/**
  * The shared license key pool. Each running profile leases one key, so N
  * concurrent profiles need N keys — this list is where they live. Keys are
  * added one per line and validated on arrival, so a dead key is caught before
@@ -138,6 +163,7 @@ export function KeyPoolPanel() {
                 {entry.state === "valid" && entry.plan && (
                   <span className="text-fg-muted">{entry.plan === "free" ? "miễn phí" : entry.plan}</span>
                 )}
+                {entry.expires && <ExpiryNote expires={entry.expires} />}
                 <span className="ml-auto text-2xs text-fg-muted">
                   {cooling
                     ? "đang chờ"
