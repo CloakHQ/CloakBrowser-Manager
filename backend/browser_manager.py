@@ -75,10 +75,18 @@ def license_error_detail(exc: BaseException) -> dict[str, str]:
 # like it runs on a separate machine.
 INSTALL_ID_NAMESPACE = uuid.UUID("5a7d2b8e-9c41-4f0a-8b3d-2c1e6f9a0d47")
 INSTALL_ID_FILENAME = "install_id"
+# Sidecar holding this machine's own id. The live file is swapped per key, so
+# after a crash it may still contain a derived key id; the sidecar lets us tell
+# the two apart and always come back to the machine's real value.
+MACHINE_INSTALL_ID_FILENAME = "install_id.machine"
 
 
 def install_id_path() -> Path:
     return Path.home() / ".cloakbrowser" / INSTALL_ID_FILENAME
+
+
+def machine_install_id_path() -> Path:
+    return Path.home() / ".cloakbrowser" / MACHINE_INSTALL_ID_FILENAME
 
 
 def install_id_for(key: str | None) -> str:
@@ -97,6 +105,69 @@ def write_install_id(value: str) -> None:
     except OSError:
         # Best-effort: a read-only home just falls back to the on-disk value.
         logger.warning("could not write install id at %s", path)
+
+
+def read_install_id() -> str | None:
+    try:
+        value = install_id_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _write_machine_install_id(value: str) -> None:
+    path = machine_install_id_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(value, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("could not write machine install id at %s", path)
+
+
+def _derive_machine_install_id() -> str:
+    """This machine's own id, captured once and kept out of the live file.
+
+    A keyless launch (or anything running the binary outside the Manager) must
+    present one stable identity. Seeding it from whatever is on disk the first
+    time keeps an existing install recognisable; the result is then pinned so a
+    crash that leaves a key's derived id behind cannot rewrite it.
+    """
+    pinned = _read_machine_install_id()
+    if pinned:
+        return pinned
+    existing = read_install_id()
+    if existing and not _is_derived(existing):
+        # First run after the upgrade: the file still holds the real value.
+        _write_machine_install_id(existing)
+        return existing
+    return _pin_new_machine_id()
+
+
+def _read_machine_install_id() -> str | None:
+    try:
+        value = machine_install_id_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _pin_new_machine_id() -> str:
+    value = str(uuid.uuid4())
+    _write_machine_install_id(value)
+    return value
+
+
+def _is_derived(value: str) -> bool:
+    """Whether ``value`` is one of the uuid5 ids this module mints."""
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return False
+    return parsed.version == 5 and str(parsed) == value
+
+
 
 
 # The license/session calls normally go straight to cloakbrowser.dev, so the
@@ -164,19 +235,47 @@ def _validate_proxy(url: str) -> None:
 def _validate_transparent_proxy(url: str | None) -> None:
     """Reject proxies the binary's transparent mode can't consume.
 
-    The binary fails closed (dead network, or exit on no proxy) unless it gets
-    one http proxy with a username and password, so refuse to launch instead.
+    Transparent mode speaks to exactly one HTTP proxy named on the command line.
+    Credentials are optional: the binary accepts `http://host:port` and an IP
+    allow-list proxy just as readily as `http://user:pass@host:port`. What it
+    cannot take is SOCKS, HTTPS, or a missing proxy — it then fails closed (dead
+    network) or rejects the configuration. Refuse to launch instead.
+
+    A username containing a ':' is rejected: Chromium splits the inline
+    credential at the first colon, and percent-encoding it (`%3A`) does not help
+    once the URL is decoded.
     """
     from urllib.parse import unquote, urlparse
 
     parsed = urlparse(url or "")
     if (
         parsed.scheme != "http"
-        or not parsed.username
-        or not parsed.password
-        or ":" in unquote(parsed.username)
+        or not parsed.hostname
+        or (parsed.password and ":" in unquote(parsed.username or ""))
     ):
-        raise ValueError("Transparent proxy needs an http:// proxy with a username and password")
+        raise ValueError(
+            "Transparent proxy needs a single http://host:port proxy "
+            "(credentials optional)"
+        )
+
+
+def _transparent_proxy_arg(url: str | None) -> str | None:
+    """The `--proxy-server` value transparent mode requires, or None.
+
+    Transparent mode only sees a proxy that reaches it as a command-line flag.
+    Without credentials the wrapper leaves a plain `http://host:port` to
+    Playwright's proxy dict, which transparent mode never reads — so the Manager
+    has to supply the flag itself. With credentials the wrapper already adds it
+    (and re-encodes them), so leaving it alone avoids a duplicate flag.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url or "")
+    if parsed.scheme != "http" or not parsed.hostname:
+        return None
+    if parsed.username:
+        return None
+    return f"http://{parsed.hostname}:{parsed.port}" if parsed.port else None
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
@@ -474,21 +573,29 @@ class BrowserManager:
         self._spawn_lock = asyncio.Lock()
         # Keyless launches have no key to derive an id from; keep the machine's
         # existing value (or mint one) so they don't churn the file per launch.
-        self._default_install_id = self._read_default_install_id()
+        # The value lives in a sidecar so a crash mid-launch (leaving some key's
+        # derived id in the live file) cannot make it drift.
+        self._default_install_id = _derive_machine_install_id()
         self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
 
-    @staticmethod
-    def _read_default_install_id() -> str:
-        path = install_id_path()
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            value = ""
-        return value or str(uuid.uuid4())
-
     def _install_id_for_key(self, key: str | None) -> str:
         return install_id_for(key) if key else self._default_install_id
+
+    def _restore_machine_install_id(self, used: str) -> None:
+        """Put the machine's own id back once a key has checked in.
+
+        The binary only reads the file on spawn, so after that the value is free
+        to change. Restoring the machine id means the steady state of the file is
+        this machine's real identity: a launch by the user directly (or the next
+        keyless run) does not inherit the last key's derived id.
+
+        Only rewrite if the file still holds the id we just used - a concurrent
+        launch that already wrote its own value wins.
+        """
+        machine = _read_machine_install_id()
+        if machine and read_install_id() == used:
+            write_install_id(machine)
 
     def resolve_binary_status(self) -> None:
         """Resolve the license tier + binary version and pre-download the binary.
@@ -565,19 +672,61 @@ class BrowserManager:
         that profile would then be refused as "already in use" when it starts.
         The pinned profile itself is excluded because the caller handles its own
         pin before falling back to the shared pool.
+
+        Only pins to a key *still in the pool* reserve anything. A pin to a key
+        that was removed is stale: its owner is already refused with "no longer
+        in the key pool", so letting it also block everyone else would deadlock
+        the app — no profile can launch until the pin is cleared by hand, which
+        is exactly the "all profiles closed but still out of seats" report.
         """
-        from . import database as db
+        from . import database as db, key_pool
 
         try:
             profiles = db.list_profiles()
         except sqlite3.OperationalError:
             # No schema yet (a launch in a fresh data dir): nothing can be pinned.
             return set()
+        pooled = {entry["id"] for entry in key_pool.entries()}
         return {
             profile["license_key_id"]
             for profile in profiles
-            if profile.get("license_key_id") and profile["id"] != exclude
+            if profile.get("license_key_id")
+            and profile["id"] != exclude
+            and profile["license_key_id"] in pooled
         }
+
+    @staticmethod
+    def _pin_owner_ids(key_id: str, exclude: str | None = None) -> list[str]:
+        """Profile ids pinning ``key_id``, optionally ignoring one."""
+        from . import database as db
+
+        try:
+            profiles = db.list_profiles()
+        except sqlite3.OperationalError:
+            return []
+        return [
+            profile["id"]
+            for profile in profiles
+            if profile.get("license_key_id") == key_id and profile["id"] != exclude
+        ]
+
+    @staticmethod
+    def _profile_names(profile_ids: list[str]) -> list[str]:
+        """Names for ``profile_ids``; the id stands in for a profile that is gone.
+
+        Only used to explain a refusal: "reserved for another profile" is
+        useless when the user has four profiles, so the message names them.
+        """
+        from . import database as db
+
+        names: list[str] = []
+        for profile_id in profile_ids:
+            try:
+                profile = db.get_profile(profile_id)
+            except sqlite3.OperationalError:
+                profile = None
+            names.append((profile or {}).get("name") or profile_id)
+        return names
 
     async def _claim_license_key(
         self, profile: dict[str, Any]
@@ -670,11 +819,20 @@ class BrowserManager:
         if app_key:
             app_id = key_pool.key_id(app_key)
             if app_id in leased or app_id in reserved:
+                holders = self._profile_names(
+                    [owner for owner, key_id in self._key_leases.items()
+                     if key_id == app_id and owner != profile_id]
+                )
+                pins = self._profile_names(self._pin_owner_ids(app_id, exclude=profile_id))
+                who = ", ".join(
+                    [f"{name} (đang chạy)" for name in holders]
+                    + [f"{name} (ghim key)" for name in pins]
+                )
                 raise CloakBrowserLicenseError(
                     "CloakBrowser Pro: session limit reached — the app-wide license "
-                    "key is already in use by, or reserved for, another profile. Add "
-                    "a key to the pool so profiles can run side by side, or stop that "
-                    "profile."
+                    f"key is already held by {who or 'another profile'}. Stop that "
+                    "profile, clear its pin, or add a key to the pool so profiles can "
+                    "run side by side."
                 )
             self._key_leases[profile_id] = app_id
             key_pool.set_lease(profile_id, app_id, plan=self.license_plan)
@@ -983,10 +1141,21 @@ class BrowserManager:
             extra_args = self._build_fingerprint_args(profile)
             extra_args += user_launch_args
             extra_args.append("--remote-debugging-address=127.0.0.1")
+            # Transparent mode and --license-route only recognise a proxy that
+            # arrived as --proxy-server; add it for the credential-free HTTP case
+            # the wrapper would otherwise keep inside Playwright.
+            extra_args += self._proxy_server_args(
+                proxy, transparent=bool(profile.get("transparent_proxy"))
+            )
             # Send the license/session calls out through the profile's proxy when
             # the binary understands the flag, so the license server does not see
             # every key on this machine's one real IP.
             extra_args += self._license_route_args(proxy)
+            # WebRTC must not leak the host's real IP through STUN either. The
+            # wrapper only spoofs it for free when GeoIP is on; with GeoIP off a
+            # proxied profile would leak. `auto` makes the wrapper resolve the
+            # proxy's exit IP itself (cheap, and it drops the flag if it can't).
+            extra_args += self._webrtc_args(proxy, user_launch_args)
             # Reopen the tabs the user had open when the profile was last stopped.
             # Chrome's persistent session is saved on disk but only restored when told to.
             if profile.get("restore_session", True):
@@ -1026,8 +1195,10 @@ class BrowserManager:
                     # the browser has sent session/start (the wrapper returns only
                     # after spawn), so a concurrent launch can't swap the file.
                     async with self._spawn_lock:
-                        write_install_id(self._install_id_for_key(launch_key))
+                        used_install_id = self._install_id_for_key(launch_key)
+                        write_install_id(used_install_id)
                         context = await launch_persistent_context_async(**launch_options)
+                        self._restore_machine_install_id(used_install_id)
                     # An over-cap/denied seat leaves the browser booting but never
                     # serving a usable CDP endpoint — so waiting on CDP would just
                     # time out (or worse). The wrapper wrote the reason to a denial
@@ -1368,15 +1539,20 @@ class BrowserManager:
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             (user_data_dir / lock_file).unlink(missing_ok=True)
         async with self._spawn_lock:
-            write_install_id(self._install_id_for_key(license_key))
-            return await launch_persistent_context_async(
+            used_install_id = self._install_id_for_key(license_key)
+            write_install_id(used_install_id)
+            context = await launch_persistent_context_async(
                 user_data_dir=str(user_data_dir),
                 headless=True,
                 proxy=proxy,
-                args=self._license_route_args(proxy),
+                args=self._proxy_server_args(proxy, transparent=True)
+                + self._license_route_args(proxy)
+                + self._webrtc_args(proxy, []),
                 license_key=license_key,
                 release_channel=self.release_channel,
             )
+            self._restore_machine_install_id(used_install_id)
+            return context
 
     async def _capture_screenshot(self, running: RunningProfile) -> None:
         """Write a compressed JPEG of the profile's current page to disk.
@@ -1854,23 +2030,64 @@ class BrowserManager:
 
         return args
 
+    @staticmethod
+    def _webrtc_args(proxy: str | None, launch_args: list[str]) -> list[str]:
+        """Spoof WebRTC to the proxy exit IP when GeoIP would not already do it.
+
+        STUN reveals the host's real address regardless of the HTTP proxy, which
+        is one more signal tying two keys to one box. With GeoIP on (the default)
+        the wrapper resolves the exit IP and sets the flag itself; with GeoIP off
+        there is no lookup, so ask for it explicitly with `auto` (the wrapper
+        resolves it and removes the flag again if the lookup fails).
+
+        Skipped when the user already set the flag, or when there is no proxy —
+        without one the real IP is correct anyway.
+        """
+        if not proxy:
+            return []
+        if any(arg.startswith("--fingerprint-webrtc-ip") for arg in launch_args):
+            return []
+        return ["--fingerprint-webrtc-ip=auto"]
+
+    def _proxy_server_args(self, proxy: str | None, *, transparent: bool) -> list[str]:
+        """Supply `--proxy-server` for paths the wrapper leaves to Playwright.
+
+        Two features need the proxy to arrive as a command-line flag rather than
+        through Playwright's proxy dict: transparent mode (which reads nothing
+        else) and `--license-route=proxy` (which only accepts a flag proxy). Only
+        a credential-free `http://host:port` needs help — the wrapper adds the
+        flag itself for SOCKS5 and credentialed proxies.
+        """
+        if not transparent and not supports_license_route(self.binary_version):
+            return []
+        arg = _transparent_proxy_arg(proxy)
+        return [f"--proxy-server={arg}"] if arg else []
+
     def _license_route_args(self, proxy: str | None) -> list[str]:
         """Route the license/session calls through the profile's own proxy.
 
         The exit IP is an identity the server can see as readily as the install
         id, so a proxied profile must not still check in from the host's real
-        IP. Only added when there is a proxy the wrapper will actually put in
-        `--proxy-server` and the binary knows the flag — otherwise the binary
-        exits 79 ("--license-route value is invalid... proxy with a proxy set").
+        IP. The binary only accepts the flag when `--proxy-server` is actually
+        set — otherwise it exits 79 ("--license-route value is invalid...").
 
-        The wrapper only passes `--proxy-server` for SOCKS5 and for credentialed
-        HTTP(S) proxies on binaries new enough for inline auth; a plain
-        `http://host:port` goes through Playwright's proxy dict instead, so it is
-        left on the direct path.
+        The wrapper puts proxies in `--proxy-server` itself for SOCKS5 and for
+        credentialed HTTP(S), but a plain `http://host:port` is handed to
+        Playwright's proxy dict instead. That path is covered here by adding the
+        flag too, which is safe: Chromium keeps using the one proxy it was given.
+
+        All of it is gated on the binary understanding the flag; older builds
+        ignore it and would just start up normally.
         """
         if not proxy or not supports_license_route(self.binary_version):
             return []
-        is_socks = proxy.startswith("socks5://")
-        if not is_socks and "@" not in proxy:
-            return []
-        return ["--license-route=proxy"]
+        if self._license_route_supported_proxy(proxy):
+            return ["--license-route=proxy"]
+        return []
+
+    @staticmethod
+    def _license_route_supported_proxy(proxy: str) -> bool:
+        """True if `--proxy-server` will be set for this proxy at spawn."""
+        return proxy.startswith("socks5://") or "@" in proxy or bool(
+            _transparent_proxy_arg(proxy)
+        )

@@ -173,17 +173,26 @@ with a device id (`~/.cloakbrowser/install_id`). Left alone, all your keys repor
 the same id and the server sees one machine running several keys — exactly what a
 farming ring looks like. The Manager therefore derives a stable UUID per key and
 writes it just before that key's browser starts, so the server sees each key on
-its own machine. Keyless launches keep the machine's original id. Changing the
-pool or restarting does not shuffle ids: they are a pure function of the key.
+its own machine. The machine's own id is kept in `~/.cloakbrowser/install_id.machine`
+and restored right after the check-in, so a keyless launch — or the binary run by
+hand — keeps the real machine id instead of inheriting the last key's, even if a
+crash left the file mid-swap. Changing the pool or restarting does not shuffle
+ids: they are a pure function of the key.
 
 **The exit IP is spoofed too.** By default the license/session calls go straight
 to cloakbrowser.dev, which would still expose your real IP for every key. On a
 proxied profile the Manager adds `--license-route=proxy` so those calls leave
 through the profile's own proxy and each key checks in from its own exit IP. This
-needs a binary that understands the flag (155+) and a proxy the browser reaches
-via `--proxy-server` — SOCKS5, or an HTTP proxy with a username and password. A
-plain no-auth HTTP proxy stays on the direct path, because the binary would
-otherwise refuse to start.
+needs a binary that understands the flag (155+); where the wrapper would leave the
+proxy in Playwright, the Manager passes `--proxy-server` itself, so SOCKS5,
+HTTP-with-credentials and plain no-auth `http://host:port` proxies all work.
+
+**WebRTC does not leak the real IP either.** A proxy does not cover STUN, so a
+page could read the host's own address and correlate two keys. Proxied profiles
+ask the wrapper to report the proxy's exit IP over WebRTC instead
+(`--fingerprint-webrtc-ip=auto`); if the lookup fails the flag is dropped and the
+real candidates show, and an explicit `--fingerprint-webrtc-ip` in the profile's
+launch arguments wins.
 
 **Keys do not create identities.** Each key is a seat, not a fingerprint: profiles
 that must look unrelated still need their own proxy and their own browser process.
