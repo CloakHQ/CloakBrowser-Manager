@@ -464,6 +464,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   };
 
   const chooseKey = (choice: string) => {
+    if (choice === "__missing") return;
     keyChoiceTouched.current = true;
     setKeyChoice(choice);
     setProviderTest(null);
