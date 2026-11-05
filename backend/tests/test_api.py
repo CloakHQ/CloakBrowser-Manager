@@ -970,6 +970,54 @@ def test_settings_report_the_pool_size(app_client: TestClient, settings_env, key
     assert app_client.get("/api/settings").json()["key_pool_size"] == 1
 
 
+def test_profile_current_proxy_uses_the_stored_key(
+    app_client: TestClient, monkeypatch
+):
+    """Checking the current proxy must not require retyping the API key.
+
+    The form used to need the key again just to look at what it already held,
+    so "is my key still working?" was unanswerable for a saved profile.
+    """
+    from backend import proxy_providers
+
+    profile_id = app_client.post(
+        "/api/profiles",
+        json={"name": "proxied", "proxy_provider": "kiotproxy", "proxy_provider_key": "k-secret"},
+    ).json()["id"]
+
+    seen: dict[str, str] = {}
+
+    async def fake_current(provider: str, key: str):
+        seen["provider"], seen["key"] = provider, key
+        return {"provider": "kiotproxy", "host": "1.2.3.4:8000", "real_ip": "1.2.3.4"}
+
+    monkeypatch.setattr(proxy_providers, "current_for", fake_current)
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 200
+    assert resp.json()["host"] == "1.2.3.4:8000"
+    assert seen == {"provider": "kiotproxy", "key": "k-secret"}
+
+
+def test_profile_current_proxy_rejects_a_direct_profile(app_client: TestClient):
+    profile_id = app_client.post("/api/profiles", json={"name": "direct"}).json()["id"]
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 400
+    assert "no proxy provider" in resp.json()["detail"]
+
+
+def test_profile_current_proxy_needs_a_stored_key(app_client: TestClient):
+    profile_id = app_client.post(
+        "/api/profiles", json={"name": "no-key", "proxy_provider": "tmproxy"}
+    ).json()["id"]
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 400
+    assert "no API key is stored" in resp.json()["detail"]
+
+
+def test_profile_current_proxy_404s_for_an_unknown_profile(app_client: TestClient):
+    assert app_client.post("/api/profiles/nope/proxy/current").status_code == 404
+
+
 def test_bundle_dir_is_repo_root_when_unfrozen():
     from backend import runtime
 
@@ -1643,3 +1691,51 @@ def test_tmproxy_options_endpoints(app_client: TestClient, monkeypatch):
     assert isps.status_code == 200
     assert isps.json() == [{"id": 1, "name": "Viettel"}]
 
+
+
+def test_renaming_a_profile_renames_its_folder(app_client: TestClient):
+    # The folder is named after the profile, so a rename keeps it that way.
+    created = app_client.post("/api/profiles", json={"name": "Shop A"}).json()
+    before = Path(created["user_data_dir"])
+    before.mkdir(parents=True)
+    (before / "Cookies").write_text("state", encoding="utf-8")
+
+    renamed = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Shop B"})
+    assert renamed.status_code == 200
+    after = Path(renamed.json()["user_data_dir"])
+    assert after.name == "Shop B"
+    assert after.is_dir() and not before.exists()
+    # Browser state moves with the profile, it is a rename not a copy.
+    assert (after / "Cookies").read_text(encoding="utf-8") == "state"
+
+
+def test_renaming_keeps_a_unique_folder(app_client: TestClient):
+    app_client.post("/api/profiles", json={"name": "Taken"})
+    other = app_client.post("/api/profiles", json={"name": "Other"}).json()
+    Path(other["user_data_dir"]).mkdir(parents=True)
+    renamed = app_client.put(f"/api/profiles/{other['id']}", json={"name": "Taken"})
+    assert Path(renamed.json()["user_data_dir"]).name == "Taken (2)"
+
+
+def test_renaming_does_not_move_a_folder_it_did_not_name(app_client: TestClient):
+    # A UUID-era path (or one moved by hand) stays where the operator put it.
+    created = app_client.post("/api/profiles", json={"name": "Legacy"}).json()
+    legacy = Path(created["user_data_dir"]).parent / "0f4c2a2e-legacy-uuid"
+    legacy.mkdir(parents=True)
+    db.set_user_data_dir(created["id"], str(legacy))
+
+    renamed = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Renamed"})
+    assert Path(renamed.json()["user_data_dir"]) == legacy
+    assert legacy.is_dir()
+
+
+def test_renaming_while_running_leaves_the_name_unchanged(app_client: TestClient, monkeypatch):
+    from backend import main
+
+    created = app_client.post("/api/profiles", json={"name": "Live"}).json()
+    Path(created["user_data_dir"]).mkdir(parents=True)
+    monkeypatch.setattr(main.browser_mgr, "is_active", lambda _pid: True)
+
+    resp = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Live 2"})
+    assert resp.status_code == 409
+    assert app_client.get(f"/api/profiles/{created['id']}").json()["name"] == "Live"

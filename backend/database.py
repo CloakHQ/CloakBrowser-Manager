@@ -233,30 +233,61 @@ def _profile_folder_name(name: str) -> str:
     return value[:80].rstrip(" .") or "profile"
 
 
-def _profile_dir_is_taken(path: Path) -> bool:
+def _profile_dir_is_taken(path: Path, ignore_profile_id: str | None = None) -> bool:
     if path.exists():
         return True
     try:
         with get_db() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM profiles WHERE lower(user_data_dir) = lower(?)",
-                (str(path),),
-            ).fetchone()
+            if ignore_profile_id is None:
+                row = conn.execute(
+                    "SELECT 1 FROM profiles WHERE lower(user_data_dir) = lower(?)",
+                    (str(path),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM profiles WHERE lower(user_data_dir) = lower(?) AND id != ?",
+                    (str(path), ignore_profile_id),
+                ).fetchone()
         return row is not None
     except sqlite3.OperationalError:
         return False
 
 
-def user_data_dir_for_name(name: str) -> str:
-    """A readable profile directory, with a numeric suffix when the name is taken."""
+def user_data_dir_for_name(name: str, ignore_profile_id: str | None = None) -> str:
+    """A readable profile directory, with a numeric suffix when the name is taken.
+
+    ``ignore_profile_id`` lets a rename reuse the folder the profile already
+    occupies, and stop treating its own row as a collision.
+    """
     base = _profile_folder_name(name)
     profiles_dir = DATA_DIR / "profiles"
     candidate = base
     index = 2
-    while _profile_dir_is_taken(profiles_dir / candidate):
+    while _profile_dir_is_taken(profiles_dir / candidate, ignore_profile_id):
         candidate = f"{base} ({index})"
         index += 1
     return str(profiles_dir / candidate)
+
+
+def folder_follows_name(profile: dict[str, Any], name: str | None = None) -> bool:
+    """True when the profile's folder is the one ``name`` derives.
+
+    Profiles from before name-based folders (UUID paths), or whose folder was
+    moved by hand, keep their location: only a folder that still matches the
+    old name is renamed along with the profile.
+    """
+    current = profile["user_data_dir"]
+    return Path(current).name == _profile_folder_name(name if name is not None else profile["name"])
+
+
+def set_user_data_dir(profile_id: str, user_data_dir: str) -> None:
+    """Point the row at a moved profile directory (no filesystem work here)."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE profiles SET user_data_dir = ?, updated_at = ? WHERE id = ?",
+            (user_data_dir, _now(), profile_id),
+        )
+        conn.commit()
 
 
 def create_profile(

@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Copy, Cpu, FileText, Fingerprint, Globe, Image, Loader2, Puzzle, RotateCcw, Save, ShieldCheck, Sliders, Tag, Terminal, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Cpu, FileText, Fingerprint, FolderOpen, Globe, Image, Loader2, Puzzle, RotateCcw, Save, ShieldCheck, Sliders, Tag, Terminal, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import { KEY_STATE_LABEL } from "../lib/labels";
@@ -71,6 +71,49 @@ const EMPTY_FORM: ProfileCreateData = {
   launch_args: [],
   tags: [],
 };
+
+const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+/** Last path segment of the stored user_data_dir, for display only. */
+function folderPath(profile: Profile): string {
+  return profile.user_data_dir.split(/[\/]/).filter(Boolean).pop() ?? profile.user_data_dir;
+}
+
+/**
+ * Provider expiry, when the provider reports one.
+ *
+ * The two providers disagree on the shape: KiotProxy sends an ISO string and
+ * TMProxy a unix timestamp in seconds. A value this function cannot parse
+ * renders as nothing rather than as "Invalid Date" in the form.
+ */
+function formatProviderExpiry(value: number | string | null): string {
+  if (value === null || value === "") return "";
+  const date =
+    typeof value === "number" || /^\d+$/.test(String(value))
+      ? new Date(Number(value) * 1000)
+      : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return ` · hết hạn ${date.toLocaleString("vi-VN")}`;
+}
+
+/**
+ * The folder a new profile will get. Mirrors the backend's sanitiser so the
+ * preview matches what lands on disk; an existing folder gets a " (2)" suffix
+ * server-side, which the preview cannot know.
+ */
+export function profileFolderName(name: string): string {
+  const cleaned = name
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+    .replace(/[<>:"/\|?*]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[. ]+|[. ]+$/g, "")
+    .slice(0, 80)
+    .replace(/[. ]+$/g, "");
+  const value = cleaned || "profile";
+  return WINDOWS_RESERVED.test(value) ? `${value}-profile` : value;
+}
 
 /** Every editable field, including the ones that come back null from the API. */
 function formFromProfile(profile: Profile | null): ProfileCreateData {
@@ -149,6 +192,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [providerTest, setProviderTest] = useState<ProxyProviderInfo | null>(null);
   const [providerTestError, setProviderTestError] = useState<string | null>(null);
   const [testingProvider, setTestingProvider] = useState(false);
+  const [checkingCurrent, setCheckingCurrent] = useState(false);
+  const [currentProxy, setCurrentProxy] = useState<ProxyProviderInfo | null>(null);
+  const [currentProxyError, setCurrentProxyError] = useState<string | null>(null);
   const [tmLocations, setTmLocations] = useState<TmProxyOption[]>([]);
   const [tmIsps, setTmIsps] = useState<TmProxyOption[]>([]);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -261,6 +307,22 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       );
     } finally {
       setTestingProvider(false);
+    }
+  };
+
+  const handleCheckCurrentProxy = async () => {
+    if (!profile || form.proxy_provider === "none") return;
+    setCurrentProxy(null);
+    setCurrentProxyError(null);
+    setCheckingCurrent(true);
+    try {
+      setCurrentProxy(await api.profileCurrentProxy(profile.id));
+    } catch (err) {
+      setCurrentProxyError(
+        err instanceof ApiError ? err.message : "Không lấy được proxy hiện tại",
+      );
+    } finally {
+      setCheckingCurrent(false);
     }
   };
 
@@ -445,7 +507,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       {/* Header bar */}
       <div className="card p-4 mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand/15 border border-brand/25 text-brand">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand/15 border border-brand/25 text-brand-fg">
             <Fingerprint className="h-5 w-5" />
           </div>
           <div className="mr-2">
@@ -574,7 +636,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         {isEdit && !previewError && (
           <section className="section-card" hidden={tab !== "basic"}>
             <div className="flex items-center gap-2 mb-3">
-              <Image className="h-4 w-4 text-brand" />
+              <Image className="h-4 w-4 text-brand-fg" />
               <h3 className="text-xs font-semibold text-fg uppercase tracking-wider">Ảnh xem trước gần nhất</h3>
             </div>
             <img
@@ -589,7 +651,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         {/* Basic */}
         <section className="section-card" hidden={tab !== "basic"}>
           <div className="flex items-center gap-2 mb-4">
-            <Fingerprint className="h-4 w-4 text-brand" />
+            <Fingerprint className="h-4 w-4 text-brand-fg" />
             <h3 className="text-xs font-semibold text-fg uppercase tracking-wider">Cơ bản</h3>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -602,6 +664,16 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 placeholder="vd: Amazon Seller #1"
                 required
               />
+              <p className="mt-1.5 flex items-center gap-1.5 text-2xs text-fg-muted">
+                <FolderOpen className="h-3 w-3 flex-shrink-0 text-fg-muted" />
+                <span className="truncate">
+                  Thư mục:{" "}
+                  <span className="font-mono text-fg-secondary">
+                    {form.name.trim() ? profileFolderName(form.name) : "profile"}
+                  </span>
+                  {isEdit && profile?.user_data_dir ? ` (hiện tại: ${folderPath(profile)})` : ""}
+                </span>
+              </p>
             </div>
             <div>
               <label className="label">Seed vân tay</label>
@@ -785,19 +857,27 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   </div>
                 )}
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
                     onClick={handleTestProvider}
                     disabled={!providerKey.trim() || testingProvider}
+                    title="Xoay một proxy mới cho key vừa nhập (key cũ bị thay thế)"
                   >
                     {testingProvider && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                     Lấy proxy mới
                   </button>
-                  <p className="text-2xs text-fg-muted">
-                    Proxy được lấy mới mỗi lần mở hồ sơ. Mỗi key chỉ dùng cho một hồ sơ đang chạy.
-                  </p>
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                    onClick={handleCheckCurrentProxy}
+                    disabled={!profile || checkingCurrent}
+                    title="Xem proxy mà key đã lưu đang giữ, không xoay key"
+                  >
+                    {checkingCurrent && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    Kiểm tra proxy hiện tại
+                  </button>
                 </div>
 
                 {providerTest && !testingProvider && (
@@ -809,6 +889,21 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 )}
                 {providerTestError && !testingProvider && (
                   <p className="text-xs font-medium text-danger">{providerTestError}</p>
+                )}
+
+                {checkingCurrent && (
+                  <p className="text-xs text-fg-muted">Đang hỏi nhà cung cấp…</p>
+                )}
+                {currentProxy && !checkingCurrent && (
+                  <p className="text-xs font-medium text-success">
+                    ✓ Đang giữ: {currentProxy.real_ip ?? currentProxy.host}
+                    {currentProxy.location ? ` · ${currentProxy.location}` : ""}
+                    {currentProxy.isp ? ` · ${currentProxy.isp}` : ""}
+                    {formatProviderExpiry(currentProxy.expires_at)}
+                  </p>
+                )}
+                {currentProxyError && !checkingCurrent && (
+                  <p className="text-xs font-medium text-danger">{currentProxyError}</p>
                 )}
               </div>
             )}
@@ -1009,7 +1104,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         {/* Compatibility */}
         <section className="section-card" hidden={tab !== "options"}>
           <div className="flex items-center gap-2 mb-4">
-            <ShieldCheck className="h-4 w-4 text-brand" />
+            <ShieldCheck className="h-4 w-4 text-brand-fg" />
             <h3 className="text-xs font-semibold text-fg uppercase tracking-wider">Tương thích</h3>
           </div>
           <div className="space-y-2.5">
@@ -1188,7 +1283,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         {/* Advanced */}
         <details className="section-card group" hidden={tab !== "options"}>
           <summary className="cursor-pointer flex items-center gap-2 text-xs font-semibold text-fg uppercase tracking-wider list-none">
-            <Terminal className="h-4 w-4 text-fg-muted group-open:text-brand transition-colors" />
+            <Terminal className="h-4 w-4 text-fg-muted group-open:text-brand-fg transition-colors" />
             <span>Tham số khởi chạy nâng cao</span>
             <ChevronDown className="ml-auto h-4 w-4 text-fg-muted transition-transform group-open:rotate-180" />
           </summary>

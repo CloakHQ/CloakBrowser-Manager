@@ -296,6 +296,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ key }),
     }),
+  /** The provider proxy this profile's *stored* key holds — no key input needed. */
+  profileCurrentProxy: (profileId: string) =>
+    request<ProxyProviderInfo>(`/api/profiles/${profileId}/proxy/current`, {
+      method: "POST",
+    }),
   kiotproxyOut: (key: string) =>
     request<{ ok: boolean }>("/api/proxy-providers/kiotproxy/out", {
       method: "POST",

@@ -677,6 +677,36 @@ async def tmproxy_current_endpoint(req: TmProxyRequest):
     return _provider_info_response(info)
 
 
+@app.post(
+    "/api/profiles/{profile_id}/proxy/current", response_model=ProxyProviderInfo
+)
+async def profile_current_proxy_endpoint(profile_id: str):
+    """The proxy the profile's provider key is holding right now, without rotating.
+
+    The provider form used to ask the user to retype the API key just to look at
+    the proxy it already had, which is exactly the "does this key still work?"
+    question the key is stored to answer. The stored key never leaves the
+    process: this reads it server-side by id.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    provider = (profile.get("proxy_provider") or "none").strip().lower()
+    key = (profile.get("proxy_provider_key") or "").strip()
+    if provider not in ("kiotproxy", "tmproxy"):
+        raise HTTPException(status_code=400, detail="Profile has no proxy provider")
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider} is selected but no API key is stored",
+        )
+    try:
+        info = await proxy_providers.current_for(provider, key)
+    except ProxyProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _provider_info_response(info)
+
+
 @app.get("/api/proxy-providers/tmproxy/locations", response_model=list[TmProxyOption])
 async def tmproxy_locations_endpoint():
     """TMProxy locations for the profile form."""
@@ -729,12 +759,63 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     tags = data.pop("tags", None)
     if tags is not None:
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
-    profile = db.update_profile(profile_id, **data)
-    if not profile:
+
+    before = db.get_profile(profile_id)
+    if not before:
         raise HTTPException(status_code=404, detail="Profile not found")
-    if "name" in data:
+
+    # A rename carries the folder with it, so the directory on disk keeps
+    # telling you which profile it is. Only a folder that already matched the
+    # old name moves — a UUID-era path or one moved by hand stays put.
+    move_from: Path | None = None
+    move_to: Path | None = None
+    new_name = data.get("name")
+    if (
+        new_name
+        and new_name != before["name"]
+        and db.folder_follows_name(before)
+    ):
+        target = Path(
+            db.user_data_dir_for_name(new_name, ignore_profile_id=profile_id)
+        )
+        if str(target) != before["user_data_dir"]:
+            move_from = Path(before["user_data_dir"])
+            move_to = target
+
+    if move_from is not None and move_to is not None:
+        try:
+            async with browser_mgr.hold_stopped(profile_id):
+                # Rename first: if it fails, the row still points at the folder
+                # that exists, so the profile is never orphaned.
+                if move_from.is_dir():
+                    move_from.rename(move_to)
+                profile = db.update_profile(profile_id, **data)
+                if not profile:
+                    raise HTTPException(status_code=404, detail="Profile not found")
+                # user_data_dir is deliberately not an updatable column, so the
+                # move is recorded on its own.
+                db.set_user_data_dir(profile_id, str(move_to))
+                profile = db.get_profile(profile_id) or profile
+        except ProfileBusyError as exc:
+            # The browser owns the folder; save everything else and keep the name.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OSError as exc:
+            logger.warning("Could not rename profile folder %s: %s", move_from, exc)
+            profile = db.update_profile(profile_id, **data)
+            if not profile:
+                raise HTTPException(status_code=404, detail="Profile not found")
+    else:
+        profile = db.update_profile(profile_id, **data)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+    if new_name and new_name != before["name"]:
         # The chooser sidebar labels each entry with the profile name.
         artifacts.refresh_picker_bookmarks()
+        try:
+            artifacts.sync_picker_view(profile_id, refresh_bookmarks=False)
+        except OSError:
+            pass
     return _profile_response(profile)
 
 
