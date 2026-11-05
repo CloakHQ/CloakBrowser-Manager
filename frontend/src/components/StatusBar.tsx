@@ -24,22 +24,35 @@ export function StatusBar({ status }: { status: SystemStatus | null }) {
       <span className={TIER_CLASS[tier] ?? "badge-neutral"}>
         {TIER_LABEL[tier] ?? tier}
       </span>
-      {plan && <span className="text-fg-secondary">gói: {plan === "free" ? "miễn phí" : plan}</span>}
+      {plan && (
+        <span className="hidden whitespace-nowrap text-fg-secondary sm:inline">
+          gói: {plan === "free" ? "miễn phí" : plan}
+        </span>
+      )}
 
       {status && (
         <>
-          <span className="h-3 w-px bg-line" />
-          <span className="inline-flex items-center gap-1.5 text-fg-secondary" title="Đang chạy / tổng số hồ sơ">
+          <span className="hidden h-3 w-px bg-line sm:block" />
+          <span
+            className="inline-flex items-center gap-1.5 whitespace-nowrap text-fg-secondary"
+            title="Đang chạy / tổng số hồ sơ"
+          >
             <MonitorSmartphone className="h-3 w-3 text-brand" />
-            {running} đang chạy / {total} hồ sơ
+            {running}/{total} hồ sơ đang chạy
           </span>
-          <span className="h-3 w-px bg-line" />
-          <span className="inline-flex items-center gap-1.5 font-mono text-fg-secondary" title="Bản Chromium đang dùng">
+          <span className="hidden h-3 w-px bg-line md:block" />
+          <span
+            className="hidden items-center gap-1.5 whitespace-nowrap font-mono text-fg-secondary md:inline-flex"
+            title="Bản Chromium đang dùng"
+          >
             <Cpu className="h-3 w-3 text-info" />
             {status.binary_version}
           </span>
-          <span className="h-3 w-px bg-line" />
-          <span className="inline-flex items-center gap-1.5" title="Chế độ chạy và trình xem">
+          <span className="hidden h-3 w-px bg-line lg:block" />
+          <span
+            className="hidden items-center gap-1.5 whitespace-nowrap lg:inline-flex"
+            title="Chế độ chạy và trình xem"
+          >
             <Server className="h-3 w-3 text-fg-muted" />
             {status.runtime_mode} · {status.viewer_mode} · {status.host_os}
           </span>
@@ -56,7 +69,7 @@ export function StatusBar({ status }: { status: SystemStatus | null }) {
         </span>
       )}
 
-      <span className="ml-auto truncate text-fg-muted">
+      <span className="ml-auto hidden truncate text-fg-muted xl:inline">
         CloakBrowser Manager (Custom) · bản fork không chính thức
       </span>
     </div>

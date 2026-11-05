@@ -37,6 +37,8 @@ export interface ProfileTableProps {
   onStop: (id: string) => Promise<void>;
   onDuplicate: (id: string) => void;
   onDelete: (id: string) => void;
+  /** Persist a manual order (the sidebar list's drag-reorder, in menu form). */
+  onReorder: (orderedIds: string[]) => void;
 }
 
 const STATUS_LABEL: Record<string, string> = PROFILE_STATUS_LABEL;
@@ -59,6 +61,7 @@ export function ProfileTable({
   onStop,
   onDuplicate,
   onDelete,
+  onReorder,
 }: ProfileTableProps) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -157,6 +160,19 @@ export function ProfileTable({
           Hồ sơ mới
         </button>
       </div>
+
+      {noKey && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-warning/30 bg-warning/10 px-3.5 py-2.5">
+          <KeyRound className="h-4 w-4 flex-shrink-0 text-warning" />
+          <p className="min-w-0 flex-1 text-xs text-fg-secondary">
+            <span className="font-semibold text-fg">Chưa có key bản quyền.</span> Hồ sơ cần key để
+            khởi chạy — mỗi phiên đang chạy dùng trọn một key.
+          </p>
+          <button onClick={onOpenSettings} className="btn-secondary px-2.5 py-1 text-xs">
+            Nhập key
+          </button>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
@@ -261,6 +277,15 @@ export function ProfileTable({
                   const stopped = p.status === "stopped";
                   const isBusy = busy.has(p.id) || p.status === "initializing";
                   const proxy = profileProxyLabel(p);
+                  const orderIndex = profiles.findIndex((x) => x.id === p.id);
+                  const move = (target: number) => {
+                    const ids = profiles.map((x) => x.id);
+                    if (target < 0 || target >= ids.length) return;
+                    const [moved] = ids.splice(orderIndex, 1);
+                    if (moved === undefined) return;
+                    ids.splice(target, 0, moved);
+                    onReorder(ids);
+                  };
                   return (
                     <tr
                       key={p.id}
@@ -317,6 +342,10 @@ export function ProfileTable({
                             onEdit={() => onEdit(p.id)}
                             onDuplicate={() => onDuplicate(p.id)}
                             onDelete={() => onDelete(p.id)}
+                            onMoveUp={() => move(orderIndex - 1)}
+                            onMoveDown={() => move(orderIndex + 1)}
+                            canMoveUp={orderIndex > 0}
+                            canMoveDown={orderIndex >= 0 && orderIndex < profiles.length - 1}
                           />
                         </div>
                       </td>

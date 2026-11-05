@@ -1,8 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { ChevronRight, Eye, LayoutGrid, Loader2, Lock, PanelLeftClose, PanelLeft, Power, Settings, Shield, SlidersHorizontal, WifiOff, X } from "lucide-react";
+import { ChevronRight, Eye, Loader2, PanelLeft, PanelLeftClose, Plus, Power, Shield, SlidersHorizontal, WifiOff, X } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial } from "./lib/api";
-import { ProfileList } from "./components/ProfileList";
 import { ProfileTable } from "./components/ProfileTable";
 import { StatusBar } from "./components/StatusBar";
 import { ProfileForm } from "./components/ProfileForm";
@@ -13,13 +12,19 @@ import { StatusIndicator } from "./components/StatusIndicator";
 import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { LicensePage } from "./components/LicensePage";
+import { ProxyPage } from "./components/ProxyPage";
+import { SettingsPage } from "./components/SettingsPage";
+import { PAGE_TITLE, Sidebar, type Page } from "./components/Sidebar";
 import { LoginPage } from "./components/LoginPage";
 import { useConfirm } from "./components/ui/confirm";
 import { useToast } from "./components/ui/toast";
 
 type AuthState = "checking" | "required" | "ok" | "error";
-type View = "empty" | "create" | "edit" | "view";
+type View = Page | "create" | "edit" | "view";
+
+const isPage = (view: View): view is Page =>
+  view === "overview" || view === "proxy" || view === "license" || view === "settings";
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -114,13 +119,14 @@ interface AppContentProps {
 function AppContent({ authRequired, onLogout }: AppContentProps) {
   const { profiles, loading, error, actionError, clearActionError, create, update, remove, reorder, launch, stop, reset, duplicate } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("empty");
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [view, setView] = useState<View>("overview");
+  const [sidebarOpen, setSidebarOpen] = useState(() =>
+    typeof window === "undefined" ? true : window.innerWidth >= 768,
+  );
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [launchError, setLaunchError] = useState<LaunchDenial | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [stopped, setStopped] = useState(false);
   const confirm = useConfirm();
   const toast = useToast();
@@ -193,6 +199,14 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     setView("create");
   }, []);
 
+  const handleNavigate = useCallback((page: Page) => {
+    setSelectedId(null);
+    setLaunchError(null);
+    setView(page);
+    // On a narrow window the rail is a drawer; picking a section closes it.
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }, []);
+
   const handleCreate = useCallback(async (data: ProfileCreateData) => {
     const profile = await create(data);
     if (profile) {
@@ -210,7 +224,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     if (!selectedId) return;
     await remove(selectedId);
     setSelectedId(null);
-    setView("empty");
+    setView("overview");
   }, [selectedId, remove]);
 
   // A license denial (out of seats, bad/expired key) → 402/403 with a
@@ -383,206 +397,150 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
   return (
     <div className="h-screen flex flex-col bg-surface-0 text-fg">
-      {settingsOpen && (
-        <SettingsPanel
-          onClose={() => setSettingsOpen(false)}
-          onSaved={setSystemStatus}
-        />
-      )}
       {updateInfo?.update_available && !updateDismissed && (
         <UpdateBanner info={updateInfo} onDismiss={() => setUpdateDismissed(true)} />
       )}
       {launchError && (
         <LaunchErrorBanner error={launchError} onDismiss={() => setLaunchError(null)} />
       )}
-      <div className="flex-1 flex min-h-0">
-      {/* Sidebar */}
-      {sidebarOpen && (
-        <div className="w-sidebar border-r border-line bg-surface-1/95 backdrop-blur-md flex-shrink-0">
-          <ProfileList
-            profiles={profiles}
-            selectedId={selectedId}
-            onSelect={handleSelect}
-            onNew={handleNew}
-            onReorder={reorder}
-          />
-        </div>
-      )}
-
-      {/* Main panel */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Top bar */}
-        <div className="flex h-topbar items-center justify-between px-4 border-b border-line bg-surface-1/90 backdrop-blur-md">
-          <div className="flex items-center gap-2 min-w-0">
-            <button
-              onClick={() => setSidebarOpen(!sidebarOpen)}
-              className="rail-item"
-              title={sidebarOpen ? "Ẩn thanh bên" : "Hiện thanh bên"}
-            >
-              {sidebarOpen ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeft className="h-4 w-4" />}
-            </button>
-            <div className="h-4 w-px bg-line mx-0.5" />
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedId(null);
-                setView("empty");
-              }}
-              className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors ${
-                !selected && view === "empty"
-                  ? "bg-surface-2 text-fg"
-                  : "text-fg-secondary hover:bg-surface-2 hover:text-fg"
-              }`}
-              title="Tổng quan hồ sơ"
-            >
-              <LayoutGrid className="h-3.5 w-3.5 text-brand" />
-              <span>Hồ sơ</span>
-            </button>
-
-            {view === "create" && !selected && (
-              <>
-                <ChevronRight className="h-3.5 w-3.5 text-fg-muted flex-shrink-0" />
-                <span className="text-sm font-medium text-fg truncate">Tạo hồ sơ mới</span>
-              </>
-            )}
-
-            {selected && (
-              <>
-                <ChevronRight className="h-3.5 w-3.5 text-fg-muted flex-shrink-0" />
-                <div className="flex items-center gap-2 min-w-0">
-                  <StatusIndicator status={selected.status} size="md" />
-                  <span className="text-sm font-semibold text-fg truncate max-w-[220px]">
-                    {selected.name}
-                  </span>
-                </div>
-                {selected.status === "running" && (
-                  <div className="ml-2 flex items-center rounded-lg border border-line bg-surface-0/80 p-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setView("view")}
-                      className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
-                        view === "view"
-                          ? "bg-brand-subtle text-brand"
-                          : "text-fg-muted hover:text-fg"
-                      }`}
-                    >
-                      <Eye className="h-3 w-3" />
-                      <span>Trình xem</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setView("edit")}
-                      className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
-                        view === "edit"
-                          ? "bg-brand-subtle text-brand"
-                          : "text-fg-muted hover:text-fg"
-                      }`}
-                    >
-                      <SlidersHorizontal className="h-3 w-3" />
-                      <span>Cấu hình</span>
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            <SystemStatusBadge status={systemStatus} />
-            {selected && (
-              <LaunchButton
-                key={selected.id}
-                status={selected.status}
-                onLaunch={handleLaunch}
-                onStop={handleStop}
+      <div className="relative flex min-h-0 flex-1">
+        {/* Sidebar: fixed rail on md+, a drawer below that. */}
+        {sidebarOpen && (
+          <>
+            <div
+              className="absolute inset-0 z-popover bg-black/50 md:hidden"
+              onClick={() => setSidebarOpen(false)}
+              aria-hidden="true"
+            />
+            <aside className="w-sidebar flex-shrink-0 max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-modal max-md:shadow-popover">
+              <Sidebar
+                page={isPage(view) ? view : "overview"}
+                onNavigate={handleNavigate}
+                status={systemStatus}
+                runningCount={profiles.filter((p) => p.status === "running").length}
+                profileCount={profiles.length}
+                version={updateInfo?.current ?? null}
+                authRequired={authRequired}
+                onLogout={onLogout}
+                onQuit={handleQuit}
               />
-            )}
-            <div className="h-4 w-px bg-line mx-0.5" />
-            <button
-              onClick={() => setSettingsOpen(true)}
-              className="rail-item"
-              title="Cài đặt"
-            >
-              <Settings className="h-4 w-4" />
-            </button>
-            {authRequired && (
-              <button
-                onClick={onLogout}
-                className="rail-item"
-                title="Đăng xuất"
-              >
-                <Lock className="h-3.5 w-3.5" />
-              </button>
-            )}
-            <button
-              onClick={handleQuit}
-              className="rail-item hover:!bg-danger/15 hover:!text-danger"
-              title="Thoát Manager (dừng máy chủ)"
-            >
-              <Power className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Error banner */}
-        {/* An action error stays until dismissed; a poll error clears itself on
-            the next good poll, so it gets no close button. */}
-        {error && (
-          <div
-            role="alert"
-            className="px-4 py-2.5 bg-danger/10 border-b border-danger/30 text-danger text-xs font-medium flex items-center gap-2"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-danger flex-shrink-0" />
-            <span className="min-w-0 flex-1">
-              {actionError ? error : `Mất kết nối tới máy chủ: ${error}`}
-            </span>
-            {actionError && (
-              <button
-                type="button"
-                onClick={clearActionError}
-                className="opacity-70 hover:opacity-100"
-                aria-label="Đóng thông báo lỗi"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            )}
-          </div>
+            </aside>
+          </>
         )}
 
-        {/* Content */}
-        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
-          {view === "empty" &&
-            ((systemStatus?.license_tier ?? "none") === "none" ? (
-              <div className="flex h-full items-center justify-center px-6">
-                <div className="max-w-sm text-center">
-                  <p className="text-sm font-medium text-fg">Chưa có key bản quyền</p>
-                  <p className="mt-1.5 text-sm text-fg-muted">
-                    Hồ sơ cần key để khởi chạy. Key miễn phí chỉ cần một email và
-                    dùng được bản dựng mới nhất.
-                  </p>
-                  <div className="mt-5 flex flex-col items-center gap-2">
-                    <button onClick={() => setSettingsOpen(true)} className="btn-primary w-56">
-                      Nhập key trong Cài đặt
-                    </button>
-                    <a
-                      href="https://cloakbrowser.dev/free"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-secondary w-56"
-                    >
-                      Lấy key miễn phí
-                    </a>
-                    <a
-                      href="https://cloakbrowser.dev/#pricing"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-fg-muted hover:text-fg-secondary"
-                    >
-                      Xem các gói Pro &rarr;
-                    </a>
-                  </div>
-                </div>
-              </div>
-            ) : (
+        {/* Main panel */}
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Top bar */}
+          <div className="flex h-topbar items-center justify-between gap-3 border-b border-line bg-surface-1/90 px-4 backdrop-blur-md">
+            <div className="flex min-w-0 items-center gap-2">
+              <button
+                onClick={() => setSidebarOpen(!sidebarOpen)}
+                className="rail-item"
+                title={sidebarOpen ? "Ẩn thanh bên" : "Hiện thanh bên"}
+                aria-label={sidebarOpen ? "Ẩn thanh bên" : "Hiện thanh bên"}
+              >
+                {sidebarOpen ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeft className="h-4 w-4" />}
+              </button>
+              <div className="mx-0.5 h-4 w-px bg-line" />
+              {isPage(view) ? (
+                <span className="truncate text-sm font-medium text-fg">{PAGE_TITLE[view]}</span>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleNavigate("overview")}
+                    className="truncate text-sm text-fg-muted transition-colors hover:text-fg"
+                  >
+                    Hồ sơ
+                  </button>
+                  <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-fg-muted" />
+                  {view === "create" ? (
+                    <span className="truncate text-sm font-semibold text-fg">Hồ sơ mới</span>
+                  ) : selected ? (
+                    <>
+                      <div className="flex min-w-0 items-center gap-2">
+                        <StatusIndicator status={selected.status} size="md" />
+                        <span className="truncate text-sm font-semibold text-fg">{selected.name}</span>
+                      </div>
+                      {selected.status === "running" && (
+                        <div className="ml-2 flex items-center rounded-lg border border-line bg-surface-0/80 p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setView("view")}
+                            className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
+                              view === "view" ? "bg-brand-subtle text-brand" : "text-fg-muted hover:text-fg"
+                            }`}
+                          >
+                            <Eye className="h-3 w-3" />
+                            <span>Trình xem</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setView("edit")}
+                            className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
+                              view === "edit" ? "bg-brand-subtle text-brand" : "text-fg-muted hover:text-fg"
+                            }`}
+                          >
+                            <SlidersHorizontal className="h-3 w-3" />
+                            <span>Cấu hình</span>
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <span className="truncate text-sm font-medium text-fg">Hồ sơ</span>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="flex flex-shrink-0 items-center gap-2">
+              <SystemStatusBadge status={systemStatus} />
+              {selected && view !== "create" && (
+                <LaunchButton
+                  key={selected.id}
+                  status={selected.status}
+                  onLaunch={handleLaunch}
+                  onStop={handleStop}
+                />
+              )}
+              {isPage(view) && view !== "overview" && (
+                <button onClick={handleNew} className="btn-primary h-8 px-3 text-xs">
+                  <Plus className="h-3.5 w-3.5" />
+                  Hồ sơ mới
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Error banner */}
+          {/* An action error stays until dismissed; a poll error clears itself on
+              the next good poll, so it gets no close button. */}
+          {error && (
+            <div
+              role="alert"
+              className="px-4 py-2.5 bg-danger/10 border-b border-danger/30 text-danger text-xs font-medium flex items-center gap-2"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-danger flex-shrink-0" />
+              <span className="min-w-0 flex-1">
+                {actionError ? error : `Mất kết nối tới máy chủ: ${error}`}
+              </span>
+              {actionError && (
+                <button
+                  type="button"
+                  onClick={clearActionError}
+                  className="opacity-70 hover:opacity-100"
+                  aria-label="Đóng thông báo lỗi"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Content */}
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+            {view === "overview" && (
               <ProfileTable
                 profiles={profiles}
                 selectedId={selectedId}
@@ -590,63 +548,79 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 onSelect={handleSelect}
                 onEdit={handleEditById}
                 onNew={handleNew}
-                onOpenSettings={() => setSettingsOpen(true)}
+                onOpenSettings={() => handleNavigate("license")}
                 onLaunch={handleRowLaunch}
                 onStop={handleRowStop}
                 onDuplicate={handleRowDuplicate}
                 onDelete={handleRowDelete}
+                onReorder={reorder}
               />
-            ))}
+            )}
 
-          {view === "create" && (
-            <ProfileForm
-              profile={null}
-              hostOs={systemStatus?.host_os ?? null}
-              viewerMode={systemStatus?.viewer_mode ?? null}
-              onSave={handleCreate}
-              onCancel={() => setView("empty")}
-            />
-          )}
+            {view === "proxy" && <ProxyPage profiles={profiles} onEdit={handleEditById} />}
 
-          {view === "edit" && selected && (
-            <ProfileForm
-              profile={selected}
-              hostOs={systemStatus?.host_os ?? null}
-              viewerMode={systemStatus?.viewer_mode ?? null}
-              onSave={handleUpdate}
-              onDelete={handleDelete}
-              onReset={handleReset}
-              onDuplicate={handleDuplicate}
-              onCancel={() => {
-                setSelectedId(null);
-                setView("empty");
-              }}
-            />
-          )}
+            {view === "license" && (
+              <LicensePage status={systemStatus} onStatusChange={refreshStatus} />
+            )}
 
-          {view === "view" && selected && selected.status === "running" && (
-            selected.viewer_mode === "vnc" ? (
-              <ProfileViewer
-                key={selected.id}
-                profileId={selected.id}
-                profileName={selected.name}
-                cdpUrl={selected.cdp_url}
-                clipboardSync={selected.clipboard_sync}
-                onClipboardSyncChange={handleClipboardSyncChange}
-                onDisconnect={handleVncDisconnect}
+            {view === "settings" && (
+              <SettingsPage
+                status={systemStatus}
+                authRequired={authRequired}
+                onLogout={onLogout}
+                onQuit={handleQuit}
               />
-            ) : (
-              <NativeWindowStatus
-                key={selected.id}
-                profileId={selected.id}
-                profileName={selected.name}
-                cdpUrl={selected.cdp_url}
-                capturePreview={selected.capture_preview}
+            )}
+
+            {view === "create" && (
+              <ProfileForm
+                profile={null}
+                hostOs={systemStatus?.host_os ?? null}
+                viewerMode={systemStatus?.viewer_mode ?? null}
+                onSave={handleCreate}
+                onCancel={() => setView("overview")}
               />
-            )
-          )}
+            )}
+
+            {view === "edit" && selected && (
+              <ProfileForm
+                profile={selected}
+                hostOs={systemStatus?.host_os ?? null}
+                viewerMode={systemStatus?.viewer_mode ?? null}
+                onSave={handleUpdate}
+                onDelete={handleDelete}
+                onReset={handleReset}
+                onDuplicate={handleDuplicate}
+                onCancel={() => {
+                  setSelectedId(null);
+                  setView("overview");
+                }}
+              />
+            )}
+
+            {view === "view" && selected && selected.status === "running" && (
+              selected.viewer_mode === "vnc" ? (
+                <ProfileViewer
+                  key={selected.id}
+                  profileId={selected.id}
+                  profileName={selected.name}
+                  cdpUrl={selected.cdp_url}
+                  clipboardSync={selected.clipboard_sync}
+                  onClipboardSyncChange={handleClipboardSyncChange}
+                  onDisconnect={handleVncDisconnect}
+                />
+              ) : (
+                <NativeWindowStatus
+                  key={selected.id}
+                  profileId={selected.id}
+                  profileName={selected.name}
+                  cdpUrl={selected.cdp_url}
+                  capturePreview={selected.capture_preview}
+                />
+              )
+            )}
+          </div>
         </div>
-      </div>
       </div>
       <StatusBar status={systemStatus} />
     </div>

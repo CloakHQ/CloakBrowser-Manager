@@ -1,4 +1,4 @@
-import { Copy, MoreHorizontal, SlidersHorizontal, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Copy, MoreHorizontal, SlidersHorizontal, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Profile } from "../lib/api";
 
@@ -87,9 +87,22 @@ interface RowMenuProps {
   onEdit: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
 }
 
-export function RowMenu({ profile, onEdit, onDuplicate, onDelete }: RowMenuProps) {
+export function RowMenu({
+  profile,
+  onEdit,
+  onDuplicate,
+  onDelete,
+  onMoveUp,
+  onMoveDown,
+  canMoveUp = false,
+  canMoveDown = false,
+}: RowMenuProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -159,6 +172,41 @@ export function RowMenu({ profile, onEdit, onDuplicate, onDelete }: RowMenuProps
         >
           {item("Mở cấu hình", <SlidersHorizontal className="h-3.5 w-3.5" />, onEdit)}
           {item("Sao chép hồ sơ", <Copy className="h-3.5 w-3.5" />, onDuplicate)}
+          {(onMoveUp || onMoveDown) && (
+            <>
+              <div className="my-1 h-px bg-line" />
+              {onMoveUp && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!canMoveUp}
+                  onClick={() => {
+                    setOpen(false);
+                    onMoveUp();
+                  }}
+                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-xs text-fg-secondary transition-colors hover:bg-surface-3 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                  Di chuyển lên
+                </button>
+              )}
+              {onMoveDown && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!canMoveDown}
+                  onClick={() => {
+                    setOpen(false);
+                    onMoveDown();
+                  }}
+                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-xs text-fg-secondary transition-colors hover:bg-surface-3 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <ArrowDown className="h-3.5 w-3.5" />
+                  Di chuyển xuống
+                </button>
+              )}
+            </>
+          )}
           <div className="my-1 h-px bg-line" />
           {item("Xóa hồ sơ", <Trash2 className="h-3.5 w-3.5" />, onDelete, {
             danger: true,

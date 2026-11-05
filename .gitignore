@@ -43,3 +43,6 @@ backend/version.txt
 keys.txt
 *.license.key
 license.key
+
+# Local UI preview scratch (throwaway DB and logs)
+.tmp-ui-preview/
