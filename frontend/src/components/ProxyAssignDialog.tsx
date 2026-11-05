@@ -10,11 +10,20 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
-import { api, type Profile, type ProfileCreateData, type ProxyProvider, type TmProxyOption } from "../lib/api";
+import {
+  api,
+  type Profile,
+  type ProfileCreateData,
+  type ProxyKeyOption,
+  type ProxyProvider,
+  type TmProxyOption,
+} from "../lib/api";
 import { PROVIDER_LABEL, profileProxyLabel } from "./ProfileTableParts";
 import { useToast } from "./ui/toast";
 
 type Mode = ProxyProvider | "direct";
+type KeySource = "random" | "specific" | "manual";
+type RotationMode = "per_launch" | "sticky" | "manual";
 
 interface ProxyAssignDialogProps {
   /** Profiles offered for selection (already the whole list). */
@@ -27,9 +36,15 @@ interface ProxyAssignDialogProps {
 
 const MODES: { key: Mode; label: string; icon: typeof Globe; hint: string }[] = [
   { key: "none", label: "Proxy thủ công", icon: Globe, hint: "Một địa chỉ dùng chung cho cả nhóm" },
-  { key: "kiotproxy", label: "KiotProxy", icon: KeyRound, hint: "Xoay proxy theo API key" },
-  { key: "tmproxy", label: "TMProxy", icon: KeyRound, hint: "Xoay proxy theo API key" },
+  { key: "kiotproxy", label: "KiotProxy", icon: KeyRound, hint: "Dùng key đã lưu hoặc key dán tay" },
+  { key: "tmproxy", label: "TMProxy", icon: KeyRound, hint: "Dùng key đã lưu hoặc key dán tay" },
   { key: "direct", label: "Bỏ proxy", icon: Link2Off, hint: "Đi trực tiếp, không qua proxy" },
+];
+
+const ROTATION_MODES: { key: RotationMode; label: string; hint: string }[] = [
+  { key: "per_launch", label: "Mỗi lần mở", hint: "Lấy IP mới khi khởi chạy" },
+  { key: "sticky", label: "Giữ IP", hint: "Dùng lại đến khi hết hạn" },
+  { key: "manual", label: "Thủ công", hint: "Chỉ đổi khi bấm nút" },
 ];
 
 /** Accepts host:port, user:pass@host:port and any scheme//host:port form. */
@@ -59,13 +74,19 @@ export function ProxyAssignDialog({
   const [selected, setSelected] = useState<Set<string>>(() => new Set(initialSelection));
   const [search, setSearch] = useState("");
   const [mode, setMode] = useState<Mode>("none");
+  const [keySource, setKeySource] = useState<KeySource>("random");
+  const [keyChoice, setKeyChoice] = useState("");
   const [proxyUrl, setProxyUrl] = useState("");
   const [providerKey, setProviderKey] = useState("");
+  const [rotationMode, setRotationMode] = useState<RotationMode>("per_launch");
   const [kiotRegion, setKiotRegion] = useState<"bac" | "trung" | "nam" | "random">("random");
   const [tmLocation, setTmLocation] = useState(0);
   const [tmIsp, setTmIsp] = useState(0);
   const [locations, setLocations] = useState<TmProxyOption[]>([]);
   const [isps, setIsps] = useState<TmProxyOption[]>([]);
+  const [keyOptions, setKeyOptions] = useState<ProxyKeyOption[]>([]);
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [keysError, setKeysError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
   const [applying, setApplying] = useState(false);
@@ -73,6 +94,8 @@ export function ProxyAssignDialog({
   const [errors, setErrors] = useState<{ name: string; message: string }[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
   const returnFocus = useRef<HTMLElement | null>(document.activeElement as HTMLElement | null);
+
+  const providerMode = mode === "kiotproxy" || mode === "tmproxy";
 
   useEffect(() => {
     searchRef.current?.focus();
@@ -83,6 +106,34 @@ export function ProxyAssignDialog({
     api.tmproxyLocations().then(setLocations).catch(() => setLocations([]));
     api.tmproxyIsps().then(setIsps).catch(() => setIsps([]));
   }, [mode, locations.length]);
+
+  useEffect(() => {
+    setKeyChoice("");
+    setKeysError(null);
+    if (!providerMode) {
+      setKeyOptions([]);
+      setKeysLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setKeysLoading(true);
+    api
+      .availableProxyKeys(mode)
+      .then((options) => {
+        if (!cancelled) setKeyOptions(options);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setKeysError(err instanceof Error ? err.message : "Không tải được danh sách key");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setKeysLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, providerMode]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -110,6 +161,20 @@ export function ProxyAssignDialog({
     );
   }, [profiles, search]);
 
+  const groupedKeys = useMemo(() => {
+    const groups = new Map<string, { id: string; label: string; options: ProxyKeyOption[] }>();
+    for (const option of keyOptions) {
+      const group = groups.get(option.account_id) ?? {
+        id: option.account_id,
+        label: option.account_label || option.account_masked || option.account_id,
+        options: [],
+      };
+      group.options.push(option);
+      groups.set(option.account_id, group);
+    }
+    return [...groups.values()];
+  }, [keyOptions]);
+
   const allVisibleSelected = visible.length > 0 && visible.every((p) => selected.has(p.id));
 
   const toggle = (id: string) =>
@@ -132,12 +197,18 @@ export function ProxyAssignDialog({
   const runningChosen = chosen.filter((p) => p.status !== "stopped").length;
 
   const manualValid = isProxyAddress(proxyUrl);
+  const availableKeys = keyOptions.filter((option) => option.key_id && !option.error);
   const canApply =
     chosen.length > 0 &&
     !applying &&
     (mode === "direct" ||
       (mode === "none" && manualValid) ||
-      ((mode === "kiotproxy" || mode === "tmproxy") && providerKey.trim().length > 0));
+      (providerMode &&
+        (keySource === "manual"
+          ? providerKey.trim().length > 0
+          : keySource === "random"
+            ? availableKeys.length > 0
+            : keyChoice.length > 0)));
 
   const handleTest = async () => {
     if (!manualValid) {
@@ -151,9 +222,11 @@ export function ProxyAssignDialog({
       setTest({
         ok: Boolean(result.ok),
         text: result.ok
-          ? `${result.ip ?? "?"}${result.city || result.country ? ` · ${[result.city, result.country].filter(Boolean).join(", ")}` : ""}${
-              result.latency_ms != null ? ` · ${result.latency_ms}ms` : ""
-            }`
+          ? `${result.ip ?? "?"}${
+              result.city || result.country
+                ? ` · ${[result.city, result.country].filter(Boolean).join(", ")}`
+                : ""
+            }${result.latency_ms != null ? ` · ${result.latency_ms}ms` : ""}`
           : result.error || "Không kết nối được tới proxy",
       });
     } catch (err) {
@@ -164,24 +237,47 @@ export function ProxyAssignDialog({
   };
 
   const payload = (): Partial<ProfileCreateData> => {
-    if (mode === "direct") return { proxy: null, proxy_provider: "none", proxy_provider_key: "" };
-    if (mode === "none") {
-      return { proxy: proxyUrl.trim(), proxy_provider: "none", proxy_provider_key: "" };
-    }
-    if (mode === "kiotproxy") {
+    if (mode === "direct") {
       return {
         proxy: null,
-        proxy_provider: "kiotproxy",
-        proxy_provider_key: providerKey.trim(),
-        kiotproxy_region: kiotRegion,
+        proxy_provider: "none",
+        proxy_provider_key: "",
+        proxy_account_id: null,
+        proxy_key_id: null,
       };
     }
-    return {
+    if (mode === "none") {
+      return {
+        proxy: proxyUrl.trim(),
+        proxy_provider: "none",
+        proxy_provider_key: "",
+        proxy_account_id: null,
+        proxy_key_id: null,
+      };
+    }
+
+    const base: Partial<ProfileCreateData> = {
       proxy: null,
-      proxy_provider: "tmproxy",
-      proxy_provider_key: providerKey.trim(),
-      tmproxy_location_id: tmLocation,
-      tmproxy_isp_id: tmIsp,
+      proxy_provider: mode,
+      proxy_provider_key: "",
+      proxy_account_id: null,
+      proxy_key_id: null,
+      proxy_rotation_mode: rotationMode,
+      ...(mode === "kiotproxy"
+        ? { kiotproxy_region: kiotRegion }
+        : { tmproxy_location_id: tmLocation, tmproxy_isp_id: tmIsp }),
+    };
+    if (keySource === "manual") {
+      return { ...base, proxy_provider_key: providerKey.trim() };
+    }
+    if (keySource === "random") {
+      return { ...base, proxy_key_id: "random" };
+    }
+    const [accountId, ...rest] = keyChoice.split("::");
+    return {
+      ...base,
+      proxy_account_id: accountId,
+      proxy_key_id: rest.join("::") || accountId,
     };
   };
 
@@ -209,9 +305,7 @@ export function ProxyAssignDialog({
     const ok = chosen.length - failed.length;
     if (failed.length === 0) {
       toast.success(
-        mode === "direct"
-          ? `Đã bỏ proxy cho ${ok} hồ sơ`
-          : `Đã gán proxy cho ${ok} hồ sơ`,
+        mode === "direct" ? `Đã bỏ proxy cho ${ok} hồ sơ` : `Đã gán proxy cho ${ok} hồ sơ`,
         "Proxy mới có hiệu lực từ lần khởi chạy tiếp theo.",
       );
       close();
@@ -240,7 +334,7 @@ export function ProxyAssignDialog({
               Gán proxy hàng loạt
             </h2>
             <p className="mt-0.5 text-xs text-fg-muted">
-              Cùng một proxy hoặc cùng một API key cho nhiều hồ sơ. Không cần mở từng hồ sơ.
+              Cùng một proxy hoặc cùng một key cho nhiều hồ sơ. Không cần mở từng hồ sơ.
             </p>
           </div>
           <button
@@ -277,12 +371,22 @@ export function ProxyAssignDialog({
                           : "border-line bg-surface-2/40 hover:border-line-strong hover:bg-surface-2/70"
                       }`}
                     >
-                      <Icon className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 ${active ? "text-brand-fg" : "text-fg-muted"}`} />
+                      <Icon
+                        className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 ${
+                          active ? "text-brand-fg" : "text-fg-muted"
+                        }`}
+                      />
                       <span className="min-w-0">
-                        <span className={`block text-xs font-medium ${active ? "text-fg" : "text-fg-secondary"}`}>
+                        <span
+                          className={`block text-xs font-medium ${
+                            active ? "text-fg" : "text-fg-secondary"
+                          }`}
+                        >
                           {label}
                         </span>
-                        <span className="mt-0.5 block text-2xs leading-snug text-fg-muted">{hint}</span>
+                        <span className="mt-0.5 block text-2xs leading-snug text-fg-muted">
+                          {hint}
+                        </span>
                       </span>
                     </button>
                   );
@@ -318,41 +422,159 @@ export function ProxyAssignDialog({
                   </button>
                 </div>
                 {test && !testing && (
-                  <p className={`mt-1.5 text-xs font-medium ${test.ok ? "text-success" : "text-danger"}`}>
+                  <p
+                    className={`mt-1.5 text-xs font-medium ${
+                      test.ok ? "text-success" : "text-danger"
+                    }`}
+                  >
                     {test.ok ? "✓ " : ""}
                     {test.text}
                   </p>
                 )}
                 <p className="mt-2 text-2xs leading-relaxed text-fg-muted">
-                  Một proxy thủ công dùng chung được cho nhiều hồ sơ, kể cả khi chạy cùng lúc.
-                  Manager chỉ hiển thị host, không hiển thị tên đăng nhập hay mật khẩu.
+                  Một proxy thủ công dùng chung được cho nhiều hồ sơ, kể cả khi chạy
+                  cùng lúc. Manager chỉ hiển thị host, không hiển thị tên đăng nhập hay
+                  mật khẩu.
                 </p>
               </div>
             )}
 
-            {(mode === "kiotproxy" || mode === "tmproxy") && (
+            {providerMode && (
               <div className="space-y-3">
                 <div>
-                  <label className="label" htmlFor="bulk-provider-key">
-                    API key {mode === "kiotproxy" ? "KiotProxy" : "TMProxy"}
+                  <p className="label">Key nguồn</p>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(
+                      [
+                        { key: "random", label: "Ngẫu nhiên" },
+                        { key: "specific", label: "Ghim key" },
+                        { key: "manual", label: "Dán tay" },
+                      ] as { key: KeySource; label: string }[]
+                    ).map((item) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        aria-pressed={keySource === item.key}
+                        onClick={() => setKeySource(item.key)}
+                        className={`rounded-md border px-2 py-1.5 text-xs transition-colors ${
+                          keySource === item.key
+                            ? "border-brand/40 bg-brand-subtle font-medium text-fg"
+                            : "border-line bg-surface-2/40 text-fg-secondary hover:border-line-strong"
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {keySource !== "manual" && (
+                  <div>
+                    {keySource === "specific" ? (
+                      <select
+                        className="input text-xs"
+                        aria-label="Key đã lưu"
+                        value={keyChoice}
+                        onChange={(e) => setKeyChoice(e.target.value)}
+                        disabled={keysLoading}
+                      >
+                        <option value="">
+                          {keysLoading ? "Đang tải key…" : "Chọn key đã lưu…"}
+                        </option>
+                        {groupedKeys.map((group) => (
+                          <optgroup key={group.id} label={group.label}>
+                            {group.options.map((option) => {
+                              if (option.error) {
+                                return (
+                                  <option
+                                    key={`${option.account_id}-error`}
+                                    value={`__error_${option.account_id}`}
+                                    disabled
+                                  >
+                                    {group.label}: {option.error}
+                                  </option>
+                                );
+                              }
+                              const value = `${option.account_id}::${option.key_id ?? ""}`;
+                              return (
+                                <option
+                                  key={value}
+                                  value={value}
+                                  disabled={!option.key_id || option.in_use}
+                                >
+                                  {option.key_masked ?? option.key_id ?? "key"}
+                                  {option.status ? ` · ${option.status}` : ""}
+                                  {option.in_use ? " · đang dùng" : ""}
+                                  {option.cooldown_remaining > 0
+                                    ? ` · chờ ${option.cooldown_remaining}s`
+                                    : ""}
+                                </option>
+                              );
+                            })}
+                          </optgroup>
+                        ))}
+                      </select>
+                    ) : (
+                      <p className="rounded-lg border border-line bg-surface-2/40 px-3 py-2 text-2xs leading-relaxed text-fg-muted">
+                        Mỗi lần mở, Manager chọn key còn trống và chưa bị hồ sơ khác
+                        giữ. {availableKeys.length} key khả dụng.
+                      </p>
+                    )}
+                    {keysError && (
+                      <p className="mt-1.5 text-2xs font-medium text-danger">{keysError}</p>
+                    )}
+                  </div>
+                )}
+
+                {keySource === "manual" && (
+                  <div>
+                    <label className="label" htmlFor="bulk-provider-key">
+                      API key {mode === "kiotproxy" ? "KiotProxy" : "TMProxy"}
+                    </label>
+                    <input
+                      id="bulk-provider-key"
+                      className="input font-mono text-xs"
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={providerKey}
+                      onChange={(e) => setProviderKey(e.target.value)}
+                      placeholder="Dán key của nhà cung cấp"
+                    />
+                    <p className="mt-1.5 flex items-start gap-1.5 text-2xs leading-relaxed text-fg-muted">
+                      <AlertTriangle className="mt-0.5 h-3 w-3 flex-shrink-0 text-warning" />
+                      <span>
+                        Key dán tay được lưu vào từng hồ sơ và không hiển thị lại. Nếu
+                        gán cùng key cho nhiều hồ sơ, chúng không thể chạy đồng thời.
+                      </span>
+                    </p>
+                  </div>
+                )}
+
+                <div>
+                  <label className="label" htmlFor="bulk-rotation-mode">
+                    Chế độ đổi IP
                   </label>
-                  <input
-                    id="bulk-provider-key"
-                    className="input font-mono text-xs"
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={providerKey}
-                    onChange={(e) => setProviderKey(e.target.value)}
-                    placeholder="Dán key của nhà cung cấp"
-                  />
-                  <p className="mt-1.5 flex items-start gap-1.5 text-2xs leading-relaxed text-fg-muted">
-                    <AlertTriangle className="mt-0.5 h-3 w-3 flex-shrink-0 text-warning" />
-                    <span>
-                      Một API key chỉ cấp <span className="font-medium text-fg-secondary">một</span> proxy tại
-                      một thời điểm, nên chỉ nên chạy một hồ sơ trong nhóm này cùng lúc. Key được lưu vào
-                      từng hồ sơ và không hiển thị lại.
-                    </span>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {ROTATION_MODES.map((item) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        aria-pressed={rotationMode === item.key}
+                        onClick={() => setRotationMode(item.key)}
+                        title={item.hint}
+                        className={`rounded-md border px-2 py-1.5 text-xs transition-colors ${
+                          rotationMode === item.key
+                            ? "border-brand/40 bg-brand-subtle font-medium text-fg"
+                            : "border-line bg-surface-2/40 text-fg-secondary hover:border-line-strong"
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-1.5 text-2xs text-fg-muted">
+                    {ROTATION_MODES.find((item) => item.key === rotationMode)?.hint}
                   </p>
                 </div>
 
@@ -418,8 +640,8 @@ export function ProxyAssignDialog({
 
             {mode === "direct" && (
               <p className="rounded-lg border border-line bg-surface-2/40 px-3 py-2.5 text-xs text-fg-secondary">
-                Các hồ sơ đã chọn sẽ bỏ cấu hình proxy (thủ công hoặc nhà cung cấp) và đi trực tiếp
-                bằng IP của máy. Có thể gán lại proxy bất cứ lúc nào.
+                Các hồ sơ đã chọn sẽ bỏ cấu hình proxy (thủ công hoặc nhà cung cấp) và
+                đi trực tiếp bằng IP của máy. Có thể gán lại proxy bất cứ lúc nào.
               </p>
             )}
 
@@ -432,7 +654,8 @@ export function ProxyAssignDialog({
             {runningChosen > 0 && mode !== "direct" && (
               <p className="flex items-start gap-1.5 text-2xs text-warning">
                 <AlertTriangle className="mt-0.5 h-3 w-3 flex-shrink-0" />
-                {runningChosen} hồ sơ đang chạy sẽ giữ proxy hiện tại cho tới khi được khởi chạy lại.
+                {runningChosen} hồ sơ đang chạy sẽ giữ proxy hiện tại cho tới khi được
+                khởi chạy lại.
               </p>
             )}
 
@@ -485,7 +708,9 @@ export function ProxyAssignDialog({
             </div>
             <ul className="min-h-0 flex-1 overflow-y-auto p-1.5">
               {visible.length === 0 && (
-                <li className="px-2 py-6 text-center text-xs text-fg-muted">Không có hồ sơ khớp.</li>
+                <li className="px-2 py-6 text-center text-xs text-fg-muted">
+                  Không có hồ sơ khớp.
+                </li>
               )}
               {visible.map((p) => {
                 const checked = selected.has(p.id);
@@ -494,12 +719,16 @@ export function ProxyAssignDialog({
                   <li key={p.id}>
                     <label
                       className={`flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${
-                        checked ? "bg-brand-subtle text-fg" : "text-fg-secondary hover:bg-surface-3/60"
+                        checked
+                          ? "bg-brand-subtle text-fg"
+                          : "text-fg-secondary hover:bg-surface-3/60"
                       }`}
                     >
                       <span
                         className={`mt-0.5 flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded border ${
-                          checked ? "border-brand bg-brand text-white" : "border-line-strong bg-surface-0"
+                          checked
+                            ? "border-brand bg-brand text-white"
+                            : "border-line-strong bg-surface-0"
                         }`}
                         aria-hidden="true"
                       >
@@ -538,7 +767,12 @@ export function ProxyAssignDialog({
             <button type="button" className="btn-secondary" onClick={close} disabled={applying}>
               Hủy
             </button>
-            <button type="button" className="btn-primary" onClick={handleApply} disabled={!canApply}>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={handleApply}
+              disabled={!canApply}
+            >
               {applying && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
               {applying ? "Đang gán…" : `Gán cho ${chosen.length} hồ sơ`}
             </button>

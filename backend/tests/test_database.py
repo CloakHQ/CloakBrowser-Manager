@@ -373,3 +373,17 @@ def test_duplicate_profile_honours_new_id(tmp_db: Path):
     assert clone["id"] == pid
     assert clone["fingerprint_seed"] == 7
     assert Path(clone["user_data_dir"]).name == "Src (copy)"
+
+
+def test_duplicate_profile_keeps_the_saved_proxy_selection(tmp_db: Path):
+    src = db.create_profile(
+        name="Saved",
+        fingerprint_seed=7,
+        proxy_provider="kiotproxy",
+        proxy_account_id="account-1",
+        proxy_key_id="random",
+    )
+    clone = db.duplicate_profile(src["id"])
+    assert clone["proxy_account_id"] == "account-1"
+    assert clone["proxy_key_id"] == "random"
+    assert clone["proxy_provider_key"] is None

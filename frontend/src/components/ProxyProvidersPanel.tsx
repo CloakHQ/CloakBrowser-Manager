@@ -617,24 +617,24 @@ export function ProxyProvidersPanel() {
   const refresh = (id: string) => syncAccount(id);
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-6 py-5">
-      <div className="flex flex-wrap items-end justify-between gap-3">
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight text-fg">Nhà cung cấp proxy</h1>
-          <p className="mt-0.5 text-xs text-fg-muted">
+          <h1 className="text-xl font-bold tracking-tight text-fg">Nhà cung cấp proxy</h1>
+          <p className="mt-1 text-xs text-fg-muted">
             Quản lý key TMProxy và KiotProxy ở cấp tài khoản: xem hạn, gia hạn, đổi IP,
             mua hoặc xóa key.
           </p>
         </div>
       </div>
 
-      <div className="card space-y-3 p-4">
+      <div className="card space-y-4 p-5 shadow-card">
         <div className="flex items-center gap-2">
-          <Plus className="h-3.5 w-3.5 text-brand-fg" />
-          <h2 className="text-sm font-semibold text-fg">Thêm tài khoản</h2>
+          <Plus className="h-4 w-4 text-brand-fg" />
+          <h2 className="text-sm font-bold text-fg">Thêm tài khoản mới</h2>
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[10rem_1fr_1.4fr_auto]">
-          <label className="text-2xs text-fg-muted">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[11rem_1fr_1.5fr_auto]">
+          <label className="text-xs font-semibold text-fg-muted">
             Nhà cung cấp
             <select
               className="input mt-1 w-full text-xs"
@@ -645,8 +645,8 @@ export function ProxyProvidersPanel() {
               <option value="tmproxy">TMProxy</option>
             </select>
           </label>
-          <label className="text-2xs text-fg-muted">
-            Tên gợi nhớ
+          <label className="text-xs font-semibold text-fg-muted">
+            Tên gợi nhớ (nhãn)
             <input
               className="input mt-1 w-full text-xs"
               value={label}
@@ -655,7 +655,7 @@ export function ProxyProvidersPanel() {
               maxLength={200}
             />
           </label>
-          <label className="text-2xs text-fg-muted">
+          <label className="text-xs font-semibold text-fg-muted">
             {provider === "kiotproxy" ? "API token KiotProxy" : "API key TMProxy"}
             <input
               type="password"
@@ -674,33 +674,33 @@ export function ProxyProvidersPanel() {
             type="button"
             onClick={handleAdd}
             disabled={adding || !secret.trim()}
-            className="btn-primary self-end px-3 py-1.5 text-xs"
+            className="btn-primary self-end h-9 px-4 text-xs font-semibold"
           >
-            {adding ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
-            Thêm
+            {adding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+            <span>Thêm tài khoản</span>
           </button>
         </div>
-        <p className="text-2xs text-fg-muted">
-          KiotProxy cần <span className="font-medium text-fg-secondary">API token tài khoản</span>{" "}
+        <p className="text-xs text-fg-muted">
+          KiotProxy cần <span className="font-semibold text-fg-secondary">API token tài khoản</span>{" "}
           (dùng để liệt kê/gia hạn/mua key). Key proxy dán vào hồ sơ vẫn dùng như cũ.
         </p>
-        {error && <p className="text-xs text-danger">{error}</p>}
+        {error && <p className="text-xs text-danger font-medium">{error}</p>}
       </div>
 
       {loading && (
-        <div className="flex items-center gap-2 text-xs text-fg-muted">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          Đang tải tài khoản proxy…
+        <div className="flex items-center gap-2 text-xs text-fg-muted py-4">
+          <Loader2 className="h-4 w-4 animate-spin text-brand-fg" />
+          <span>Đang tải danh sách tài khoản proxy…</span>
         </div>
       )}
 
       {!loading && accounts.length === 0 && (
-        <div className="empty-state">
-          <div className="mb-2 flex h-14 w-14 items-center justify-center rounded-2xl border border-info/30 bg-info/10">
-            <Globe className="h-7 w-7 text-info" />
+        <div className="empty-state card p-12">
+          <div className="mb-2 flex h-14 w-14 items-center justify-center rounded-2xl border border-info/30 bg-info/10 text-info">
+            <Globe className="h-7 w-7" />
           </div>
-          <p className="text-base font-semibold text-fg">Chưa có tài khoản proxy</p>
-          <p className="max-w-md text-sm text-fg-secondary">
+          <p className="text-base font-bold text-fg">Chưa có tài khoản proxy</p>
+          <p className="max-w-md text-xs text-fg-muted mt-1">
             Thêm API token KiotProxy hoặc API key TMProxy để xem danh sách key và hạn sử
             dụng ngay tại đây.
           </p>
@@ -711,26 +711,26 @@ export function ProxyProvidersPanel() {
         {accounts.map((account) => {
           const state = syncs[account.id];
           return (
-            <section key={account.id} className="card overflow-hidden">
-              <header className="flex flex-wrap items-center gap-2.5 border-b border-line px-4 py-3">
+            <section key={account.id} className="card overflow-hidden shadow-card">
+              <header className="flex flex-wrap items-center gap-3 border-b border-line/80 bg-surface-2/40 px-4.5 py-3">
                 <span className="badge badge-info">
                   {PROVIDER_LABEL[account.provider] ?? account.provider}
                 </span>
                 <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-fg">
+                  <p className="truncate text-xs font-bold text-fg">
                     {account.label || account.secret_masked || account.id}
                   </p>
-                  <p className="font-mono text-2xs text-fg-muted">{account.secret_masked}</p>
+                  <p className="font-mono text-[11px] text-fg-muted">{account.secret_masked}</p>
                 </div>
-                <div className="ml-auto flex items-center gap-1.5">
+                <div className="ml-auto flex items-center gap-2">
                   <button
                     type="button"
                     onClick={() => refresh(account.id)}
-                    className="btn-secondary px-2 py-1 text-2xs"
+                    className="btn-secondary h-7 px-2.5 text-xs"
                     title="Tải lại dữ liệu từ nhà cung cấp"
                   >
                     <RefreshCw className="h-3 w-3" />
-                    Làm mới
+                    <span>Làm mới</span>
                   </button>
                   <button
                     type="button"
@@ -741,16 +741,16 @@ export function ProxyProvidersPanel() {
                         )
                         .catch(() => undefined)
                     }
-                    className="btn-ghost px-2 py-1 text-2xs"
+                    className="btn-ghost h-7 px-2.5 text-xs"
                     title="Mở trang quản lý của nhà cung cấp"
                   >
                     <ExternalLink className="h-3 w-3" />
-                    Trang chủ
+                    <span>Trang chủ</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => handleDelete(account)}
-                    className="rounded p-1 text-fg-muted transition-colors hover:bg-danger/10 hover:text-danger"
+                    className="rounded-lg p-1.5 text-fg-muted transition-colors hover:bg-danger/10 hover:text-danger"
                     title="Xóa khỏi Manager"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -758,7 +758,7 @@ export function ProxyProvidersPanel() {
                 </div>
               </header>
 
-              <div className="p-4">
+              <div className="p-4.5">
                 {!state && (
                   <div className="flex items-center gap-2 text-xs text-fg-muted">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -766,7 +766,7 @@ export function ProxyProvidersPanel() {
                   </div>
                 )}
                 {isError(state) && (
-                  <p className="text-xs text-danger">
+                  <p className="text-xs text-danger font-medium">
                     Không tải được dữ liệu: {state.error}
                   </p>
                 )}
@@ -790,9 +790,9 @@ export function ProxyProvidersPanel() {
         })}
       </div>
 
-      <p className="flex items-center gap-1.5 text-2xs text-fg-muted">
-        <KeyRound className="h-3 w-3" />
-        Thông tin key/tài khoản chỉ lưu trên máy này và không được trả lại nguyên văn qua API.
+      <p className="flex items-center gap-1.5 text-xs text-fg-muted">
+        <KeyRound className="h-3.5 w-3.5 text-brand-fg" />
+        <span>Thông tin key/tài khoản chỉ lưu trên máy này và không được trả lại nguyên văn qua API.</span>
       </p>
     </div>
   );

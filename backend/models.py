@@ -24,6 +24,9 @@ class ProfileCreate(BaseModel):
     # at launch; a concrete id pins one key. Null on both = use the raw key.
     proxy_account_id: str | None = None
     proxy_key_id: str | None = None
+    # per_launch = rotate on every launch; sticky = reuse the current proxy until
+    # it expires or the user rotates; manual = only rotate on explicit request.
+    proxy_rotation_mode: Literal["per_launch", "sticky", "manual"] = "per_launch"
     kiotproxy_region: Literal["bac", "trung", "nam", "random"] = "random"
     tmproxy_location_id: int = 0
     tmproxy_isp_id: int = 0
@@ -65,6 +68,7 @@ class ProfileUpdate(BaseModel):
     # Omitted = unchanged; null/"" = clear the saved account/key selection.
     proxy_account_id: str | None = Field(default=None)
     proxy_key_id: str | None = Field(default=None)
+    proxy_rotation_mode: Literal["per_launch", "sticky", "manual"] | None = None
     kiotproxy_region: Literal["bac", "trung", "nam", "random"] | None = None
     tmproxy_location_id: int | None = None
     tmproxy_isp_id: int | None = None
@@ -148,6 +152,7 @@ class ProfileResponse(BaseModel):
     proxy_provider_key_masked: str | None = None
     proxy_account_id: str | None = None
     proxy_key_id: str | None = None
+    proxy_rotation_mode: str = "per_launch"
     kiotproxy_region: str = "random"
     tmproxy_location_id: int = 0
     tmproxy_isp_id: int = 0
@@ -339,7 +344,21 @@ class ProxyProviderInfo(BaseModel):
     expires_at: int | str | None = None
     ttl: int | None = None
     ttc: int | None = None
-    next_request_at: int | None = None
+    next_request_at: int | str | None = None
+
+
+class ProxyRotationState(BaseModel):
+    mode: Literal["per_launch", "sticky", "manual"] = "per_launch"
+    cooldown_remaining: int = 0
+    usable: bool = False
+    running: bool = False
+    can_rotate: bool = False
+    blocked_reason: str | None = None
+    eligible_key_count: int = 0
+    key_id: str | None = None
+    key_masked: str | None = None
+    account_id: str | None = None
+    info: ProxyProviderInfo | None = None
 
 
 class TmProxyOption(BaseModel):
@@ -421,8 +440,11 @@ class ProxyKeyOption(BaseModel):
     account_masked: str | None = None
     key_id: str | None = None
     key_masked: str | None = None
+    fingerprint: str | None = None
     status: str | None = None
     expiration_at: int | str | None = None
+    cooldown_remaining: int = 0
+    eligible: bool = False
     in_use: bool = False
     error: str | None = None
 

@@ -522,6 +522,7 @@ class RunningProfile:
     proxy_provider: str | None = None
     proxy_provider_key: str | None = None
     proxy_provider_fingerprint: str | None = None
+    proxy_rotation_mode: str | None = None
     proxy_info: dict[str, Any] | None = None
 
 
@@ -980,54 +981,36 @@ class BrowserManager:
 
     async def _claim_proxy(
         self, profile: dict[str, Any]
-    ) -> tuple[dict[str, Any] | None, str | None, str | None, str | None]:
-        """Fetch a fresh proxy from the profile's provider, or return no proxy.
+    ) -> tuple[
+        dict[str, Any] | None, str | None, str | None, str | None, str | None
+    ]:
+        """Fetch or reuse a provider proxy, or return no proxy.
 
-        The provider key is reserved before the network call so two launches
-        racing on the same key cannot both receive a proxy. A failed fetch
-        releases the reservation again.
+        Saved keys are selected under the provider's cooldown; a random key is
+        retried if another launch won the same free key in the meantime.
         """
-        from . import proxy_key_source, proxy_providers
+        from . import proxy_key_source, proxy_providers, proxy_rotation
 
         provider = (profile.get("proxy_provider") or "none").strip().lower()
         if provider not in ("kiotproxy", "tmproxy"):
-            return None, None, None, None
+            return None, None, None, None, None
         profile_id = profile["id"]
-        key = (profile.get("proxy_provider_key") or "").strip()
+        random_selection = (
+            proxy_key_source.uses_saved_selection(profile)
+            and proxy_key_source.is_random_selection(profile)
+        )
 
-        if not proxy_key_source.uses_saved_selection(profile):
-            if not key:
-                raise ValueError(
-                    f"{provider} is selected but no API key is configured"
-                )
-            fingerprint = self._proxy_fingerprint(provider, key)
-            async with self._lock:
-                for owner, held in self._proxy_leases.items():
-                    if held == fingerprint and owner != profile_id:
-                        raise ValueError(
-                            f"The {provider} key is already in use by running profile {owner}. "
-                            "Each provider key can hand out one proxy at a time; use another key."
-                        )
-                self._proxy_leases[profile_id] = fingerprint
-        else:
-            selected = False
-            for _ in range(3):
-                exclude = await self.proxy_key_fingerprints(exclude_profile=profile_id)
-                try:
-                    key = await proxy_key_source.resolve_profile_key(
-                        profile, exclude_fingerprints=exclude
-                    )
-                except proxy_key_source.NoAvailableProxyKey as exc:
-                    raise ValueError(str(exc)) from exc
-                except proxy_providers.ProxyProviderError as exc:
-                    raise ValueError(str(exc)) from exc
-                fingerprint = self._proxy_fingerprint(provider, key)
+        for _ in range(3):
+            exclude = await self.proxy_key_fingerprints(exclude_profile=profile_id)
+            try:
+                selection = await proxy_rotation.choose(profile, exclude=exclude)
+                fingerprint = selection.fingerprint
                 async with self._lock:
                     conflict = any(
                         held == fingerprint and owner != profile_id
                         for owner, held in self._proxy_leases.items()
                     )
-                    if conflict and proxy_key_source.is_random_selection(profile):
+                    if conflict and random_selection:
                         continue
                     if conflict:
                         raise ValueError(
@@ -1035,42 +1018,48 @@ class BrowserManager:
                             "another running profile. Pick another key or use random."
                         )
                     self._proxy_leases[profile_id] = fingerprint
-                    selected = True
-                    break
-            if not selected:
-                raise ValueError(
-                    f"No free {provider} key is available. Every key is expired or "
-                    "already used by another running profile."
-                )
 
-        try:
-            info = await proxy_providers.new_for(
-                provider,
-                key,
-                region=profile.get("kiotproxy_region") or "random",
-                location_id=int(profile.get("tmproxy_location_id") or 0),
-                isp_id=int(profile.get("tmproxy_isp_id") or 0),
-            )
-        except proxy_providers.ProxyProviderError as exc:
-            self._proxy_leases.pop(profile_id, None)
-            raise ValueError(str(exc)) from exc
-        except BaseException:
-            self._proxy_leases.pop(profile_id, None)
-            raise
-        if not info.get("http"):
-            self._proxy_leases.pop(profile_id, None)
-            raise ValueError(f"{provider} did not return an HTTP proxy")
-        return info, provider, key, fingerprint
+                info, selection, mode, _rotated = await proxy_rotation.acquire(
+                    profile,
+                    exclude_fingerprints=exclude,
+                    selection=selection,
+                )
+            except (
+                proxy_key_source.NoAvailableProxyKey,
+                proxy_rotation.ProxyRotationError,
+                proxy_providers.ProxyProviderError,
+                ValueError,
+            ) as exc:
+                self._proxy_leases.pop(profile_id, None)
+                raise ValueError(str(exc)) from exc
+
+            fingerprint = selection.fingerprint
+            if not info.get("http"):
+                self._proxy_leases.pop(profile_id, None)
+                raise ValueError(f"{provider} did not return an HTTP proxy")
+            return info, provider, selection.key, fingerprint, mode
+
+        raise ValueError(
+            f"No free {provider} key is available. Every key is expired or "
+            "already used by another running profile."
+        )
 
     async def _release_proxy(
-        self, profile_id: str, provider: str | None, key: str | None
+        self,
+        profile_id: str,
+        provider: str | None,
+        key: str | None,
+        mode: str | None = None,
+        *,
+        clear: bool = False,
     ) -> None:
-        """Detach the provider proxy (KiotProxy) and free its in-memory lease."""
-        from . import proxy_providers
+        """Release the provider proxy, keeping a sticky/manual profile's IP."""
+        from . import proxy_rotation
 
         try:
-            if provider and key:
-                await proxy_providers.release_for(provider, key)
+            await proxy_rotation.release(
+                profile_id, provider, key, mode, clear=clear
+            )
         except Exception as exc:  # noqa: BLE001 - teardown must never fail on this
             logger.warning("Could not release %s proxy for %s: %s", provider, profile_id, exc)
         finally:
@@ -1131,6 +1120,7 @@ class BrowserManager:
         proxy_provider: str | None = None
         proxy_provider_key: str | None = None
         proxy_provider_fingerprint: str | None = None
+        proxy_rotation_mode: str | None = None
         try:
             if self.runtime.viewer_mode == "vnc":
                 display, ws_port = await self.vnc.allocate()
@@ -1149,9 +1139,13 @@ class BrowserManager:
             # proxy field. Claimed before anything that spawns a browser so the
             # one-time search-engine launch rides the same exit IP as the real
             # launch — and keeps the lease in this launch's failure path.
-            proxy_info, proxy_provider, proxy_provider_key, proxy_provider_fingerprint = (
-                await self._claim_proxy(profile)
-            )
+            (
+                proxy_info,
+                proxy_provider,
+                proxy_provider_key,
+                proxy_provider_fingerprint,
+                proxy_rotation_mode,
+            ) = await self._claim_proxy(profile)
             raw_proxy = (proxy_info or {}).get("http") or profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
@@ -1187,8 +1181,12 @@ class BrowserManager:
                     + ", ".join(conflicting_debug_args)
                 )
 
+            # Headless is the Manager's own toggle, not an opaque Chrome switch,
+            # so it is read off the profile's launch args, passed as one, and not
+            # duplicated into the command line.
+            headless = any(arg == "--headless" for arg in user_launch_args)
             extra_args = self._build_fingerprint_args(profile)
-            extra_args += user_launch_args
+            extra_args += [arg for arg in user_launch_args if arg != "--headless"]
             extra_args.append("--remote-debugging-address=127.0.0.1")
             # Transparent mode and --license-route only recognise a proxy that
             # arrived as --proxy-server; add it for the credential-free HTTP case
@@ -1212,7 +1210,7 @@ class BrowserManager:
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
-                "headless": False,
+                "headless": headless,
                 "proxy": proxy,
                 "args": extra_args,
                 "timezone": profile.get("timezone") or None,
@@ -1340,6 +1338,7 @@ class BrowserManager:
                 proxy_provider=proxy_provider,
                 proxy_provider_key=proxy_provider_key,
                 proxy_provider_fingerprint=proxy_provider_fingerprint,
+                proxy_rotation_mode=proxy_rotation_mode,
                 proxy_info=proxy_info,
             )
             context.on(
@@ -1419,7 +1418,9 @@ class BrowserManager:
             finally:
                 async with self._lock:
                     self._release_license_key(profile_id, cooldown=grace)
-                await self._release_proxy(profile_id, proxy_provider, proxy_provider_key)
+                await self._release_proxy(
+                    profile_id, proxy_provider, proxy_provider_key, proxy_rotation_mode
+                )
                 self._release_stopping(profile_id)
             raise
 
@@ -1702,7 +1703,10 @@ class BrowserManager:
             # releases the seat outright, a death cools the key down first.
             self._release_license_key(running.profile_id, cooldown=grace_seconds)
             await self._release_proxy(
-                running.profile_id, running.proxy_provider, running.proxy_provider_key
+                running.profile_id,
+                running.proxy_provider,
+                running.proxy_provider_key,
+                running.proxy_rotation_mode,
             )
 
     async def _on_browser_closed(self, running: RunningProfile):

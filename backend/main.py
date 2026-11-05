@@ -43,6 +43,8 @@ from . import key_pool
 from . import proxy_accounts
 from . import proxy_key_source
 from . import proxy_providers
+from . import proxy_rotation
+from . import proxy_state
 from .proxy_providers import ProxyProviderError
 from cloakbrowser.license import CloakBrowserLicenseError
 
@@ -83,6 +85,7 @@ from .models import (
     ProxyKeyRevealResponse,
     ProxyKeyRotateRequest,
     ProxyProviderInfo,
+    ProxyRotationState,
     ProxyTestRequest,
     ProxyTestResponse,
     ReorderRequest,
@@ -827,43 +830,132 @@ async def _profile_provider_key(
     "/api/profiles/{profile_id}/proxy/current", response_model=ProxyProviderInfo
 )
 async def profile_current_proxy_endpoint(profile_id: str):
-    """The proxy the profile's provider key is holding right now, without rotating.
-
-    The provider form used to ask the user to retype the API key just to look at
-    the proxy it already had, which is exactly the "does this key still work?"
-    question the key is stored to answer. The stored key never leaves the
-    process: this reads it server-side by id.
-    """
+    """The proxy the profile's key currently holds, without rotating it."""
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    provider, key = await _profile_provider_key(profile, allow_random=False)
+    provider = (profile.get("proxy_provider") or "none").strip().lower()
+    if provider not in ("kiotproxy", "tmproxy"):
+        raise HTTPException(status_code=400, detail="Profile has no proxy provider")
+
+    local = await proxy_rotation.state_for(profile)
+    if local:
+        return ProxyProviderInfo(
+            provider=provider,
+            host=local.get("host"),
+            real_ip=local.get("real_ip"),
+            location=local.get("location"),
+            isp=local.get("isp"),
+            expires_at=local.get("expires_at"),
+            ttl=local.get("ttl"),
+            ttc=local.get("ttc"),
+            next_request_at=local.get("next_request_at"),
+        )
+
+    provider_name, key = await _profile_provider_key(profile, allow_random=False)
     try:
-        info = await proxy_providers.current_for(provider, key)
+        info = await proxy_providers.current_for(provider_name, key)
     except ProxyProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if proxy_key_source.uses_saved_selection(profile):
+        proxy_state.set_current(
+            proxy_key_source.key_fingerprint(provider_name, key),
+            provider_name,
+            account_id=profile.get("proxy_account_id"),
+            key_id=profile.get("proxy_key_id"),
+            info=info,
+            rotated=False,
+        )
     return _provider_info_response(info)
+
+
+@app.get(
+    "/api/profiles/{profile_id}/proxy/state", response_model=ProxyRotationState
+)
+async def profile_proxy_state_endpoint(profile_id: str):
+    """Rotation mode, cooldown and the locally known exit IP for the form."""
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    state = await proxy_rotation.state_for(profile)
+    running = browser_mgr.is_active(profile_id)
+    cooldown = int((state or {}).get("cooldown_remaining") or 0)
+
+    eligible = 0
+    if (profile.get("proxy_provider") or "none") in ("kiotproxy", "tmproxy"):
+        used = await browser_mgr.proxy_key_fingerprints(exclude_profile=profile_id)
+        try:
+            options = await proxy_key_source.available_options(
+                profile["proxy_provider"], in_use=used
+            )
+        except ValueError:
+            options = []
+        eligible = sum(1 for option in options if option.get("eligible"))
+
+    if running:
+        can_rotate, blocked = False, "Dừng hồ sơ trước khi đổi IP"
+    elif eligible == 0 and cooldown > 0:
+        can_rotate, blocked = False, f"Tất cả key đang chờ · gần nhất {cooldown}s"
+    elif eligible == 0 and (state or {}).get("info"):
+        can_rotate, blocked = False, "Không có key khả dụng để đổi IP"
+    else:
+        can_rotate, blocked = True, None
+
+    return ProxyRotationState(
+        mode=proxy_rotation.mode_for(profile),
+        cooldown_remaining=cooldown,
+        usable=bool((state or {}).get("usable")),
+        running=running,
+        can_rotate=can_rotate,
+        blocked_reason=blocked,
+        eligible_key_count=eligible,
+        key_id=(state or {}).get("key_id"),
+        key_masked=(state or {}).get("key_masked"),
+        account_id=(state or {}).get("account_id"),
+        info=(
+            ProxyProviderInfo(
+                provider=(state or {}).get("provider") or "",
+                host=(state or {}).get("host"),
+                real_ip=(state or {}).get("real_ip"),
+                location=(state or {}).get("location"),
+                isp=(state or {}).get("isp"),
+                expires_at=(state or {}).get("expires_at"),
+                ttl=(state or {}).get("ttl"),
+                ttc=(state or {}).get("ttc"),
+                next_request_at=(state or {}).get("next_request_at"),
+            )
+            if state
+            else None
+        ),
+    )
 
 
 @app.post(
     "/api/profiles/{profile_id}/proxy/new", response_model=ProxyProviderInfo
 )
 async def profile_new_proxy_endpoint(profile_id: str):
-    """Fetch a fresh proxy for the profile without launching its browser."""
+    """Rotate the profile's proxy now, respecting the provider's cooldown."""
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
-    provider, key = await _profile_provider_key(
-        profile, allow_random=True
-    )
-    try:
-        info = await proxy_providers.new_for(
-            provider,
-            key,
-            region=profile.get("kiotproxy_region") or "random",
-            location_id=int(profile.get("tmproxy_location_id") or 0),
-            isp_id=int(profile.get("tmproxy_isp_id") or 0),
+    if browser_mgr.is_active(profile_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the profile before rotating its proxy",
         )
+    exclude = await browser_mgr.proxy_key_fingerprints(exclude_profile=profile_id)
+    try:
+        info, _selection, _mode, _rotated = await proxy_rotation.acquire(
+            profile, exclude_fingerprints=exclude, force_rotate=True
+        )
+    except proxy_key_source.ProxyRotationCooldown as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    except proxy_key_source.NoAvailableProxyKey as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ProxyProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return _provider_info_response(info)
@@ -931,6 +1023,7 @@ async def create_proxy_account(req: ProxyAccountCreate):
 async def delete_proxy_account(account_id: str):
     if not proxy_accounts.delete_account(account_id):
         raise HTTPException(status_code=404, detail="Proxy account not found")
+    proxy_state.clear_account(account_id)
     return {"ok": True}
 
 
@@ -1255,10 +1348,13 @@ async def delete_profile(profile_id: str):
 
     user_data_dir = Path(profile["user_data_dir"])
 
+    await proxy_rotation.release_profile(profile)
+
     try:
         async with browser_mgr.hold_stopped(profile_id):
             # DB first — if this fails, filesystem is untouched
             db.delete_profile(profile_id)
+            proxy_rotation.clear_profile(profile_id)
             # Then clean up disk
             if user_data_dir.exists():
                 shutil.rmtree(user_data_dir, ignore_errors=True)

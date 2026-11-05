@@ -74,7 +74,7 @@ export default {
       },
       spacing: {
         rail: "3.25rem",
-        sidebar: "18.5rem",
+        sidebar: "16.5rem",
         topbar: "3.5rem",
         statusbar: "1.875rem",
       },

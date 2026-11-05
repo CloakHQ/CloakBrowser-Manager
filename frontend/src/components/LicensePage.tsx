@@ -30,55 +30,61 @@ export function LicensePage({ status }: LicensePageProps) {
   const plan = status?.license_plan ?? null;
 
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-col gap-5 px-6 py-5">
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-6">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight text-fg">Bản quyền</h1>
-        <p className="mt-0.5 text-xs text-fg-muted">
-          Mỗi hồ sơ đang chạy dùng một key. Kho key cho phép nhiều hồ sơ chạy song song.
+        <h1 className="text-xl font-bold tracking-tight text-fg">Quản lý bản quyền</h1>
+        <p className="mt-1 text-xs text-fg-muted">
+          Mỗi hồ sơ đang chạy dùng trọn một key. Kho key cho phép khởi chạy song song nhiều hồ sơ cùng lúc.
         </p>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
         <StatCard
-          icon={<ShieldCheck className="h-3.5 w-3.5" />}
-          iconClass="bg-brand/10 border-brand/20 text-brand-fg"
+          icon={<ShieldCheck className="h-4 w-4" />}
+          iconClass="bg-brand/10 border-brand/25 text-brand-fg"
           label="Gói hiện tại"
-          value={<span className="text-lg">{TIER_LABEL[tier] ?? tier}</span>}
+          value={<span className="text-lg font-bold">{TIER_LABEL[tier] ?? tier}</span>}
           caption={plan ? `gói: ${plan === "free" ? "miễn phí" : plan}` : "chưa xác định"}
         />
         <StatCard
-          icon={<KeyRound className="h-3.5 w-3.5" />}
-          iconClass="bg-info/10 border-info/20 text-info"
+          icon={<KeyRound className="h-4 w-4" />}
+          iconClass="bg-info/10 border-info/25 text-info"
           label="Kho key"
-          value={current?.key_pool_size ?? 0}
+          value={<span className="font-bold">{current?.key_pool_size ?? 0}</span>}
           caption="key dùng cho các hồ sơ đang chạy"
         />
       </div>
 
-      <section className="card p-4" aria-labelledby="pool-heading">
-        <h2 id="pool-heading" className="mb-3 text-sm font-semibold text-fg">
-          Kho key dùng chung
-        </h2>
+      <section className="card p-5 shadow-card" aria-labelledby="pool-heading">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 id="pool-heading" className="text-sm font-bold text-fg">
+              Kho key dùng chung
+            </h2>
+            <p className="text-xs text-fg-muted mt-0.5">
+              Hệ thống tự động cấp phát key trống cho các hồ sơ khi khởi chạy.
+            </p>
+          </div>
+        </div>
         <KeyPoolPanel />
-        <p className="mt-3 text-xs leading-relaxed text-fg-muted">
-          Mỗi hồ sơ đang chạy giữ một key trong kho. Hết key trống thì hồ sơ tiếp theo
-          phải chờ.{" "}
+        <div className="mt-4 flex items-center justify-between rounded-xl border border-line/80 bg-surface-2/40 px-3.5 py-2.5 text-xs text-fg-muted">
+          <span>Mỗi hồ sơ đang chạy giữ một key trong kho. Hết key trống thì hồ sơ tiếp theo phải chờ.</span>
           <a
             href="https://cloakbrowser.dev/free"
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-1 font-medium text-brand-fg hover:underline"
+            className="inline-flex items-center gap-1 font-semibold text-brand-fg hover:underline ml-3 flex-shrink-0"
           >
             <span>Lấy key miễn phí</span>
-            <ExternalLink className="h-3 w-3" />
+            <ExternalLink className="h-3.5 w-3.5" />
           </a>
-          .
-        </p>
+        </div>
       </section>
 
       {error && (
-        <div role="alert" className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger">
-          {error}
+        <div role="alert" className="rounded-xl border border-danger/30 bg-danger/10 p-3 text-xs text-danger flex items-center gap-2">
+          <span className="h-1.5 w-1.5 rounded-full bg-danger flex-shrink-0" />
+          <span>{error}</span>
         </div>
       )}
     </div>

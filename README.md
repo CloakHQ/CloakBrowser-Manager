@@ -219,7 +219,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Unlimited profiles, no per-profile tax** — create as many identities as you want. You pay only for how many run at the same time, not how many you keep. Dormant accounts cost nothing.
 - **Each profile is a different machine** — its own fingerprint seed, GPU family, screen, cookies, localStorage, cache, and history, persistent across restarts
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
-- **Rotating proxy providers** — pull a fresh proxy from KiotProxy or TMProxy on every launch instead of pasting one by hand
+- **Rotating proxy providers** — pull a fresh proxy from KiotProxy or TMProxy on every launch, keep one IP until it expires, or rotate only on demand; the Manager respects each provider's cooldown
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
 - **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage

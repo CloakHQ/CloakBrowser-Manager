@@ -143,28 +143,24 @@ export function KeyPoolPanel() {
       </div>
 
       {entries.length > 0 && (
-        <ul className="divide-y divide-line overflow-hidden rounded-lg border border-line bg-surface-1 text-xs">
+        <ul className="divide-y divide-line/60 overflow-hidden rounded-xl border border-line/80 bg-surface-1 text-xs">
           {entries.map((entry) => {
             const style = STATE_STYLE[entry.state] ?? UNKNOWN_STATE;
             const stateLabel = KEY_STATE_LABEL[entry.state] ?? KEY_STATE_LABEL.unknown;
-            // The server still counts this key's last session, so it can't be
-            // handed to a launch yet — and must not be deleted.
             const cooling =
               entry.available_at !== null && new Date(entry.available_at) > new Date();
             return (
               <li
                 key={entry.id}
-                className="flex items-center gap-2.5 px-3 py-2 hover:bg-surface-2/50 transition-colors"
+                className="flex items-center gap-2.5 px-3.5 py-2.5 hover:bg-surface-2/60 transition-colors"
               >
-                <span className="font-mono text-fg">{entry.key_masked}</span>
+                <span className="font-mono text-fg font-medium">{entry.key_masked}</span>
                 <span className={style}>{stateLabel}</span>
-                {/* The server reports a placeholder plan for a key it rejected;
-                    showing it next to "invalid" is just noise. */}
                 {entry.state === "valid" && entry.plan && (
-                  <span className="text-fg-muted">{entry.plan === "free" ? "miễn phí" : entry.plan}</span>
+                  <span className="text-fg-muted text-[11px] font-medium">{entry.plan === "free" ? "miễn phí" : entry.plan}</span>
                 )}
                 {entry.expires && <ExpiryNote expires={entry.expires} />}
-                <span className="ml-auto text-2xs text-fg-muted">
+                <span className="ml-auto text-[11px] text-fg-muted">
                   {cooling
                     ? "đang chờ"
                     : entry.leased_to
@@ -174,7 +170,7 @@ export function KeyPoolPanel() {
                 <button
                   onClick={() => handleDelete(entry.id)}
                   disabled={entry.leased_to !== null || cooling}
-                  className="rounded p-1 text-fg-muted hover:bg-danger/10 hover:text-danger disabled:opacity-30 transition-colors"
+                  className="rounded-lg p-1.5 text-fg-muted hover:bg-danger/10 hover:text-danger disabled:opacity-30 transition-colors"
                   title={
                     cooling
                       ? "Máy chủ vẫn tính phiên trước của key này; thử lại sau"
@@ -192,26 +188,26 @@ export function KeyPoolPanel() {
       )}
 
       <textarea
-        className="input font-mono h-16 resize-y text-xs"
+        className="input font-mono h-20 resize-y text-xs py-2 px-3 rounded-xl border-line/80"
         spellCheck={false}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
-        placeholder={"Mỗi dòng một key\ncb_…\ncb_…"}
+        placeholder={"Mỗi dòng một key bản quyền:\ncb_…\ncb_…"}
       />
-      <div className="flex items-center gap-2.5">
+      <div className="flex items-center gap-3">
         <button
           onClick={handleAdd}
           disabled={busy !== null || !draft.trim()}
-          className="btn-secondary flex items-center gap-1.5 text-xs py-1.5"
+          className="btn-primary flex items-center gap-1.5 text-xs h-8 px-3.5"
         >
-          {busy === "add" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
-          Thêm key
+          {busy === "add" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+          <span>Thêm key</span>
         </button>
-        <p className="text-2xs text-fg-muted">
-          Mỗi hồ sơ đang chạy cần một key. Key được kiểm tra khi thêm.
+        <p className="text-[11px] text-fg-muted">
+          Mỗi hồ sơ đang chạy cần một key. Key được kiểm tra trực tiếp khi thêm.
         </p>
       </div>
-      {error && <p className="text-xs text-danger">{error}</p>}
+      {error && <p className="text-xs text-danger font-medium">{error}</p>}
     </div>
   );
 }

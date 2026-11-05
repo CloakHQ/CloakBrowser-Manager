@@ -83,13 +83,16 @@ export function StatCard({
   caption: ReactNode;
 }) {
   return (
-    <div className="card p-4">
+    <div className="group relative overflow-hidden rounded-2xl border border-line/80 bg-surface-1/90 p-4 shadow-card backdrop-blur-md transition-all duration-200 hover:border-line-strong hover:shadow-elevated">
+      <div className="absolute -right-6 -top-6 h-20 w-20 rounded-full bg-brand/5 blur-xl pointer-events-none group-hover:bg-brand/10 transition-colors" />
       <div className="flex items-center justify-between">
-        <span className="text-xs font-medium text-fg-secondary">{label}</span>
-        <span className={`flex h-7 w-7 items-center justify-center rounded-lg border ${iconClass}`}>{icon}</span>
+        <span className="text-xs font-semibold uppercase tracking-wider text-fg-muted">{label}</span>
+        <span className={`flex h-8 w-8 items-center justify-center rounded-xl border shadow-sm transition-transform group-hover:scale-105 ${iconClass}`}>
+          {icon}
+        </span>
       </div>
-      <div className="mt-2 text-2xl font-semibold tracking-tight text-fg">{value}</div>
-      <div className="mt-0.5 truncate text-2xs text-fg-muted">{caption}</div>
+      <div className="mt-2.5 text-2xl font-bold tracking-tight text-fg">{value}</div>
+      <div className="mt-1 truncate text-xs text-fg-muted">{caption}</div>
     </div>
   );
 }

@@ -1072,6 +1072,77 @@ def test_random_key_has_no_current_proxy_before_launch(app_client: TestClient):
     assert "random key" in resp.json()["detail"]
 
 
+def test_proxy_state_reports_cooldown_and_blocks_rotation(
+    app_client: TestClient, monkeypatch
+):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "key-1",
+                    "value": "Kraw-secret",
+                    "value_masked": "Kraw…cret",
+                    "status": "ACTIVE",
+                    "expiration_at": int(time.time() * 1000) + 86_400_000,
+                    "deleted": False,
+                }
+            ]
+        ),
+    )
+    account = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+    profile = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "state",
+            "proxy_provider": "kiotproxy",
+            "proxy_account_id": account["id"],
+            "proxy_key_id": "key-1",
+            "proxy_rotation_mode": "sticky",
+        },
+    ).json()
+
+    now = int(time.time() * 1000)
+    main.proxy_state.set_current(
+        main.proxy_key_source.key_fingerprint("kiotproxy", "Kraw-secret"),
+        "kiotproxy",
+        account_id=account["id"],
+        key_id="key-1",
+        key_masked="Kraw…cret",
+        info={
+            "http": "http://user:pass@1.2.3.4:8080",
+            "real_ip": "1.2.3.4",
+            "host": "1.2.3.4",
+            "expires_at": now + 3_600_000,
+            "next_request_at": now + 45_000,
+        },
+    )
+    main.proxy_state.bind_profile(profile["id"], main.proxy_key_source.key_fingerprint("kiotproxy", "Kraw-secret"))
+
+    state = app_client.get(f"/api/profiles/{profile['id']}/proxy/state")
+    assert state.status_code == 200
+    body = state.json()
+    assert body["mode"] == "sticky"
+    assert body["can_rotate"] is False
+    assert body["running"] is False
+    assert body["eligible_key_count"] == 0
+    assert body["key_masked"] == "Kraw…cret"
+    assert body["cooldown_remaining"] > 0
+
+    rotate = app_client.post(f"/api/profiles/{profile['id']}/proxy/new")
+    assert rotate.status_code == 429
+    assert int(rotate.headers["Retry-After"]) > 0
+
+
+
 def test_available_keys_endpoint_hides_raw_values(app_client: TestClient, monkeypatch):
     monkeypatch.setattr(
         main.proxy_providers,

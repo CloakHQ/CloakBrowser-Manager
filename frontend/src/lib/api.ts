@@ -31,6 +31,7 @@ export interface Profile {
   proxy_provider_key_masked: string | null;
   proxy_account_id: string | null;
   proxy_key_id: string | null;
+  proxy_rotation_mode: "per_launch" | "sticky" | "manual";
   kiotproxy_region: "bac" | "trung" | "nam" | "random";
   tmproxy_location_id: number;
   tmproxy_isp_id: number;
@@ -86,6 +87,7 @@ export interface ProfileCreateData {
   proxy_provider_key?: string | null;
   proxy_account_id?: string | null;
   proxy_key_id?: string | null;
+  proxy_rotation_mode?: "per_launch" | "sticky" | "manual";
   kiotproxy_region?: "bac" | "trung" | "nam" | "random";
   tmproxy_location_id?: number;
   tmproxy_isp_id?: number;
@@ -165,10 +167,27 @@ export interface ProxyKeyOption {
   account_masked: string | null;
   key_id: string | null;
   key_masked: string | null;
+  fingerprint: string | null;
   status: string | null;
   expiration_at: number | string | null;
+  cooldown_remaining: number;
+  eligible: boolean;
   in_use: boolean;
   error: string | null;
+}
+
+export interface ProxyRotationState {
+  mode: "per_launch" | "sticky" | "manual";
+  cooldown_remaining: number;
+  usable: boolean;
+  running: boolean;
+  can_rotate: boolean;
+  blocked_reason: string | null;
+  eligible_key_count: number;
+  key_id: string | null;
+  key_masked: string | null;
+  account_id: string | null;
+  info: ProxyProviderInfo | null;
 }
 
 export interface KiotProxyKeyInfo {
@@ -401,6 +420,8 @@ export const api = {
     request<ProxyProviderInfo>(`/api/profiles/${profileId}/proxy/new`, {
       method: "POST",
     }),
+  profileProxyState: (profileId: string) =>
+    request<ProxyRotationState>(`/api/profiles/${profileId}/proxy/state`),
   kiotproxyOut: (key: string) =>
     request<{ ok: boolean }>("/api/proxy-providers/kiotproxy/out", {
       method: "POST",

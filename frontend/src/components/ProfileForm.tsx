@@ -11,6 +11,7 @@ import type {
   ProfileCreateData,
   ProxyKeyOption,
   ProxyProviderInfo,
+  ProxyRotationState,
   ProxyTestResult,
   TmProxyOption,
   ViewerMode,
@@ -52,6 +53,7 @@ const EMPTY_FORM: ProfileCreateData = {
   proxy_provider: "none",
   proxy_account_id: null,
   proxy_key_id: null,
+  proxy_rotation_mode: "per_launch",
   kiotproxy_region: "random",
   tmproxy_location_id: 0,
   tmproxy_isp_id: 0,
@@ -130,6 +132,7 @@ function formFromProfile(profile: Profile | null): ProfileCreateData {
     proxy_provider: profile.proxy_provider ?? "none",
     proxy_account_id: profile.proxy_account_id,
     proxy_key_id: profile.proxy_key_id,
+    proxy_rotation_mode: profile.proxy_rotation_mode ?? "per_launch",
     kiotproxy_region: profile.kiotproxy_region ?? "random",
     tmproxy_location_id: profile.tmproxy_location_id ?? 0,
     tmproxy_isp_id: profile.tmproxy_isp_id ?? 0,
@@ -213,10 +216,12 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [checkingCurrent, setCheckingCurrent] = useState(false);
   const [currentProxy, setCurrentProxy] = useState<ProxyProviderInfo | null>(null);
   const [currentProxyError, setCurrentProxyError] = useState<string | null>(null);
+  const [proxyState, setProxyState] = useState<ProxyRotationState | null>(null);
   const [tmLocations, setTmLocations] = useState<TmProxyOption[]>([]);
   const [tmIsps, setTmIsps] = useState<TmProxyOption[]>([]);
   const [keyOptions, setKeyOptions] = useState<ProxyKeyOption[]>([]);
   const [keyOptionsLoading, setKeyOptionsLoading] = useState(false);
+  const [keyOptionsLoaded, setKeyOptionsLoaded] = useState(false);
   const [keyOptionsError, setKeyOptionsError] = useState<string | null>(null);
   // "", "random", "manual", or "<account_id>::<key_id>"
   const [keyChoice, setKeyChoice] = useState("manual");
@@ -258,8 +263,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     return [...groups.values()];
   }, [keyOptions]);
   const selectedSavedMissing =
-    !keyOptionsLoading &&
-    !keyOptionsError &&
+    keyOptionsLoaded &&
     keyChoice.includes("::") &&
     !keyOptions.some(
       (option) => `${option.account_id}::${option.key_id}` === keyChoice,
@@ -279,6 +283,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     setProviderTestError(null);
     setCurrentProxy(null);
     setCurrentProxyError(null);
+    setProxyState(null);
     setKeyChoice(keyChoiceFromProfile(profile));
     keyChoiceTouched.current = false;
     setTab("basic");
@@ -318,6 +323,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     const provider = form.proxy_provider;
     setKeyOptions([]);
     setKeyOptionsError(null);
+    setKeyOptionsLoaded(false);
     keyChoiceTouched.current = false;
     if (!provider || provider === "none") {
       setKeyOptionsLoading(false);
@@ -340,7 +346,10 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         );
       })
       .finally(() => {
-        if (!cancelled) setKeyOptionsLoading(false);
+        if (!cancelled) {
+          setKeyOptionsLoading(false);
+          setKeyOptionsLoaded(true);
+        }
       });
     return () => {
       cancelled = true;
@@ -349,7 +358,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
   // Default to the saved choice, else a random free key when one exists.
   useEffect(() => {
-    if (keyOptionsLoading || keyChoiceTouched.current) return;
+    if (!keyOptionsLoaded || keyOptionsError || keyChoiceTouched.current) return;
     const provider = form.proxy_provider;
     if (!provider || provider === "none") {
       setKeyChoice("manual");
@@ -378,7 +387,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         : "manual",
     );
   }, [
-    keyOptionsLoading,
+    keyOptionsLoaded,
+    keyOptionsError,
     keyOptions,
     form.proxy_provider,
     form.proxy_account_id,
@@ -386,6 +396,15 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     profile?.proxy_provider,
     profile?.proxy_provider_key_set,
   ]);
+  useEffect(() => {
+    if (profile?.id && form.proxy_provider !== "none") {
+      void refreshProxyState();
+    } else {
+      setProxyState(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile?.id, form.proxy_provider, keyChoice]);
+
   useEffect(() => {
     if (hostOs === "macos") {
       setForm((previous) => ({ ...previous, gpu_family: "auto" }));
@@ -436,14 +455,34 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         }
       } else {
         if (!profile) return;
+        setProxyState((prev) =>
+          prev
+            ? {
+                ...prev,
+                can_rotate: false,
+                blocked_reason: "Đang đổi IP…",
+              }
+            : prev,
+        );
         setProviderTest(await api.profileNewProxy(profile.id));
+        await refreshProxyState();
       }
     } catch (err) {
-      setProviderTestError(
-        err instanceof ApiError ? err.message : "Không lấy được proxy từ nhà cung cấp",
-      );
+      const message =
+        err instanceof ApiError ? err.message : "Không lấy được proxy từ nhà cung cấp";
+      setProviderTestError(message);
+      await refreshProxyState();
     } finally {
       setTestingProvider(false);
+    }
+  };
+
+  const refreshProxyState = async () => {
+    if (!profile) return;
+    try {
+      setProxyState(await api.profileProxyState(profile.id));
+    } catch {
+      setProxyState(null);
     }
   };
 
@@ -454,6 +493,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     setCheckingCurrent(true);
     try {
       setCurrentProxy(await api.profileCurrentProxy(profile.id));
+      await refreshProxyState();
     } catch (err) {
       setCurrentProxyError(
         err instanceof ApiError ? err.message : "Không lấy được proxy hiện tại",
@@ -699,19 +739,19 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   };
 
   return (
-    <form onSubmit={handleSubmit} className="p-6 max-w-4xl mx-auto">
+    <form onSubmit={handleSubmit} className="p-6 max-w-4xl mx-auto space-y-5">
       {/* Header bar */}
-      <div className="card p-4 mb-6 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand/15 border border-brand/25 text-brand-fg">
+      <div className="card p-4.5 flex flex-wrap items-center justify-between gap-3 shadow-card">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-brand/20 to-brand-deep/10 border border-brand/30 text-brand-fg shadow-sm">
             <Fingerprint className="h-5 w-5" />
           </div>
           <div className="mr-2">
-            <h2 className="text-base font-semibold text-fg leading-tight">
-              {isEdit ? "Sửa hồ sơ" : "Hồ sơ mới"}
+            <h2 className="text-base font-bold text-fg leading-tight">
+              {isEdit ? "Cấu hình hồ sơ" : "Tạo hồ sơ mới"}
             </h2>
-            <p className="text-2xs text-fg-muted">
-              {isEdit ? `Cấu hình danh tính · ${profile?.name}` : "Thiết lập danh tính trình duyệt độc lập"}
+            <p className="text-xs text-fg-muted mt-0.5">
+              {isEdit ? `Danh tính trình duyệt · ${profile?.name}` : "Thiết lập danh tính trình duyệt độc lập"}
             </p>
           </div>
           {isEdit && onDuplicate && (
@@ -721,7 +761,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 onClick={() => handleDuplicate(false)}
                 disabled={duplicating}
                 title="Chỉ sao chép cài đặt và vân tay"
-                className="btn-secondary text-xs flex items-center gap-1.5 rounded-r-none"
+                className="btn-secondary h-8 text-xs flex items-center gap-1.5 rounded-r-none"
               >
                 <Copy className="h-3.5 w-3.5" />
                 <span>{duplicating ? "Đang sao chép..." : "Sao chép"}</span>
@@ -734,14 +774,14 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 aria-haspopup="menu"
                 aria-expanded={duplicateMenuOpen}
                 aria-label="Tùy chọn sao chép"
-                className="btn-secondary flex items-center rounded-l-none border-l-0 px-2"
+                className="btn-secondary h-8 flex items-center rounded-l-none border-l-0 px-2"
               >
                 <ChevronDown className="h-3.5 w-3.5" />
               </button>
               {duplicateMenuOpen && (
                 <div
                   role="menu"
-                  className="absolute left-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-xl border border-line-strong bg-surface-1 py-1 shadow-popover"
+                  className="absolute left-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-2xl border border-line-strong bg-surface-1 py-1.5 shadow-popover backdrop-blur-md"
                 >
                   <button
                     type="button"
@@ -749,8 +789,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                     onClick={() => handleDuplicate(false)}
                     className="w-full px-3.5 py-2.5 text-left hover:bg-surface-2 transition-colors"
                   >
-                    <div className="text-xs font-medium text-fg">Chỉ cài đặt và vân tay</div>
-                    <div className="text-2xs text-fg-muted">Bắt đầu với dữ liệu trình duyệt trống</div>
+                    <div className="text-xs font-semibold text-fg">Chỉ cài đặt và vân tay</div>
+                    <div className="text-[11px] text-fg-muted">Bắt đầu với dữ liệu trình duyệt trống</div>
                   </button>
                   <button
                     type="button"
@@ -759,8 +799,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                     onClick={() => handleDuplicate(true)}
                     className="w-full px-3.5 py-2.5 text-left hover:bg-surface-2 transition-colors disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                   >
-                    <div className="text-xs font-medium text-fg">Kèm dữ liệu trình duyệt</div>
-                    <div className="text-2xs text-fg-muted">
+                    <div className="text-xs font-semibold text-fg">Kèm dữ liệu trình duyệt</div>
+                    <div className="text-[11px] text-fg-muted">
                       {profile?.status === "stopped"
                         ? "Cookie, phiên đăng nhập và lịch sử"
                         : "Dừng hồ sơ trước"}
@@ -775,7 +815,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               type="button"
               onClick={handleReset}
               disabled={resetting || resetDone}
-              className="btn-secondary text-xs flex items-center gap-1.5"
+              className="btn-secondary h-8 text-xs flex items-center gap-1.5"
             >
               {resetDone ? <Check className="h-3.5 w-3.5 text-success" /> : <RotateCcw className="h-3.5 w-3.5" />}
               <span>{resetDone ? "Đã đặt lại" : resetting ? "Đang đặt lại..." : "Đặt lại"}</span>
@@ -786,7 +826,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               type="button"
               onClick={handleDelete}
               disabled={deleting}
-              className="btn-danger text-xs flex items-center gap-1.5"
+              className="btn-danger h-8 text-xs flex items-center gap-1.5"
             >
               <Trash2 className="h-3.5 w-3.5" />
               <span>{deleting ? "Đang xóa..." : "Xóa"}</span>
@@ -794,39 +834,43 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
           )}
         </div>
         <div className="flex items-center gap-2 ml-auto">
-          <button type="button" onClick={handleCancel} className="btn-secondary text-xs">
+          <button type="button" onClick={handleCancel} className="btn-secondary h-8 px-3 text-xs">
             Hủy
           </button>
-          <button type="submit" disabled={saving || saved} className="btn-primary text-xs flex items-center gap-1.5">
+          <button type="submit" disabled={saving || saved} className="btn-primary h-8 px-3.5 text-xs flex items-center gap-1.5">
             {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
             <span>{saved ? "Đã lưu" : saving ? "Đang lưu..." : isEdit ? "Lưu" : "Tạo"}</span>
           </button>
         </div>
       </div>
 
-      {/* Tab strip — keeps the long form from reading as one wall of cards. */}
-      <div className="mb-4 flex flex-wrap items-center gap-1 border-b border-line" role="tablist">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            type="button"
-            role="tab"
-            aria-selected={tab === t.key}
-            onClick={() => setTab(t.key)}
-            className={`-mb-px border-b-2 px-3 py-2 text-xs font-medium transition-colors ${
-              tab === t.key
-                ? "border-brand text-fg"
-                : "border-transparent text-fg-muted hover:border-line-strong hover:text-fg-secondary"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
+      {/* Tab strip — modern segmented pills */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-line/80 bg-surface-1/90 p-1.5 shadow-card backdrop-blur-md" role="tablist">
+        <div className="flex flex-wrap items-center gap-1">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              role="tab"
+              aria-selected={tab === t.key}
+              onClick={() => setTab(t.key)}
+              className={`rounded-xl px-3.5 py-1.5 text-xs font-semibold transition-all duration-150 ${
+                tab === t.key
+                  ? "bg-brand/15 text-fg shadow-sm border border-brand/35"
+                  : "text-fg-muted hover:text-fg hover:bg-surface-2/70 border border-transparent"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
         {dirty && (
-          <span className="ml-auto pb-2 pr-1 text-2xs text-warning">Có thay đổi chưa lưu</span>
+          <span className="flex items-center gap-1.5 rounded-full bg-warning/15 border border-warning/30 px-2.5 py-0.5 text-[11px] font-semibold text-warning mr-2">
+            <span className="h-1.5 w-1.5 rounded-full bg-warning animate-pulse" />
+            Có thay đổi chưa lưu
+          </span>
         )}
       </div>
-
       <div className="space-y-4">
         {/* Last preview — the last frame captured before the browser stopped */}
         {isEdit && !previewError && (
@@ -1023,6 +1067,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                               {option.key_masked ?? option.key_id ?? "key"}
                               {option.status ? ` · ${option.status}` : ""}
                               {option.in_use ? " · đang dùng" : ""}
+                              {option.cooldown_remaining > 0
+                                ? ` · chờ ${option.cooldown_remaining}s`
+                                : ""}
                               {formatProviderExpiry(option.expiration_at)}
                             </option>
                           );
@@ -1087,6 +1134,28 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   </div>
                 )}
 
+                <div>
+                  <label className="label">Chế độ đổi IP</label>
+                  <select
+                    className="input"
+                    value={form.proxy_rotation_mode ?? "per_launch"}
+                    onChange={(e) =>
+                      set(
+                        "proxy_rotation_mode",
+                        e.target.value as "per_launch" | "sticky" | "manual",
+                      )
+                    }
+                  >
+                    <option value="per_launch">Mỗi lần mở hồ sơ</option>
+                    <option value="sticky">Giữ IP đến khi hết hạn</option>
+                    <option value="manual">Chỉ đổi khi bấm nút</option>
+                  </select>
+                  <p className="mt-1 text-2xs text-fg-muted">
+                    Manager luôn tôn trọng thời gian chờ đổi IP của nhà cung cấp.
+                    Chế độ “giữ IP” không gọi API đổi IP khi dừng hồ sơ.
+                  </p>
+                </div>
+
                 {form.proxy_provider === "kiotproxy" ? (
                   <div>
                     <label className="label">Vùng</label>
@@ -1141,37 +1210,86 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   </div>
                 )}
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
-                    onClick={handleNewProviderProxy}
-                    disabled={
-                      testingProvider ||
-                      (keyChoice === "manual"
-                        ? !providerKey.trim()
-                        : !profile || dirty)
-                    }
-                    title={
-                      keyChoice === "manual"
-                        ? "Xoay một proxy mới cho key vừa nhập (key cũ bị thay thế)"
-                        : "Lưu hồ sơ trước, rồi lấy proxy mới cho key đã chọn"
-                    }
-                  >
-                    {testingProvider && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                    Lấy proxy mới
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
-                    onClick={handleCheckCurrentProxy}
-                    disabled={!profile || checkingCurrent}
-                    title="Xem proxy mà key đã lưu đang giữ, không xoay key"
-                  >
-                    {checkingCurrent && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                    Kiểm tra proxy hiện tại
-                  </button>
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn-primary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                      onClick={handleNewProviderProxy}
+                      disabled={
+                        testingProvider ||
+                        !profile ||
+                        dirty ||
+                        proxyState?.running === true ||
+                        (keyChoice === "manual"
+                          ? !providerKey.trim()
+                          : proxyState?.can_rotate === false)
+                      }
+                      title={
+                        proxyState?.blocked_reason ??
+                        (keyChoice === "manual"
+                          ? "Xoay một proxy mới cho key vừa nhập (key cũ bị thay thế)"
+                          : "Đổi IP ngay cho key đang dùng")
+                      }
+                    >
+                      {testingProvider && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      Đổi IP ngay
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+                      onClick={handleCheckCurrentProxy}
+                      disabled={!profile || checkingCurrent}
+                      title="Xem proxy mà key đã lưu đang giữ, không xoay key"
+                    >
+                      {checkingCurrent && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      Kiểm tra proxy hiện tại
+                    </button>
+                  </div>
+                  {profile && dirty && (
+                    <p className="text-2xs text-fg-muted">
+                      Lưu hồ sơ trước khi đổi IP.
+                    </p>
+                  )}
                 </div>
+
+                {proxyState && (
+                  <div className="rounded-lg border border-line bg-surface-2/50 p-3 space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs">
+                        <span className="font-medium text-fg">
+                          {proxyState.info?.real_ip ??
+                            proxyState.info?.host ??
+                            "Chưa có IP"}
+                        </span>
+                        {proxyState.info?.location
+                          ? ` · ${proxyState.info.location}`
+                          : ""}
+                        {proxyState.info?.isp
+                          ? ` · ${proxyState.info.isp}`
+                          : ""}
+                      </div>
+                      <span
+                        className={`text-2xs font-medium ${
+                          proxyState.can_rotate ? "text-success" : "text-warning"
+                        }`}
+                      >
+                        {proxyState.can_rotate
+                          ? "Sẵn sàng đổi IP"
+                          : proxyState.blocked_reason}
+                      </span>
+                    </div>
+                    <p className="text-2xs text-fg-muted">
+                      Key: {proxyState.key_masked ?? "tự chọn khi mở"}
+                      {proxyState.info?.expires_at
+                        ? formatProviderExpiry(proxyState.info.expires_at)
+                        : ""}
+                      {proxyState.eligible_key_count > 0
+                        ? ` · ${proxyState.eligible_key_count} key sẵn sàng`
+                        : ""}
+                    </p>
+                  </div>
+                )}
 
                 {providerTest && !testingProvider && (
                   <p className="text-xs font-medium text-success">

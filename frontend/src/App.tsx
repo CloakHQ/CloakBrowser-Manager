@@ -3,6 +3,7 @@ import { ChevronRight, Eye, Loader2, PanelLeft, PanelLeftClose, Plus, Power, Shi
 import { useProfiles } from "./hooks/useProfiles";
 import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial } from "./lib/api";
 import { ProfileTable } from "./components/ProfileTable";
+import { OverviewPage } from "./components/OverviewPage";
 import { StatusBar } from "./components/StatusBar";
 import { ProfileForm } from "./components/ProfileForm";
 import { ProfileViewer } from "./components/ProfileViewer";
@@ -13,7 +14,6 @@ import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
 import { LicensePage } from "./components/LicensePage";
-import { ProxyPage } from "./components/ProxyPage";
 import { ProxyProvidersPanel } from "./components/ProxyProvidersPanel";
 import { SettingsPage } from "./components/SettingsPage";
 import { PAGE_TITLE, Sidebar, type Page } from "./components/Sidebar";
@@ -26,7 +26,7 @@ type View = Page | "create" | "edit" | "view";
 
 const isPage = (view: View): view is Page =>
   view === "overview" ||
-  view === "proxy" ||
+  view === "profiles" ||
   view === "providers" ||
   view === "license" ||
   view === "settings";
@@ -229,7 +229,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     if (!selectedId) return;
     await remove(selectedId);
     setSelectedId(null);
-    setView("overview");
+    setView("profiles");
   }, [selectedId, remove]);
 
   // A license denial (out of seats, bad/expired key) → 402/403 with a
@@ -436,44 +436,46 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
         {/* Main panel */}
         <div className="flex-1 flex flex-col min-w-0">
           {/* Top bar */}
-          <div className="flex h-topbar items-center justify-between gap-3 border-b border-line bg-surface-1/90 px-4 backdrop-blur-md">
-            <div className="flex min-w-0 items-center gap-2">
+          <header className="flex h-topbar items-center justify-between gap-3 border-b border-line/75 bg-surface-1/90 px-5 backdrop-blur-md sticky top-0 z-20">
+            <div className="flex min-w-0 items-center gap-2.5">
               <button
                 onClick={() => setSidebarOpen(!sidebarOpen)}
-                className="rail-item"
+                className="rail-item hover:bg-surface-2"
                 title={sidebarOpen ? "Ẩn thanh bên" : "Hiện thanh bên"}
                 aria-label={sidebarOpen ? "Ẩn thanh bên" : "Hiện thanh bên"}
               >
                 {sidebarOpen ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeft className="h-4 w-4" />}
               </button>
-              <div className="mx-0.5 h-4 w-px bg-line" />
+              <div className="mx-0.5 h-4 w-px bg-line/80" />
               {isPage(view) ? (
-                <span className="truncate text-sm font-medium text-fg">{PAGE_TITLE[view]}</span>
+                <span className="truncate text-sm font-semibold text-fg tracking-tight">{PAGE_TITLE[view]}</span>
               ) : (
-                <>
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => handleNavigate("overview")}
-                    className="truncate text-sm text-fg-muted transition-colors hover:text-fg"
+                    onClick={() => handleNavigate("profiles")}
+                    className="truncate text-xs font-medium text-fg-muted transition-colors hover:text-fg"
                   >
                     Hồ sơ
                   </button>
-                  <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-fg-muted" />
+                  <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-fg-muted/60" />
                   {view === "create" ? (
-                    <span className="truncate text-sm font-semibold text-fg">Hồ sơ mới</span>
+                    <span className="truncate text-xs font-semibold text-fg">Hồ sơ mới</span>
                   ) : selected ? (
                     <>
                       <div className="flex min-w-0 items-center gap-2">
                         <StatusIndicator status={selected.status} size="md" />
-                        <span className="truncate text-sm font-semibold text-fg">{selected.name}</span>
+                        <span className="truncate text-xs font-semibold text-fg">{selected.name}</span>
                       </div>
                       {selected.status === "running" && (
-                        <div className="ml-2 flex items-center rounded-lg border border-line bg-surface-0/80 p-0.5">
+                        <div className="ml-2 flex items-center rounded-xl border border-line/80 bg-surface-0/80 p-0.5 shadow-sm">
                           <button
                             type="button"
                             onClick={() => setView("view")}
-                            className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
-                              view === "view" ? "bg-brand-subtle text-brand-fg" : "text-fg-muted hover:text-fg"
+                            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-2xs font-semibold transition-all ${
+                              view === "view"
+                                ? "bg-brand/20 text-brand-fg shadow-sm"
+                                : "text-fg-muted hover:text-fg"
                             }`}
                           >
                             <Eye className="h-3 w-3" />
@@ -482,8 +484,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                           <button
                             type="button"
                             onClick={() => setView("edit")}
-                            className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors ${
-                              view === "edit" ? "bg-brand-subtle text-brand-fg" : "text-fg-muted hover:text-fg"
+                            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-2xs font-semibold transition-all ${
+                              view === "edit"
+                                ? "bg-brand/20 text-brand-fg shadow-sm"
+                                : "text-fg-muted hover:text-fg"
                             }`}
                           >
                             <SlidersHorizontal className="h-3 w-3" />
@@ -493,13 +497,13 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                       )}
                     </>
                   ) : (
-                    <span className="truncate text-sm font-medium text-fg">Hồ sơ</span>
+                    <span className="truncate text-xs font-medium text-fg">Hồ sơ</span>
                   )}
-                </>
+                </div>
               )}
             </div>
 
-            <div className="flex flex-shrink-0 items-center gap-2">
+            <div className="flex flex-shrink-0 items-center gap-2.5">
               <SystemStatusBadge status={systemStatus} />
               {selected && view !== "create" && (
                 <LaunchButton
@@ -509,14 +513,17 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                   onStop={handleStop}
                 />
               )}
-              {isPage(view) && view !== "overview" && view !== "providers" && (
-                <button onClick={handleNew} className="btn-primary h-8 px-3 text-xs">
+              {isPage(view) &&
+                view !== "overview" &&
+                view !== "profiles" &&
+                view !== "providers" && (
+                <button onClick={handleNew} className="btn-primary h-8 px-3.5 text-xs">
                   <Plus className="h-3.5 w-3.5" />
                   Hồ sơ mới
                 </button>
               )}
             </div>
-          </div>
+          </header>
 
           {/* Error banner */}
           {/* An action error stays until dismissed; a poll error clears itself on
@@ -546,24 +553,31 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           {/* Content */}
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
             {view === "overview" && (
+              <OverviewPage
+                profiles={profiles}
+                systemStatus={systemStatus}
+                onNew={handleNew}
+                onOpenProfiles={() => handleNavigate("profiles")}
+                onOpenProviders={() => handleNavigate("providers")}
+                onOpenLicense={() => handleNavigate("license")}
+                onSelect={handleSelect}
+              />
+            )}
+
+            {view === "profiles" && (
               <ProfileTable
                 profiles={profiles}
                 selectedId={selectedId}
-                systemStatus={systemStatus}
                 onSelect={handleSelect}
                 onEdit={handleEditById}
                 onNew={handleNew}
-                onOpenSettings={() => handleNavigate("license")}
                 onLaunch={handleRowLaunch}
                 onStop={handleRowStop}
                 onDuplicate={handleRowDuplicate}
                 onDelete={handleRowDelete}
                 onReorder={reorder}
+                onApplied={refresh}
               />
-            )}
-
-            {view === "proxy" && (
-              <ProxyPage profiles={profiles} onEdit={handleEditById} onApplied={refresh} />
             )}
 
             {view === "providers" && <ProxyProvidersPanel />}
@@ -587,7 +601,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 hostOs={systemStatus?.host_os ?? null}
                 viewerMode={systemStatus?.viewer_mode ?? null}
                 onSave={handleCreate}
-                onCancel={() => setView("overview")}
+                onCancel={() => setView("profiles")}
               />
             )}
 
@@ -602,7 +616,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 onDuplicate={handleDuplicate}
                 onCancel={() => {
                   setSelectedId(null);
-                  setView("overview");
+                  setView("profiles");
                 }}
               />
             )}

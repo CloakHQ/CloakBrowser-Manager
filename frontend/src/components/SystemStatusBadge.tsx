@@ -24,17 +24,20 @@ export function SystemStatusBadge({ status }: { status: SystemStatus | null }) {
 
   return (
     <span
-      className="inline-flex items-center gap-2 rounded-lg border border-line bg-surface-2/60 px-2.5 py-1 text-xs"
+      className="inline-flex items-center gap-2 rounded-xl border border-line/80 bg-surface-2/70 px-2.5 py-1 text-xs shadow-sm transition-all"
       title={title}
     >
-      <span className={TIER_CLASS[tier] ?? "badge-neutral"}>{TIER_LABEL[tier] ?? tier}</span>
-      <span className="font-mono text-2xs text-fg-secondary">{status.binary_version}</span>
+      <span className={TIER_CLASS[tier] ?? "badge-neutral"}>
+        <span className="h-1.5 w-1.5 rounded-full bg-current opacity-80" />
+        {TIER_LABEL[tier] ?? tier}
+      </span>
+      <span className="font-mono text-[11px] text-fg-secondary">{status.binary_version}</span>
       {status.windows_fonts_complete === false && (
         <span
-          className="flex items-center gap-1 text-warning text-2xs font-medium"
+          className="flex items-center gap-1 rounded-md bg-warning/10 px-1.5 py-0.5 text-warning text-[10px] font-semibold"
           title={`Thiếu font Windows persona: tìm thấy ${status.windows_fonts_present ?? 0}/${status.windows_fonts_required ?? 0}`}
         >
-          <AlertTriangle className="h-3.5 w-3.5" />
+          <AlertTriangle className="h-3 w-3" />
           Thiếu font
         </span>
       )}

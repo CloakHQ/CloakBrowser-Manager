@@ -1,10 +1,9 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+﻿import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ManagerSettings, Profile, SystemStatus } from "../lib/api";
 import { renderWithProviders as render } from "../test/render";
 import { LicensePage } from "./LicensePage";
 import { ProfileTable } from "./ProfileTable";
-import { ProxyPage } from "./ProxyPage";
 import { Sidebar } from "./Sidebar";
 
 const profile = (over: Partial<Profile> = {}): Profile => ({
@@ -15,6 +14,9 @@ const profile = (over: Partial<Profile> = {}): Profile => ({
   proxy_provider: "none",
   proxy_provider_key_set: false,
   proxy_provider_key_masked: null,
+  proxy_account_id: null,
+  proxy_key_id: null,
+  proxy_rotation_mode: "per_launch",
   kiotproxy_region: "random",
   tmproxy_location_id: 0,
   tmproxy_isp_id: 0,
@@ -45,6 +47,9 @@ const profile = (over: Partial<Profile> = {}): Profile => ({
   created_at: "2026-10-01T00:00:00Z",
   updated_at: "2026-10-01T00:00:00Z",
   status: "stopped",
+  runtime_mode: "native",
+  viewer_mode: "native-window",
+  vnc_ws_port: null,
   cdp_url: null,
   last_error: null,
   ...over,
@@ -91,6 +96,22 @@ beforeEach(() => {
   apiMock.listKeys.mockResolvedValue([]);
 });
 
+const renderProfiles = (profiles: Profile[], onReorder = () => {}) =>
+  render(
+    <ProfileTable
+      profiles={profiles}
+      selectedId={null}
+      onSelect={() => {}}
+      onEdit={() => {}}
+      onNew={() => {}}
+      onLaunch={async () => {}}
+      onStop={async () => {}}
+      onDuplicate={() => {}}
+      onDelete={() => {}}
+      onReorder={onReorder}
+    />,
+  );
+
 describe("Sidebar", () => {
   it("navigates and marks the active section", () => {
     const onNavigate = vi.fn();
@@ -109,10 +130,12 @@ describe("Sidebar", () => {
     );
 
     const nav = screen.getByRole("navigation", { name: "Điều hướng" });
-    expect(within(nav).getByRole("button", { name: /Tổng quan/ }).getAttribute("aria-current")).toBe("page");
+    expect(
+      within(nav).getByRole("button", { name: /Tổng quan/ }).getAttribute("aria-current"),
+    ).toBe("page");
 
-    fireEvent.click(within(nav).getByRole("button", { name: /Proxy/ }));
-    expect(onNavigate).toHaveBeenCalledWith("proxy");
+    fireEvent.click(within(nav).getByRole("button", { name: /Hồ sơ/ }));
+    expect(onNavigate).toHaveBeenCalledWith("profiles");
   });
 
   it("flags a missing key on the license item", () => {
@@ -133,71 +156,40 @@ describe("Sidebar", () => {
   });
 });
 
-describe("ProxyPage", () => {
+describe("ProfileTable", () => {
   it("shows the provider and the address each profile exits from", () => {
-    render(
-      <ProxyPage
-        profiles={[
-          profile({
-            id: "p1",
-            name: "Rotating",
-            proxy_provider: "kiotproxy",
-            proxy_provider_key_set: true,
-            active_proxy: {
-              provider: "kiotproxy",
-              host: "103.1.2.3:8000",
-              real_ip: "103.1.2.3",
-              location: "Hà Nội",
-              isp: null,
-              expires_at: null,
-              ttl: null,
-              ttc: null,
-              next_request_at: null,
-            },
-          }),
-          profile({ id: "p2", name: "Direct", proxy: null }),
-        ]}
-        onEdit={() => {}}
-      />,
-    );
+    renderProfiles([
+      profile({
+        id: "p1",
+        name: "Rotating",
+        proxy_provider: "kiotproxy",
+        proxy_provider_key_set: true,
+        active_proxy: {
+          provider: "kiotproxy",
+          host: "103.1.2.3:8000",
+          real_ip: "103.1.2.3",
+          location: "Hà Nội",
+          isp: null,
+          expires_at: null,
+          ttl: null,
+          ttc: null,
+          next_request_at: null,
+        },
+      }),
+      profile({ id: "p2", name: "Direct", proxy: null }),
+    ]);
 
     expect(screen.getByText("103.1.2.3:8000")).toBeTruthy();
     expect(screen.getByText("trực tiếp")).toBeTruthy();
   });
 
-  it("counts a provider profile as proxied before its first launch", () => {
-    render(
-      <ProxyPage
-        profiles={[
-          profile({
-            id: "p1",
-            name: "Rotating",
-            proxy_provider: "tmproxy",
-            proxy_provider_key_set: true,
-          }),
-        ]}
-        onEdit={() => {}}
-      />,
-    );
-
-    expect(
-      screen.getByText((_, el) => el?.textContent?.replace(/\s/g, "") === "1/1"),
-    ).toBeTruthy();
-    expect(screen.getByText("lấy mới khi khởi chạy")).toBeTruthy();
-  });
-
   it("assigns one proxy to every selected profile", async () => {
     apiMock.updateProfile.mockResolvedValue(profile());
-    render(
-      <ProxyPage
-        profiles={[
-          profile({ id: "p1", name: "A" }),
-          profile({ id: "p2", name: "B" }),
-          profile({ id: "p3", name: "C" }),
-        ]}
-        onEdit={() => {}}
-      />,
-    );
+    renderProfiles([
+      profile({ id: "p1", name: "A" }),
+      profile({ id: "p2", name: "B" }),
+      profile({ id: "p3", name: "C" }),
+    ]);
 
     fireEvent.click(screen.getByRole("button", { name: /Gán proxy hàng loạt/ }));
     const dialog = screen.getByRole("dialog", { name: /Gán proxy hàng loạt/ });
@@ -214,36 +206,14 @@ describe("ProxyPage", () => {
         proxy: "http://user:pass@1.2.3.4:8000",
         proxy_provider: "none",
         proxy_provider_key: "",
+        proxy_account_id: null,
+        proxy_key_id: null,
       });
     }
   });
 
-  it("clears the proxy when the direct mode is chosen", async () => {
-    apiMock.updateProfile.mockResolvedValue(profile());
-    render(
-      <ProxyPage
-        profiles={[profile({ id: "p1", name: "A", proxy: "http://1.2.3.4:8000" })]}
-        onEdit={() => {}}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /Gán proxy hàng loạt/ }));
-    const dialog = screen.getByRole("dialog", { name: /Gán proxy hàng loạt/ });
-    fireEvent.click(within(dialog).getByRole("button", { name: /Chọn tất cả/ }));
-    fireEvent.click(within(dialog).getByRole("button", { name: /^Bỏ proxy/ }));
-    fireEvent.click(within(dialog).getByRole("button", { name: /Gán cho 1 hồ sơ/ }));
-
-    await waitFor(() =>
-      expect(apiMock.updateProfile).toHaveBeenCalledWith("p1", {
-        proxy: null,
-        proxy_provider: "none",
-        proxy_provider_key: "",
-      }),
-    );
-  });
-
   it("refuses a malformed manual proxy before writing anything", () => {
-    render(<ProxyPage profiles={[profile({ id: "p1", name: "A" })]} onEdit={() => {}} />);
+    renderProfiles([profile({ id: "p1", name: "A" })]);
 
     fireEvent.click(screen.getByRole("button", { name: /Gán proxy hàng loạt/ }));
     const dialog = screen.getByRole("dialog", { name: /Gán proxy hàng loạt/ });
@@ -252,30 +222,18 @@ describe("ProxyPage", () => {
       target: { value: "not a proxy" },
     });
 
-    const apply = within(dialog).getByRole("button", { name: /Gán cho 1 hồ sơ/ }) as HTMLButtonElement;
+    const apply = within(dialog).getByRole("button", {
+      name: /Gán cho 1 hồ sơ/,
+    }) as HTMLButtonElement;
     expect(apply.disabled).toBe(true);
     expect(apiMock.updateProfile).not.toHaveBeenCalled();
   });
-});
 
-describe("ProfileTable", () => {
   it("moves a profile down through the row menu", () => {
     const onReorder = vi.fn();
-    render(
-      <ProfileTable
-        profiles={[profile({ id: "a", name: "A" }), profile({ id: "b", name: "B" })]}
-        selectedId={null}
-        systemStatus={status}
-        onSelect={() => {}}
-        onEdit={() => {}}
-        onNew={() => {}}
-        onOpenSettings={() => {}}
-        onLaunch={async () => {}}
-        onStop={async () => {}}
-        onDuplicate={() => {}}
-        onDelete={() => {}}
-        onReorder={onReorder}
-      />,
+    renderProfiles(
+      [profile({ id: "a", name: "A" }), profile({ id: "b", name: "B" })],
+      onReorder,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Thao tác khác cho A" }));
@@ -284,25 +242,13 @@ describe("ProfileTable", () => {
   });
 
   it("refuses to delete a running profile from the menu", () => {
-    render(
-      <ProfileTable
-        profiles={[profile({ id: "a", name: "A", status: "running" })]}
-        selectedId={null}
-        systemStatus={status}
-        onSelect={() => {}}
-        onEdit={() => {}}
-        onNew={() => {}}
-        onOpenSettings={() => {}}
-        onLaunch={async () => {}}
-        onStop={async () => {}}
-        onDuplicate={() => {}}
-        onDelete={() => {}}
-        onReorder={() => {}}
-      />,
-    );
+    renderProfiles([profile({ id: "a", name: "A", status: "running" })]);
 
     fireEvent.click(screen.getByRole("button", { name: "Thao tác khác cho A" }));
-    expect((screen.getByRole("menuitem", { name: /Xóa hồ sơ/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByRole("menuitem", { name: /Xóa hồ sơ/ }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 });
 

@@ -14,17 +14,40 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import random
 import time
+from dataclasses import dataclass
 from typing import Any
 
-from . import proxy_accounts, proxy_providers
+from . import proxy_accounts, proxy_providers, proxy_state
 
 RANDOM_KEY = "random"
 
 
+@dataclass(frozen=True)
+class ProxyKeySelection:
+    provider: str
+    key: str
+    account_id: str | None = None
+    key_id: str | None = None
+    label: str | None = None
+    key_masked: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        return key_fingerprint(self.provider, self.key)
+
+
+
 class NoAvailableProxyKey(ValueError):
     """The profile asked for a saved key but none can serve this launch."""
+
+
+class ProxyRotationCooldown(NoAvailableProxyKey):
+    """Every eligible key is inside the provider's rotation cooldown."""
+
+    def __init__(self, message: str, retry_after: int = 0):
+        super().__init__(message)
+        self.retry_after = max(0, int(retry_after))
 
 
 def key_fingerprint(provider: str, key: str) -> str:
@@ -89,10 +112,40 @@ def _error_option(account: dict[str, Any], message: str) -> dict[str, Any]:
         "account_masked": proxy_accounts.mask_secret(account.get("secret")),
         "key_id": None,
         "key_masked": None,
+        "fingerprint": None,
         "status": None,
         "expiration_at": None,
+        "cooldown_remaining": 0,
+        "eligible": False,
         "in_use": False,
         "error": message,
+    }
+
+
+def _option(
+    account: dict[str, Any],
+    *,
+    key_id: str | None,
+    key_masked: str | None,
+    fingerprint: str,
+    status: str | None,
+    expiration_at: int | str | None,
+    in_use: bool,
+) -> dict[str, Any]:
+    cooldown = proxy_state.cooldown_remaining(proxy_state.get(fingerprint))
+    return {
+        "account_id": account["id"],
+        "account_label": _account_label(account),
+        "account_masked": proxy_accounts.mask_secret(account.get("secret")),
+        "key_id": key_id,
+        "key_masked": key_masked,
+        "fingerprint": fingerprint,
+        "status": status,
+        "expiration_at": expiration_at,
+        "cooldown_remaining": cooldown,
+        "eligible": bool(key_id) and not in_use and cooldown == 0,
+        "in_use": in_use,
+        "error": None,
     }
 
 
@@ -125,17 +178,15 @@ async def available_options(
             for key in usable:
                 fingerprint = key_fingerprint(provider, key["value"])
                 options.append(
-                    {
-                        "account_id": account["id"],
-                        "account_label": _account_label(account),
-                        "account_masked": proxy_accounts.mask_secret(account.get("secret")),
-                        "key_id": key.get("id"),
-                        "key_masked": key.get("value_masked"),
-                        "status": key.get("status"),
-                        "expiration_at": key.get("expiration_at"),
-                        "in_use": fingerprint in used,
-                        "error": None,
-                    }
+                    _option(
+                        account,
+                        key_id=key.get("id"),
+                        key_masked=key.get("value_masked"),
+                        fingerprint=fingerprint,
+                        status=key.get("status"),
+                        expiration_at=key.get("expiration_at"),
+                        in_use=fingerprint in used,
+                    )
                 )
             continue
 
@@ -150,17 +201,15 @@ async def available_options(
             continue
         fingerprint = key_fingerprint(provider, account["secret"])
         options.append(
-            {
-                "account_id": account["id"],
-                "account_label": _account_label(account),
-                "account_masked": proxy_accounts.mask_secret(account.get("secret")),
-                "key_id": account["id"],
-                "key_masked": proxy_accounts.mask_secret(account.get("secret")),
-                "status": stats.get("plan"),
-                "expiration_at": expiration,
-                "in_use": fingerprint in used,
-                "error": None,
-            }
+            _option(
+                account,
+                key_id=account["id"],
+                key_masked=proxy_accounts.mask_secret(account["secret"]),
+                fingerprint=fingerprint,
+                status=stats.get("plan"),
+                expiration_at=expiration,
+                in_use=fingerprint in used,
+            )
         )
 
     return options
@@ -182,7 +231,8 @@ async def _pick_kiot(
     key_id: str,
     *,
     exclude: set[str],
-) -> str:
+    require_rotation_ready: bool = False,
+) -> ProxyKeySelection:
     try:
         keys = await proxy_providers.kiotproxy_keys(account["secret"])
     except proxy_providers.ProxyProviderError as exc:
@@ -197,23 +247,39 @@ async def _pick_kiot(
             raise NoAvailableProxyKey(
                 "The selected KiotProxy key is missing, inactive, or expired"
             )
-        if key_fingerprint("kiotproxy", selected["value"]) in exclude:
+        fingerprint = key_fingerprint("kiotproxy", selected["value"])
+        if fingerprint in exclude:
             raise NoAvailableProxyKey(
                 "The selected KiotProxy key is already in use by another running profile"
             )
-        return selected["value"]
+        remaining = proxy_state.cooldown_remaining(proxy_state.get(fingerprint))
+        if require_rotation_ready and remaining > 0:
+            raise ProxyRotationCooldown(
+                f"The selected KiotProxy key can get a new IP in {remaining}s",
+                remaining,
+            )
+        return ProxyKeySelection(
+            provider="kiotproxy",
+            key=selected["value"],
+            account_id=account["id"],
+            key_id=selected.get("id"),
+            label=_account_label(account),
+            key_masked=selected.get("value_masked"),
+        )
 
     candidates = [
-        key
+        ProxyKeySelection(
+            provider="kiotproxy",
+            key=key["value"],
+            account_id=account["id"],
+            key_id=key.get("id"),
+            label=_account_label(account),
+            key_masked=key.get("value_masked"),
+        )
         for key in usable
         if key_fingerprint("kiotproxy", key["value"]) not in exclude
     ]
-    if not candidates:
-        raise NoAvailableProxyKey(
-            "No free KiotProxy key is available. Every key is expired or already "
-            "used by another running profile."
-        )
-    return random.choice(candidates)["value"]
+    return _ready_candidate(candidates, require_rotation_ready, "KiotProxy")
 
 
 async def _pick_tm(
@@ -221,9 +287,10 @@ async def _pick_tm(
     key_id: str,
     *,
     exclude: set[str],
-) -> str:
+    require_rotation_ready: bool = False,
+) -> ProxyKeySelection:
     now_ms = int(time.time() * 1000)
-    candidates: list[tuple[str, dict[str, Any]]] = []
+    candidates: list[ProxyKeySelection] = []
     errors: list[str] = []
 
     for account in accounts:
@@ -236,49 +303,112 @@ async def _pick_tm(
             continue
         if _expired(stats.get("expired_at"), now_ms):
             continue
-        if key_fingerprint("tmproxy", account["secret"]) in exclude:
+        fingerprint = key_fingerprint("tmproxy", account["secret"])
+        if fingerprint in exclude:
             if key_id != RANDOM_KEY:
                 raise NoAvailableProxyKey(
                     "The selected TMProxy key is already in use by another running profile"
                 )
             continue
-        candidates.append((account["secret"], account))
+        candidates.append(
+            ProxyKeySelection(
+                provider="tmproxy",
+                key=account["secret"],
+                account_id=account["id"],
+                key_id=account["id"],
+                label=_account_label(account),
+                key_masked=proxy_accounts.mask_secret(account["secret"]),
+            )
+        )
 
     if key_id != RANDOM_KEY:
         if candidates:
-            return candidates[0][0]
+            selection = candidates[0]
+            remaining = proxy_state.cooldown_remaining(
+                proxy_state.get(selection.fingerprint)
+            )
+            if require_rotation_ready and remaining > 0:
+                raise ProxyRotationCooldown(
+                    f"The selected TMProxy key can get a new IP in {remaining}s",
+                    remaining,
+                )
+            return selection
         detail = f" ({errors[0]})" if errors else ""
         raise NoAvailableProxyKey(
             f"The selected TMProxy key is missing or expired{detail}"
         )
+    return _ready_candidate(candidates, require_rotation_ready, "TMProxy")
+
+
+def _ready_candidate(
+    candidates: list[ProxyKeySelection],
+    require_rotation_ready: bool,
+    provider_label: str,
+) -> ProxyKeySelection:
     if not candidates:
-        detail = f" Last error: {errors[0]}" if errors else ""
         raise NoAvailableProxyKey(
-            "No free TMProxy key is available. Every key is expired or already "
-            f"used by another running profile.{detail}"
+            f"No free {provider_label} key is available. Every key is expired or "
+            "already used by another running profile."
         )
-    return random.choice(candidates)[0]
+    if not require_rotation_ready:
+        return _least_recently_used(candidates)
+
+    ready = [
+        candidate
+        for candidate in candidates
+        if proxy_state.cooldown_remaining(proxy_state.get(candidate.fingerprint)) == 0
+    ]
+    if ready:
+        return _least_recently_used(ready)
+
+    wait = min(
+        proxy_state.cooldown_remaining(proxy_state.get(candidate.fingerprint))
+        for candidate in candidates
+    )
+    raise ProxyRotationCooldown(
+        f"Every free {provider_label} key is cooling down; the next one can "
+        f"rotate in {wait}s.",
+        wait,
+    )
 
 
-async def resolve_profile_key(
+async def select_profile_key(
     profile: dict[str, Any],
     *,
     exclude_fingerprints: set[str] | None = None,
-) -> str:
-    """Return the raw provider key for this launch (never persisted for saved keys)."""
+    account_id: str | None = None,
+    key_id: str | None = None,
+    require_rotation_ready: bool = False,
+) -> ProxyKeySelection:
+    """Pick a key for this launch, preferring the least recently used one.
+
+    ``account_id``/``key_id`` override the profile selection so a sticky binding
+    can be resolved again after a restart. ``require_rotation_ready`` skips keys
+    that are still inside the provider's rotation cooldown.
+    """
     provider = (profile.get("proxy_provider") or "none").strip().lower()
     if provider not in proxy_accounts.PROVIDERS:
         raise NoAvailableProxyKey(f"Unknown proxy provider: {provider}")
 
     exclude = exclude_fingerprints or set()
-    account_id = (profile.get("proxy_account_id") or "").strip()
-    key_id = (profile.get("proxy_key_id") or "").strip() or RANDOM_KEY
+    account_id = (account_id or profile.get("proxy_account_id") or "").strip()
+    key_id = (key_id or profile.get("proxy_key_id") or "").strip() or RANDOM_KEY
 
     if account_id:
         account = _resolve_account(provider, account_id)
         if provider == "kiotproxy":
-            return await _pick_kiot(account, key_id, exclude=exclude)
-        return await _pick_tm([account], key_id, exclude=exclude)
+            return await _pick_kiot(
+                account,
+                key_id,
+                exclude=exclude,
+                require_rotation_ready=require_rotation_ready,
+            )
+        return await _pick_tm(
+            [account],
+            key_id,
+            exclude=exclude,
+            require_rotation_ready=require_rotation_ready,
+        )
 
     if key_id == RANDOM_KEY:
         accounts = [
@@ -292,7 +422,7 @@ async def resolve_profile_key(
                 "or enter a key manually."
             )
         if provider == "kiotproxy":
-            candidates: list[str] = []
+            candidates: list[ProxyKeySelection] = []
             errors: list[str] = []
             now_ms = int(time.time() * 1000)
             for account in accounts:
@@ -302,7 +432,14 @@ async def resolve_profile_key(
                     errors.append(str(exc))
                     continue
                 candidates.extend(
-                    key["value"]
+                    ProxyKeySelection(
+                        provider="kiotproxy",
+                        key=key["value"],
+                        account_id=account["id"],
+                        key_id=key.get("id"),
+                        label=_account_label(account),
+                        key_masked=key.get("value_masked"),
+                    )
                     for key in keys
                     if _kiot_key_usable(key, now_ms)
                     and key_fingerprint(provider, key["value"]) not in exclude
@@ -313,9 +450,38 @@ async def resolve_profile_key(
                     "No free KiotProxy key is available. Every key is expired or "
                     f"already used by another running profile.{detail}"
                 )
-            return random.choice(candidates)
-        return await _pick_tm(accounts, RANDOM_KEY, exclude=exclude)
+            return _ready_candidate(candidates, require_rotation_ready, "KiotProxy")
+        return await _pick_tm(
+            accounts,
+            RANDOM_KEY,
+            exclude=exclude,
+            require_rotation_ready=require_rotation_ready,
+        )
 
     raise NoAvailableProxyKey(
         "Choose a saved proxy key or enter the provider key manually"
     )
+
+
+async def resolve_profile_key(
+    profile: dict[str, Any],
+    *,
+    exclude_fingerprints: set[str] | None = None,
+    account_id: str | None = None,
+    key_id: str | None = None,
+) -> str:
+    """Return the raw provider key for this launch (never persisted for saved keys)."""
+    selection = await select_profile_key(
+        profile,
+        exclude_fingerprints=exclude_fingerprints,
+        account_id=account_id,
+        key_id=key_id,
+    )
+    return selection.key
+
+
+def _least_recently_used(
+    candidates: list[ProxyKeySelection],
+) -> ProxyKeySelection:
+    return min(candidates, key=lambda item: proxy_state.last_used_at(item.fingerprint))
+

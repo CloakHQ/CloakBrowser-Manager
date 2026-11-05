@@ -11,39 +11,35 @@
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --surface-0: 8 11 17;
-  --surface-1: 14 19 29;
-  --surface-2: 20 27 41;
-  --surface-3: 27 36 54;
-  --surface-4: 36 48 71;
-  --fg: 241 245 249;
-  --fg-secondary: 148 163 184;
-  /* Muted, not invisible: 5.9:1 on surface-1 and still 4.9:1 on surface-3,
-     which is the darkest surface low-emphasis text ever sits on. */
-  --fg-muted: 133 146 165;
-  --line: 30 39 56;
-  --line-strong: 46 59 84;
-  /* `brand` is a fill (white text on it, 4.9:1). Accent text and icons use
-     `brand-fg`, which is lightened for dark surfaces (6.6:1 on surface-1). */
-  --brand: 91 94 238;
-  --brand-hover: 94 97 239;
+  --surface-0: 10 13 20;
+  --surface-1: 15 19 28;
+  --surface-2: 22 28 42;
+  --surface-3: 31 39 58;
+  --surface-4: 42 52 76;
+  --fg: 243 246 251;
+  --fg-secondary: 153 167 189;
+  --fg-muted: 112 126 148;
+  --line: 28 36 52;
+  --line-strong: 44 56 80;
+  --brand: 99 102 241;
+  --brand-hover: 114 118 248;
   --brand-deep: 79 70 229;
-  --brand-fg: 139 143 250;
-  --brand-subtle-alpha: 0.14;
+  --brand-fg: 146 153 255;
+  --brand-subtle-alpha: 0.15;
   --success: 16 185 129;
   --warning: 245 158 11;
   --danger: 244 63 94;
   --info: 56 189 248;
 
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.25),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  --shadow-elevated: 0 8px 24px -4px rgba(0, 0, 0, 0.5), 0 2px 6px -1px rgba(0, 0, 0, 0.3),
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.25),
     inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  --shadow-popover: 0 20px 48px -8px rgba(0, 0, 0, 0.65), 0 0 1px 1px rgba(255, 255, 255, 0.06);
-  --shadow-glow: 0 0 20px -4px rgb(var(--brand) / 0.45);
-  --input-inset: inset 0 1px 2px rgba(0, 0, 0, 0.25);
-  --bg-glow: radial-gradient(ellipse 80% 50% at 50% -20%, rgb(var(--brand) / 0.08), transparent),
-    radial-gradient(ellipse 60% 40% at 100% 100%, rgb(var(--info) / 0.04), transparent);
+  --shadow-elevated: 0 10px 30px -6px rgba(0, 0, 0, 0.6), 0 3px 8px -2px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-popover: 0 24px 50px -10px rgba(0, 0, 0, 0.75), 0 0 1px 1px rgba(255, 255, 255, 0.08);
+  --shadow-glow: 0 0 24px -4px rgb(var(--brand) / 0.5);
+  --input-inset: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  --bg-glow: radial-gradient(ellipse 90% 60% at 50% -20%, rgb(var(--brand) / 0.12), transparent 70%),
+    radial-gradient(ellipse 60% 40% at 100% 100%, rgb(var(--info) / 0.05), transparent 60%);
 }
 
 :root[data-theme="light"] {
@@ -148,22 +144,23 @@
 @layer components {
   /* ---- buttons ------------------------------------------------------ */
   .btn {
-    @apply inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg
-      text-sm font-medium transition-all duration-150 select-none
+    @apply inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-xl
+      text-xs font-medium transition-all duration-150 select-none
       disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .btn:active:not(:disabled) {
-    transform: scale(0.98);
+    transform: scale(0.97);
   }
   .btn-primary {
-    @apply btn bg-gradient-to-b from-brand to-brand-deep text-white
-      hover:from-brand-hover hover:to-brand shadow-card hover:shadow-glow;
+    @apply btn bg-gradient-to-r from-brand to-brand-deep text-white font-semibold
+      hover:from-brand-hover hover:to-brand shadow-card hover:shadow-glow
+      border border-brand/40 hover:border-brand/70;
   }
   .btn-secondary {
-    @apply btn bg-surface-2 hover:bg-surface-3 text-fg border border-line hover:border-line-strong shadow-card;
+    @apply btn bg-surface-2/90 hover:bg-surface-3 text-fg border border-line hover:border-line-strong shadow-card;
   }
   .btn-ghost {
-    @apply btn bg-transparent text-fg-secondary hover:bg-surface-3/80 hover:text-fg;
+    @apply btn bg-transparent text-fg-secondary hover:bg-surface-2 hover:text-fg;
   }
   .btn-danger {
     @apply btn bg-danger/10 text-danger border border-danger/25 hover:bg-danger/20 hover:border-danger/40;
@@ -171,8 +168,8 @@
 
   /* ---- inputs ------------------------------------------------------- */
   .input {
-    @apply w-full h-9 bg-surface-0/90 border border-line rounded-lg px-3 py-2
-      text-sm text-fg placeholder-fg-muted transition-all duration-150
+    @apply w-full h-9 bg-surface-0/90 border border-line rounded-xl px-3 py-1.5
+      text-xs text-fg placeholder-fg-muted transition-all duration-150
       hover:border-line-strong
       focus:outline-none focus:border-brand focus:ring-2 focus:ring-brand/20;
     box-shadow: var(--input-inset);
@@ -181,7 +178,7 @@
     @apply pr-8 cursor-pointer bg-surface-0/90;
   }
   textarea.input {
-    @apply h-auto py-2.5;
+    @apply h-auto py-2;
   }
   .label {
     @apply block text-xs font-medium text-fg-secondary mb-1.5;
@@ -189,13 +186,13 @@
 
   /* ---- surfaces ----------------------------------------------------- */
   .card {
-    @apply bg-surface-1/90 border border-line rounded-xl shadow-card backdrop-blur-sm;
+    @apply bg-surface-1/90 border border-line/80 rounded-2xl shadow-card backdrop-blur-md;
   }
   .section-card {
-    @apply bg-surface-1/80 border border-line rounded-xl p-5 shadow-card transition-colors hover:border-line-strong/70;
+    @apply bg-surface-1/80 border border-line/75 rounded-2xl p-5 shadow-card transition-all duration-150 hover:border-line-strong/80 backdrop-blur-sm;
   }
   .panel {
-    @apply bg-surface-1 border border-line rounded-xl;
+    @apply bg-surface-1 border border-line rounded-2xl;
   }
   .section-title {
     @apply text-2xs font-semibold uppercase tracking-wider text-fg-muted;
@@ -206,20 +203,20 @@
 
   /* ---- badges ------------------------------------------------------- */
   .badge {
-    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5
-      text-2xs font-medium whitespace-nowrap border border-transparent;
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5
+      text-2xs font-medium whitespace-nowrap border border-transparent transition-colors;
   }
   .badge-success {
-    @apply badge bg-success/10 text-success border-success/25;
+    @apply badge bg-success/10 text-success border-success/30;
   }
   .badge-warning {
-    @apply badge bg-warning/10 text-warning border-warning/25;
+    @apply badge bg-warning/10 text-warning border-warning/30;
   }
   .badge-danger {
-    @apply badge bg-danger/10 text-danger border-danger/25;
+    @apply badge bg-danger/10 text-danger border-danger/30;
   }
   .badge-info {
-    @apply badge bg-info/10 text-info border-info/25;
+    @apply badge bg-info/10 text-info border-info/30;
   }
   .badge-neutral {
     @apply badge bg-surface-3/80 text-fg-secondary border-line;
@@ -227,28 +224,27 @@
 
   /* ---- shell -------------------------------------------------------- */
   .sidebar-item {
-    @apply relative w-full text-left rounded-lg px-3 py-2.5 transition-all duration-150
-      border border-transparent cursor-pointer;
+    @apply relative w-full text-left rounded-xl px-3 py-2.5 transition-all duration-150
+      border border-transparent cursor-pointer font-medium text-xs;
   }
   .sidebar-item:hover {
-    @apply bg-surface-2/80 border-line/60;
+    @apply bg-surface-2/80 text-fg border-line/50;
   }
   .sidebar-item[data-selected="true"] {
-    @apply bg-gradient-to-r from-brand/15 to-brand/5 border-brand/35;
-    box-shadow: inset 2px 0 0 rgb(var(--brand));
+    @apply bg-brand/15 text-fg border-brand/35 font-semibold;
+    box-shadow: inset 3px 0 0 rgb(var(--brand));
   }
   .rail-item {
-    @apply flex h-8 w-8 items-center justify-center rounded-lg
+    @apply flex h-8 w-8 items-center justify-center rounded-xl
       text-fg-secondary transition-all duration-150 hover:bg-surface-3 hover:text-fg;
   }
   .rail-item[data-active="true"] {
     @apply bg-brand-subtle text-brand-fg;
   }
   .statusbar {
-    @apply flex h-statusbar items-center gap-3 border-t border-line bg-surface-1/95
+    @apply flex h-statusbar items-center gap-3 border-t border-line/75 bg-surface-1/95
       px-4 text-2xs text-fg-muted select-none backdrop-blur-md;
   }
-
   /* ---- data table --------------------------------------------------- */
   .data-table {
     @apply w-full border-collapse text-sm;
