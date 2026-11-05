@@ -80,7 +80,7 @@ export function Sidebar({
                 className="sidebar-item flex items-center gap-2.5 py-2"
                 data-selected={page === key}
               >
-                <Icon className={`h-4 w-4 flex-shrink-0 ${page === key ? "text-brand" : "text-fg-muted"}`} />
+                <Icon className={`h-4 w-4 flex-shrink-0 ${page === key ? "text-brand-fg" : "text-fg-muted"}`} />
                 <span className={`text-sm ${page === key ? "font-medium text-fg" : "text-fg-secondary"}`}>
                   {label}
                 </span>
@@ -102,7 +102,7 @@ export function Sidebar({
         >
           <div className="flex items-center justify-between">
             <span className="text-2xs font-medium uppercase tracking-wider text-fg-muted">Gói dịch vụ</span>
-            <KeyRound className={`h-3.5 w-3.5 ${tier === "none" ? "text-warning" : "text-brand"}`} />
+            <KeyRound className={`h-3.5 w-3.5 ${tier === "none" ? "text-warning" : "text-brand-fg"}`} />
           </div>
           <div className="mt-1 text-sm font-semibold text-fg">{planLabel}</div>
           <div className="mt-0.5 text-2xs text-fg-muted">

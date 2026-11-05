@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
-import { Cpu, Info, Loader2, LogOut, Power, Radio, Server } from "lucide-react";
+import { Cpu, Info, Loader2, LogOut, Monitor, Moon, Power, Radio, Server, Sun } from "lucide-react";
 import { api, type ManagerSettings, type SystemStatus } from "../lib/api";
 import { useToast } from "./ui/toast";
+import { useTheme } from "../lib/useTheme";
+import type { ThemePreference } from "../lib/theme";
 
 interface SettingsPageProps {
   status: SystemStatus | null;
@@ -11,8 +13,15 @@ interface SettingsPageProps {
 }
 
 /** App-wide settings: release channel, environment details, session controls. */
+const THEME_OPTIONS: { key: ThemePreference; label: string; hint: string; icon: typeof Sun }[] = [
+  { key: "system", label: "Theo hệ thống", hint: "Đổi theo cài đặt sáng/tối của máy", icon: Monitor },
+  { key: "light", label: "Sáng", hint: "Nền sáng, luôn bật", icon: Sun },
+  { key: "dark", label: "Tối", hint: "Nền tối, luôn bật", icon: Moon },
+];
+
 export function SettingsPage({ status, authRequired, onLogout, onQuit }: SettingsPageProps) {
   const toast = useToast();
+  const theme = useTheme();
   const [current, setCurrent] = useState<ManagerSettings | null>(null);
   const [channel, setChannel] = useState<"stable" | "preview">("stable");
   const [saving, setSaving] = useState(false);
@@ -54,6 +63,57 @@ export function SettingsPage({ status, authRequired, onLogout, onQuit }: Setting
         <p className="mt-0.5 text-xs text-fg-muted">Kênh phát hành, môi trường chạy và phiên làm việc.</p>
       </div>
 
+      <section className="card p-4" aria-labelledby="appearance-heading">
+        <div className="mb-2 flex items-center gap-2">
+          <Sun className="h-4 w-4 text-warning" />
+          <h2 id="appearance-heading" className="text-sm font-semibold text-fg">
+            Giao diện
+          </h2>
+        </div>
+        <p className="mb-3 text-xs text-fg-muted">
+          Bảng màu sáng hoặc tối. "Theo hệ thống" bám theo cài đặt của Windows và đổi ngay
+          khi bạn chuyển chế độ trong hệ điều hành.
+        </p>
+        <div
+          role="radiogroup"
+          aria-label="Giao diện"
+          className="grid grid-cols-1 gap-2 sm:grid-cols-3"
+        >
+          {THEME_OPTIONS.map(({ key, label, hint, icon: Icon }) => {
+            const selected = theme.preference === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                onClick={() => theme.setPreference(key)}
+                className={`flex items-start gap-2.5 rounded-lg border p-3 text-left transition-colors ${
+                  selected
+                    ? "border-brand/40 bg-brand-subtle"
+                    : "border-line bg-surface-2/40 hover:border-line-strong hover:bg-surface-2/70"
+                }`}
+              >
+                <Icon className={`mt-0.5 h-4 w-4 flex-shrink-0 ${selected ? "text-brand-fg" : "text-fg-muted"}`} />
+                <span className="min-w-0">
+                  <span className={`block text-xs font-medium ${selected ? "text-fg" : "text-fg-secondary"}`}>
+                    {label}
+                  </span>
+                  <span className="mt-0.5 block text-2xs leading-snug text-fg-muted">{hint}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <p className="mt-2.5 text-2xs text-fg-muted">
+          Đang hiển thị nền{" "}
+          <span className="font-medium text-fg-secondary">
+            {theme.resolved === "dark" ? "tối" : "sáng"}
+          </span>
+          {theme.preference === "system" && " (theo hệ thống)"}.
+        </p>
+      </section>
+
       <section className="card p-4" aria-labelledby="channel-heading">
         <div className="mb-2 flex items-center gap-2">
           <Radio className="h-4 w-4 text-info" />
@@ -83,7 +143,7 @@ export function SettingsPage({ status, authRequired, onLogout, onQuit }: Setting
 
       <section className="card p-4" aria-labelledby="env-heading">
         <div className="mb-3 flex items-center gap-2">
-          <Cpu className="h-4 w-4 text-brand" />
+          <Cpu className="h-4 w-4 text-brand-fg" />
           <h2 id="env-heading" className="text-sm font-semibold text-fg">
             Môi trường
           </h2>

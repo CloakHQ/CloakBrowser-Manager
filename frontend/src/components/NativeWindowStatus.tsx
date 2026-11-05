@@ -50,7 +50,7 @@ export function NativeWindowStatus({
             />
           </div>
         )}
-        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-brand/10 border border-brand/25 text-brand shadow-glow">
+        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-brand/10 border border-brand/25 text-brand-fg shadow-glow">
           <Monitor className="h-6 w-6" />
         </div>
         <h2 className="text-lg font-semibold text-fg">Đã mở trong cửa sổ gốc</h2>
@@ -58,7 +58,7 @@ export function NativeWindowStatus({
           {profileName} đang chạy trực tiếp trên máy này. Dùng cửa sổ CloakBrowser của hồ sơ để duyệt web.
         </p>
         <div className="mt-6 inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-surface-2/50 px-3.5 py-2 text-xs text-fg-secondary">
-          <ExternalLink className="h-3.5 w-3.5 text-brand" />
+          <ExternalLink className="h-3.5 w-3.5 text-brand-fg" />
           <span>Vẫn có thể tự động hóa qua CDP của Manager</span>
           <CdpEndpointButton cdpUrl={cdpUrl} />
         </div>

@@ -110,7 +110,7 @@ export function ProfileTable({
     return (
       <div className="empty-state">
         <div className="relative mb-2 flex h-16 w-16 items-center justify-center rounded-2xl border border-brand/30 bg-gradient-to-br from-brand/20 to-brand-deep/5 shadow-glow">
-          <Fingerprint className="h-8 w-8 text-brand" />
+          <Fingerprint className="h-8 w-8 text-brand-fg" />
         </div>
         <p className="text-lg font-semibold text-fg">Chưa có hồ sơ</p>
         <p className="max-w-md text-sm leading-relaxed text-fg-secondary">
@@ -118,7 +118,7 @@ export function ProfileTable({
         </p>
         <div className="my-2 flex flex-wrap items-center justify-center gap-2 text-xs text-fg-muted">
           <span className="badge-neutral px-3 py-1">
-            <Fingerprint className="h-3 w-3 text-brand" />
+            <Fingerprint className="h-3 w-3 text-brand-fg" />
             Vân tay độc lập
           </span>
           <span className="badge-neutral px-3 py-1">
@@ -177,7 +177,7 @@ export function ProfileTable({
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           icon={<Layers className="h-3.5 w-3.5" />}
-          iconClass="bg-brand/10 border-brand/20 text-brand"
+          iconClass="bg-brand/10 border-brand/20 text-brand-fg"
           label="Hồ sơ"
           value={profiles.length}
           caption="tổng số hồ sơ trình duyệt"
@@ -208,7 +208,7 @@ export function ProfileTable({
           value={<span className="text-lg">{TIER_LABEL[tier] ?? tier}</span>}
           caption={
             noKey ? (
-              <button onClick={onOpenSettings} className="font-medium text-brand hover:underline">
+              <button onClick={onOpenSettings} className="font-medium text-brand-fg hover:underline">
                 Thêm key trong Cài đặt
               </button>
             ) : plan ? (

@@ -15,33 +15,38 @@ export default {
   theme: {
     extend: {
       colors: {
+        // Every colour is a CSS variable defined in globals.css, so the same
+        // semantic names resolve differently in the light and dark themes.
         surface: {
-          0: "#080B11",
-          1: "#0E131D",
-          2: "#141B29",
-          3: "#1B2436",
-          4: "#243047",
+          0: "rgb(var(--surface-0) / <alpha-value>)",
+          1: "rgb(var(--surface-1) / <alpha-value>)",
+          2: "rgb(var(--surface-2) / <alpha-value>)",
+          3: "rgb(var(--surface-3) / <alpha-value>)",
+          4: "rgb(var(--surface-4) / <alpha-value>)",
         },
         fg: {
-          DEFAULT: "#F1F5F9",
-          secondary: "#94A3B8",
-          muted: "#64748B",
+          DEFAULT: "rgb(var(--fg) / <alpha-value>)",
+          secondary: "rgb(var(--fg-secondary) / <alpha-value>)",
+          muted: "rgb(var(--fg-muted) / <alpha-value>)",
         },
         line: {
-          DEFAULT: "#1E2738",
-          strong: "#2E3B54",
+          DEFAULT: "rgb(var(--line) / <alpha-value>)",
+          strong: "rgb(var(--line-strong) / <alpha-value>)",
         },
         brand: {
-          DEFAULT: "#6366F1",
-          hover: "#818CF8",
-          // Gradient end stop (was the raw indigo-600).
-          deep: "#4F46E5",
-          subtle: "rgba(99, 102, 241, 0.14)",
+          DEFAULT: "rgb(var(--brand) / <alpha-value>)",
+          hover: "rgb(var(--brand-hover) / <alpha-value>)",
+          // Gradient end stop.
+          deep: "rgb(var(--brand-deep) / <alpha-value>)",
+          // Accent text/icons: same hue as `brand`, lightened in dark so it
+          // clears 4.5:1 on the surfaces it sits on.
+          fg: "rgb(var(--brand-fg) / <alpha-value>)",
+          subtle: "rgb(var(--brand) / var(--brand-subtle-alpha))",
         },
-        success: "#10B981",
-        warning: "#F59E0B",
-        danger: "#F43F5E",
-        info: "#38BDF8",
+        success: "rgb(var(--success) / <alpha-value>)",
+        warning: "rgb(var(--warning) / <alpha-value>)",
+        danger: "rgb(var(--danger) / <alpha-value>)",
+        info: "rgb(var(--info) / <alpha-value>)",
       },
       borderRadius: {
         sm: "6px",
@@ -60,10 +65,12 @@ export default {
         "2xl": ["24px", "32px"],
       },
       boxShadow: {
-        card: "0 1px 3px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.04)",
-        elevated: "0 8px 24px -4px rgba(0, 0, 0, 0.5), 0 2px 6px -1px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.05)",
-        popover: "0 20px 48px -8px rgba(0, 0, 0, 0.65), 0 0 1px 1px rgba(255, 255, 255, 0.06)",
-        glow: "0 0 20px -4px rgba(99, 102, 241, 0.45)",
+        // Per-theme in globals.css: a dark theme needs drop shadows, a light
+        // one needs hairlines instead.
+        card: "var(--shadow-card)",
+        elevated: "var(--shadow-elevated)",
+        popover: "var(--shadow-popover)",
+        glow: "var(--shadow-glow)",
       },
       spacing: {
         rail: "3.25rem",

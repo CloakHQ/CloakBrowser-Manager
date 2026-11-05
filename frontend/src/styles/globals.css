@@ -2,6 +2,88 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Theme tokens. Every colour is stored as an "R G B" triple so Tailwind's
+ * `<alpha-value>` modifiers keep working (`bg-surface-1/90`). Dark is the
+ * default; `data-theme="light"` on <html> swaps the palette. The theme module
+ * (src/lib/theme.ts) resolves "system" to one of the two.
+ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: 8 11 17;
+  --surface-1: 14 19 29;
+  --surface-2: 20 27 41;
+  --surface-3: 27 36 54;
+  --surface-4: 36 48 71;
+  --fg: 241 245 249;
+  --fg-secondary: 148 163 184;
+  /* Muted, not invisible: 5.9:1 on surface-1 and still 4.9:1 on surface-3,
+     which is the darkest surface low-emphasis text ever sits on. */
+  --fg-muted: 133 146 165;
+  --line: 30 39 56;
+  --line-strong: 46 59 84;
+  /* `brand` is a fill (white text on it, 4.9:1). Accent text and icons use
+     `brand-fg`, which is lightened for dark surfaces (6.6:1 on surface-1). */
+  --brand: 91 94 238;
+  --brand-hover: 94 97 239;
+  --brand-deep: 79 70 229;
+  --brand-fg: 139 143 250;
+  --brand-subtle-alpha: 0.14;
+  --success: 16 185 129;
+  --warning: 245 158 11;
+  --danger: 244 63 94;
+  --info: 56 189 248;
+
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --shadow-elevated: 0 8px 24px -4px rgba(0, 0, 0, 0.5), 0 2px 6px -1px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --shadow-popover: 0 20px 48px -8px rgba(0, 0, 0, 0.65), 0 0 1px 1px rgba(255, 255, 255, 0.06);
+  --shadow-glow: 0 0 20px -4px rgb(var(--brand) / 0.45);
+  --input-inset: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+  --bg-glow: radial-gradient(ellipse 80% 50% at 50% -20%, rgb(var(--brand) / 0.08), transparent),
+    radial-gradient(ellipse 60% 40% at 100% 100%, rgb(var(--info) / 0.04), transparent);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --surface-0: 246 247 251;
+  --surface-1: 255 255 255;
+  --surface-2: 242 244 249;
+  --surface-3: 232 236 244;
+  --surface-4: 218 224 235;
+  --fg: 15 23 42;
+  --fg-secondary: 71 85 105;
+  /* 4.8:1 on surface-2 — the light palette has less headroom than the dark
+     one, so the muted tone has to come down further than a straight swap. */
+  --fg-muted: 91 103 121;
+  --line: 226 232 240;
+  --line-strong: 203 213 225;
+  --brand: 79 70 229;
+  --brand-hover: 81 72 231;
+  --brand-deep: 67 56 202;
+  /* On a light surface the fill is already dark enough to read as text. */
+  --brand-fg: 79 70 229;
+  --brand-subtle-alpha: 0.1;
+  /* Both are darkened from the dark-theme hue so the badge text clears 4.5:1
+     against its own 10% tint. */
+  --success: 4 120 87;
+  --warning: 159 79 6;
+  --danger: 190 18 60;
+  --info: 3 105 161;
+
+  /* A light surface separates by hairline, not by drop shadow. */
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --shadow-elevated: 0 8px 24px -6px rgba(15, 23, 42, 0.16), 0 2px 6px -2px rgba(15, 23, 42, 0.08);
+  --shadow-popover: 0 18px 44px -12px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(15, 23, 42, 0.05);
+  --shadow-glow: 0 0 18px -6px rgb(var(--brand) / 0.35);
+  --input-inset: inset 0 1px 2px rgba(15, 23, 42, 0.05);
+  --bg-glow: radial-gradient(ellipse 80% 50% at 50% -20%, rgb(var(--brand) / 0.1), transparent),
+    radial-gradient(ellipse 60% 40% at 100% 100%, rgb(var(--info) / 0.08), transparent);
+}
+
 @layer base {
   * {
     box-sizing: border-box;
@@ -19,11 +101,9 @@
       -apple-system, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    background-color: theme("colors.surface.0");
-    background-image:
-      radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99, 102, 241, 0.08), transparent),
-      radial-gradient(ellipse 60% 40% at 100% 100%, rgba(56, 189, 248, 0.04), transparent);
-    color: theme("colors.fg.DEFAULT");
+    background-color: rgb(var(--surface-0));
+    background-image: var(--bg-glow);
+    color: rgb(var(--fg));
   }
 
   /* Scrollbars follow the line tokens instead of hardcoded greys. */
@@ -35,13 +115,13 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: theme("colors.line.DEFAULT");
+    background: rgb(var(--line));
     border-radius: 9999px;
     border: 2px solid transparent;
     background-clip: content-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: theme("colors.line.strong");
+    background: rgb(var(--line-strong));
     background-clip: content-box;
   }
 
@@ -56,11 +136,11 @@
   }
 
   input[type="checkbox"] {
-    accent-color: theme("colors.brand.DEFAULT");
+    accent-color: rgb(var(--brand));
   }
 
   :focus-visible {
-    outline: 2px solid theme("colors.brand.DEFAULT");
+    outline: 2px solid rgb(var(--brand));
     outline-offset: 2px;
   }
 }
@@ -95,7 +175,7 @@
       text-sm text-fg placeholder-fg-muted transition-all duration-150
       hover:border-line-strong
       focus:outline-none focus:border-brand focus:ring-2 focus:ring-brand/20;
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--input-inset);
   }
   select.input {
     @apply pr-8 cursor-pointer bg-surface-0/90;
@@ -155,14 +235,14 @@
   }
   .sidebar-item[data-selected="true"] {
     @apply bg-gradient-to-r from-brand/15 to-brand/5 border-brand/35;
-    box-shadow: inset 2px 0 0 theme("colors.brand.DEFAULT");
+    box-shadow: inset 2px 0 0 rgb(var(--brand));
   }
   .rail-item {
     @apply flex h-8 w-8 items-center justify-center rounded-lg
       text-fg-secondary transition-all duration-150 hover:bg-surface-3 hover:text-fg;
   }
   .rail-item[data-active="true"] {
-    @apply bg-brand-subtle text-brand;
+    @apply bg-brand-subtle text-brand-fg;
   }
   .statusbar {
     @apply flex h-statusbar items-center gap-3 border-t border-line bg-surface-1/95
@@ -188,7 +268,7 @@
     @apply bg-surface-2/60;
   }
   .data-table tbody tr[data-selected="true"] {
-    @apply bg-brand-subtle/70;
+    @apply bg-brand/10;
   }
 
   /* ---- misc --------------------------------------------------------- */

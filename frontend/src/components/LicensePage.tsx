@@ -91,7 +91,7 @@ export function LicensePage({ status, onStatusChange }: LicensePageProps) {
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <StatCard
           icon={<ShieldCheck className="h-3.5 w-3.5" />}
-          iconClass="bg-brand/10 border-brand/20 text-brand"
+          iconClass="bg-brand/10 border-brand/20 text-brand-fg"
           label="Gói hiện tại"
           value={<span className="text-lg">{TIER_LABEL[tier] ?? tier}</span>}
           caption={plan ? `gói: ${plan === "free" ? "miễn phí" : plan}` : "chưa xác định"}
@@ -114,7 +114,7 @@ export function LicensePage({ status, onStatusChange }: LicensePageProps) {
 
       <section className="card p-4" aria-labelledby="shared-key-heading">
         <div className="mb-2 flex items-center gap-2">
-          <KeyRound className="h-3.5 w-3.5 text-brand" />
+          <KeyRound className="h-3.5 w-3.5 text-brand-fg" />
           <h2 id="shared-key-heading" className="text-sm font-semibold text-fg">
             Key dùng chung
           </h2>
@@ -157,7 +157,7 @@ export function LicensePage({ status, onStatusChange }: LicensePageProps) {
             href="https://cloakbrowser.dev/free"
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-1 font-medium text-brand hover:underline"
+            className="inline-flex items-center gap-1 font-medium text-brand-fg hover:underline"
           >
             <span>Lấy key miễn phí</span>
             <ExternalLink className="h-3 w-3" />

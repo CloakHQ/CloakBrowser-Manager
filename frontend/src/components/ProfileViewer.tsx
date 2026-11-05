@@ -328,7 +328,7 @@ export function ProfileViewer({
             onClick={toggleClipboardSync}
             className={`inline-flex items-center justify-center rounded-md p-1.5 transition-colors ${
               clipboardSync
-                ? "bg-brand-subtle text-brand"
+                ? "bg-brand-subtle text-brand-fg"
                 : "text-fg-muted hover:bg-surface-3 hover:text-fg"
             }`}
             title={clipboardSync ? "Tắt đồng bộ clipboard" : "Bật đồng bộ clipboard"}
@@ -366,7 +366,7 @@ export function ProfileViewer({
                 className="flex items-start gap-2 rounded-md border border-line bg-surface-2/95 px-3 py-2 shadow-lg"
               >
                 {transfer.state === "uploading" ? (
-                  <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-brand" />
+                  <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-brand-fg" />
                 ) : transfer.state === "done" ? (
                   <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" />
                 ) : (
@@ -387,7 +387,7 @@ export function ProfileViewer({
                     <button
                       type="button"
                       onClick={() => void files.retryTransfer(transfer.id)}
-                      className="mt-1 text-xs text-brand hover:underline"
+                      className="mt-1 text-xs text-brand-fg hover:underline"
                     >
                       Thử lại
                     </button>

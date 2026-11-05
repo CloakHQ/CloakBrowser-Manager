@@ -103,7 +103,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                       toast.action?.onClick();
                       dismiss(toast.id);
                     }}
-                    className="mt-1.5 text-xs font-medium text-brand hover:underline"
+                    className="mt-1.5 text-xs font-medium text-brand-fg hover:underline"
                   >
                     {toast.action.label}
                   </button>

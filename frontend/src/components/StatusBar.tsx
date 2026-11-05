@@ -37,7 +37,7 @@ export function StatusBar({ status }: { status: SystemStatus | null }) {
             className="inline-flex items-center gap-1.5 whitespace-nowrap text-fg-secondary"
             title="Đang chạy / tổng số hồ sơ"
           >
-            <MonitorSmartphone className="h-3 w-3 text-brand" />
+            <MonitorSmartphone className="h-3 w-3 text-brand-fg" />
             {running}/{total} hồ sơ đang chạy
           </span>
           <span className="hidden h-3 w-px bg-line md:block" />

@@ -240,7 +240,7 @@ export function ProfileFilesButton({
         aria-label={`Tệp của hồ sơ, ${files.length} tệp`}
         title="Các tệp của hồ sơ này"
         className={`relative inline-flex items-center justify-center rounded-md p-1.5 transition-colors focus:outline-none focus:ring-2 focus:ring-brand/50 ${
-          open || files.length ? "bg-brand-subtle text-brand" : "text-fg-muted hover:bg-surface-3 hover:text-fg"
+          open || files.length ? "bg-brand-subtle text-brand-fg" : "text-fg-muted hover:bg-surface-3 hover:text-fg"
         }`}
       >
         {uploading ? (
@@ -304,7 +304,7 @@ export function ProfileFilesButton({
                   {file.kind === "download" ? (
                     <FileDown className="h-3.5 w-3.5 shrink-0 text-info" aria-label="Trình duyệt đã tải xuống" />
                   ) : (
-                    <FileUp className="h-3.5 w-3.5 shrink-0 text-brand" aria-label="Đã tải lên" />
+                    <FileUp className="h-3.5 w-3.5 shrink-0 text-brand-fg" aria-label="Đã tải lên" />
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-xs font-medium text-fg" title={file.name}>
@@ -312,7 +312,7 @@ export function ProfileFilesButton({
                     </div>
                     <div className="text-[11px] text-fg-muted">
                       {file.state === "pending" ? (
-                        <span className="text-brand">Đang tải xuống...</span>
+                        <span className="text-brand-fg">Đang tải xuống...</span>
                       ) : file.state === "failed" ? (
                         <span className="text-danger">Tải xuống thất bại</span>
                       ) : (

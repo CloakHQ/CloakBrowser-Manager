@@ -109,7 +109,7 @@ export function KeyPoolPanel() {
           title="Kiểm tra lại toàn bộ key trong kho với máy chủ bản quyền"
         >
           {busy === "check" ? (
-            <Loader2 className="h-3 w-3 animate-spin text-brand" />
+            <Loader2 className="h-3 w-3 animate-spin text-brand-fg" />
           ) : (
             <RefreshCw className="h-3 w-3" />
           )}

@@ -36,7 +36,7 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
           : "Đang khởi chạy...";
     return (
       <button disabled className="btn-secondary h-8 text-xs opacity-70 cursor-not-allowed flex items-center gap-1.5">
-        <Loader2 className="h-3.5 w-3.5 animate-spin text-brand" />
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-fg" />
         <span>{label}</span>
       </button>
     );
