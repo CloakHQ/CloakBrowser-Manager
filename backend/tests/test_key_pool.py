@@ -375,8 +375,8 @@ def _fake_seats(monkeypatch, *, state="ok", active=0, limit=1, calls=None):
     monkeypatch.setattr(license_module, "get_session_seats", fake)
 
 
-async def _launching_manager(module, monkeypatch):
-    manager = BrowserManager(NATIVE_RUNTIME)
+async def _launching_manager(module, monkeypatch, *, license_key=None):
+    manager = BrowserManager(NATIVE_RUNTIME, license_key=license_key)
     manager._wait_for_cdp = AsyncMock()
 
     async def launch(**kwargs):
@@ -506,6 +506,56 @@ async def test_an_unpinned_launch_cannot_take_a_key_pinned_to_a_stopped_profile(
     running = await manager.launch(_profile(tmp_path, "someone-else"))
     assert running.license_key_id == pool.key_id("cb_free")
     assert manager.leased_keys() == {"someone-else": pool.key_id("cb_free")}
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pin_to_a_removed_key_does_not_block_other_profiles(
+    pool, monkeypatch, tmp_path: Path
+):
+    """A pin to a key no longer in the pool must not deadlock the whole app.
+
+    Reported in the field: every profile was stopped, yet launches were refused
+    with "the app-wide license key is already in use by, or reserved for,
+    another profile" — because one stopped profile still pinned a key that had
+    since been deleted from the pool. The stale pin reserved that key id, the
+    app-wide key fell back to the same id, and nothing could start.
+    """
+    from backend import browser_manager as module
+
+    pool.add("cb_live")
+    live_id = pool.key_id("cb_live")
+
+    db.create_profile(name="stale", profile_id="stale", license_key_id="deadbeef0000")
+    manager = await _launching_manager(module, monkeypatch, license_key="cb_live")
+
+    # The stale pin's owner is still refused for its own (explained) reason...
+    stale = _profile(tmp_path, "stale")
+    stale["license_key_id"] = "deadbeef0000"
+    with pytest.raises(Exception) as raised:
+        await manager.launch(stale)
+    assert "no longer in the key pool" in str(raised.value)
+
+    # ...but it no longer takes the healthy key hostage.
+    running = await manager.launch(_profile(tmp_path, "healthy"))
+    assert running.license_key_id == live_id
+
+
+@pytest.mark.asyncio
+async def test_a_seat_refusal_names_the_profile_holding_the_app_wide_key(
+    pool, monkeypatch, tmp_path: Path
+):
+    from backend import browser_manager as module
+
+    manager = await _launching_manager(module, monkeypatch, license_key="cb_appwide")
+    owner = _profile(tmp_path, "owner")
+    running = await manager.launch(owner)
+
+    with pytest.raises(CloakBrowserLicenseError) as raised:
+        await manager.launch(_profile(tmp_path, "rival"))
+    assert is_seat_limit_error(raised.value)
+    # The message must say who to stop, or it is unactionable.
+    assert "owner" in str(raised.value)
+    await manager.stop(running.profile_id)
 
 
 @pytest.mark.asyncio
