@@ -13,9 +13,21 @@ export function proxyHost(proxy: string | null): string | null {
   }
 }
 
+export const PROVIDER_LABEL: Record<string, string> = {
+  none: "Tùy chỉnh",
+  manual: "Tùy chỉnh",
+  kiotproxy: "KiotProxy",
+  tmproxy: "TMProxy",
+};
+
+/**
+ * How a profile's traffic leaves. A rotating provider counts as proxied even
+ * before the first launch — the address is only known once it has fetched one.
+ */
 export function profileProxyLabel(p: Profile): string | null {
   const provider = String(p.proxy_provider ?? "");
-  if (p.active_proxy && provider && provider !== "none" && provider !== "manual") return provider;
+  const rotating = provider !== "" && provider !== "none" && provider !== "manual";
+  if (rotating) return p.active_proxy?.host ?? PROVIDER_LABEL[provider] ?? provider;
   return proxyHost(p.proxy);
 }
 
@@ -91,6 +103,8 @@ interface RowMenuProps {
   onMoveDown?: () => void;
   canMoveUp?: boolean;
   canMoveDown?: boolean;
+  /** Open upward — the table clips overflow, so the last rows need it. */
+  flipUp?: boolean;
 }
 
 export function RowMenu({
@@ -102,6 +116,7 @@ export function RowMenu({
   onMoveDown,
   canMoveUp = false,
   canMoveDown = false,
+  flipUp = false,
 }: RowMenuProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -168,7 +183,9 @@ export function RowMenu({
       {open && (
         <div
           role="menu"
-          className="absolute right-0 top-full z-popover mt-1 w-48 rounded-lg border border-line bg-surface-2 p-1 shadow-popover"
+          className={`absolute right-0 z-popover w-48 rounded-lg border border-line bg-surface-2 p-1 shadow-popover ${
+            flipUp ? "bottom-full mb-1" : "top-full mt-1"
+          }`}
         >
           {item("Mở cấu hình", <SlidersHorizontal className="h-3.5 w-3.5" />, onEdit)}
           {item("Sao chép hồ sơ", <Copy className="h-3.5 w-3.5" />, onDuplicate)}

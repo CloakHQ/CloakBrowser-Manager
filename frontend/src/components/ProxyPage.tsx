@@ -1,15 +1,7 @@
 import { useMemo, useState } from "react";
 import { Globe, KeyRound, Link2Off, RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Profile } from "../lib/api";
-import { profileProxyLabel, proxyHost } from "./ProfileTableParts";
-import { StatCard } from "./ProfileTableParts";
-
-const PROVIDER_LABEL: Record<string, string> = {
-  none: "Tùy chỉnh",
-  manual: "Tùy chỉnh",
-  kiotproxy: "KiotProxy",
-  tmproxy: "TMProxy",
-};
+import { PROVIDER_LABEL, StatCard, profileProxyLabel, proxyHost } from "./ProfileTableParts";
 
 const REGION_LABEL: Record<string, string> = {
   bac: "Miền Bắc",

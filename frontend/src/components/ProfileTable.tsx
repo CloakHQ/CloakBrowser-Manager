@@ -273,7 +273,7 @@ export function ProfileTable({
                     </td>
                   </tr>
                 )}
-                {rows.map((p) => {
+                {rows.map((p, rowIndex) => {
                   const stopped = p.status === "stopped";
                   const isBusy = busy.has(p.id) || p.status === "initializing";
                   const proxy = profileProxyLabel(p);
@@ -346,6 +346,7 @@ export function ProfileTable({
                             onMoveDown={() => move(orderIndex + 1)}
                             canMoveUp={orderIndex > 0}
                             canMoveDown={orderIndex >= 0 && orderIndex < profiles.length - 1}
+                            flipUp={rowIndex >= rows.length - 2}
                           />
                         </div>
                       </td>
