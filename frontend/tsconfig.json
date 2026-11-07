@@ -2,6 +2,7 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "bundler",

@@ -75,7 +75,7 @@ export function ProfileViewer({
     async function connect() {
       try {
         // Import noVNC dynamically
-        const { default: RFB } = await import("@novnc/novnc/core/rfb.js");
+        const { default: RFB } = await import("@novnc/novnc");
 
         if (cancelled) return;
 

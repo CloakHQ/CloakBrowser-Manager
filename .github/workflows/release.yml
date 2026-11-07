@@ -21,7 +21,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
-  NODE_VERSION: "20"
+  NODE_VERSION: "24.22.2"
   REGISTRY_IMAGE: cloakhq/cloakbrowser-manager
 
 jobs:

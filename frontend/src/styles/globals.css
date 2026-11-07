@@ -1,10 +1,18 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../../tailwind.config.ts";
+
+@utility btn {
+  @apply px-3 py-1.5 rounded-md text-sm font-medium transition-colors focus:outline-hidden focus:ring-2 focus:ring-accent/50;
+}
 
 @layer base {
   * {
     box-sizing: border-box;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
   }
 
   body {
@@ -42,9 +50,6 @@
 }
 
 @layer components {
-  .btn {
-    @apply px-3 py-1.5 rounded-md text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-accent/50;
-  }
   .btn-primary {
     @apply btn bg-accent text-white hover:bg-accent-hover;
   }
@@ -55,7 +60,10 @@
     @apply btn bg-red-600/20 text-red-400 hover:bg-red-600/30;
   }
   .input {
-    @apply w-full h-9 bg-surface-2 border border-border rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50;
+    @apply w-full h-9 bg-surface-2 border border-border rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-hidden focus:border-accent focus:ring-1 focus:ring-accent/50;
+  }
+  select.input:disabled {
+    opacity: 0.7;
   }
   textarea.input {
     @apply h-auto;

@@ -51,7 +51,7 @@ cd CloakBrowser-Manager
 ./run-macos.sh      # macOS  (or run-windows.bat on Windows)
 ```
 
-This path requires Python 3.10+ and Node 18+; the first run creates a local Python environment, installs dependencies, and builds the React UI before starting the Manager.
+This path requires Python 3.10+ and Node 24.15+; the first run creates a local Python environment, installs dependencies, and builds the React UI before starting the Manager.
 
 ### Linux server
 
@@ -173,7 +173,7 @@ docker compose up --build
 
 ## Requirements
 
-- Windows or macOS native: Python 3.10+, Node.js 18+
+- Windows or macOS native: Python 3.10+, Node.js 24.15+
 - Linux server: Docker 20.10+
 - ~2 GB disk (application + browser binary)
 - ~512 MB RAM per running profile

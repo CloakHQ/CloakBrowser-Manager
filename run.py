@@ -67,7 +67,7 @@ def _ensure_environment() -> Path:
 
     npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
     if not npm:
-        raise RuntimeError("Node.js 18 or newer is required to build the Manager UI")
+        raise RuntimeError("Node.js 24.15 or newer is required to build the Manager UI")
 
     package_lock = FRONTEND_DIR / "package-lock.json"
     frontend_hash = _file_hash(package_lock)
