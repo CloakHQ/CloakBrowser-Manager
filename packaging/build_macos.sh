@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the native macOS CloakBrowser Manager: freeze -> .app -> .dmg,
+# Build the native macOS CloakBrowser Manager (Custom): freeze -> .app -> .dmg,
 # optionally codesign + notarize + staple.
 #
 # Runs unsigned locally when no signing env is set. CI-ready: the same script
@@ -9,19 +9,19 @@
 #     (create once: xcrun notarytool store-credentials CB_NOTARY_PROFILE \
 #        --apple-id you@example.com --team-id TEAMID --password app-specific-pw)
 #
-# Output: dist_native/CloakBrowser-Manager-<version>.dmg
+# Output: dist_native/CloakBrowser-Manager-Custom-<version>.dmg
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="CloakBrowser Manager"
+APP_NAME="CloakBrowser Manager (Custom)"
 VERSION="$(git describe --tags --always 2>/dev/null || echo dev)"
 DIST="$ROOT/dist_native"
 BUILD="$ROOT/build_native"
 BUILD_VENV="${PACKAGING_VENV:-$ROOT/.venv-build}"
 
-echo "[build] CloakBrowser Manager $VERSION (macOS)"
+echo "[build] CloakBrowser Manager (Custom) $VERSION (macOS)"
 
 # Bake the version into the bundle so the frozen app can log its own build
 # (no .git at runtime). manager.spec ships backend/version.txt as data.
@@ -115,7 +115,7 @@ fi
 for v in "/Volumes/$APP_NAME"*; do
   [ -d "$v" ] && { hdiutil detach "$v" -force >/dev/null 2>&1 || diskutil unmount force "$v" >/dev/null 2>&1 || true; }
 done
-DMG="$DIST/CloakBrowser-Manager-$VERSION.dmg"
+DMG="$DIST/CloakBrowser-Manager-Custom-$VERSION.dmg"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"

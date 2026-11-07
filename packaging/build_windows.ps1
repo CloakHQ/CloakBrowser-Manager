@@ -1,4 +1,4 @@
-# Build the native Windows CloakBrowser Manager: freeze -> Inno Setup installer.
+# Build the native Windows CloakBrowser Manager (Custom): freeze -> Inno Setup installer.
 # Unsigned (SmartScreen click-through) for the test. CI-ready.
 #
 # Requires: Python 3.10+, Node 18+, and Inno Setup 6 (iscc.exe on PATH or at the
@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
-$AppName = "CloakBrowser Manager"
+$AppName = "CloakBrowser Manager (Custom)"
 # Version: explicit $env:CB_VERSION wins (CI / transferred source with no usable
 # .git); otherwise git describe. Never let a git hiccup abort the build
 # (ErrorAction=Stop would otherwise treat git's stderr as fatal).
@@ -28,7 +28,7 @@ $Dist = Join-Path $Root "dist_native"
 $Build = Join-Path $Root "build_native"
 $BuildVenv = if ($env:PACKAGING_VENV) { $env:PACKAGING_VENV } else { Join-Path $Root ".venv-build" }
 
-Write-Host "[build] CloakBrowser Manager $Version (Windows)"
+Write-Host "[build] CloakBrowser Manager (Custom) $Version (Windows)"
 
 # Bake the version into the bundle so the frozen app can log its own build
 # (no .git at runtime). manager.spec ships backend/version.txt as data.
@@ -71,4 +71,4 @@ if (-not (Get-Command $Iscc -ErrorAction SilentlyContinue)) {
 Write-Host "[build] Inno Setup"
 & $Iscc "/DAppVersion=$Version" "/DSourceDir=$AppDir" (Join-Path $Root "packaging\installer.iss")
 
-Write-Host "[done] $Dist\CloakBrowser-Manager-$Version-setup.exe"
+Write-Host "[done] $Dist\CloakBrowser-Manager-Custom-$Version-setup.exe"

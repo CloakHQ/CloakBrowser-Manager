@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Code2 } from "lucide-react";
+import { Check, Code2 } from "lucide-react";
 
 interface CdpEndpointButtonProps {
   cdpUrl: string | null;
@@ -21,10 +21,14 @@ export function CdpEndpointButton({ cdpUrl }: CdpEndpointButtonProps) {
   return (
     <button
       onClick={copyEndpoint}
-      className={`p-1 ${copied ? "text-emerald-400" : "text-gray-500 hover:text-gray-300"}`}
-      title={copied ? "Copied!" : "Copy CDP endpoint URL"}
+      className={`inline-flex items-center justify-center rounded-md p-1.5 transition-colors ${
+        copied
+          ? "bg-success/15 text-success"
+          : "text-fg-muted hover:bg-surface-3 hover:text-fg"
+      }`}
+      title={copied ? "Đã sao chép!" : "Sao chép URL CDP"}
     >
-      <Code2 className="h-3.5 w-3.5" />
+      {copied ? <Check className="h-3.5 w-3.5" /> : <Code2 className="h-3.5 w-3.5" />}
     </button>
   );
 }

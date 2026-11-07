@@ -21,23 +21,23 @@ export function UpdateBanner({
   };
 
   return (
-    <div className="flex items-center justify-center gap-2 px-4 py-1.5 text-xs bg-cyan-500/10 border-b border-cyan-500/30 text-cyan-300">
+    <div className="flex items-center justify-center gap-2.5 px-4 py-2 text-xs bg-info/10 border-b border-info/25 text-info backdrop-blur-sm">
       <ArrowUpCircle className="h-3.5 w-3.5 flex-shrink-0" />
       <span>
-        CloakBrowser Manager{" "}
-        <span className="font-mono font-medium">{info.latest}</span> is available.
+        CloakBrowser Manager (Custom){" "}
+        <span className="font-mono font-semibold">{info.latest}</span> đã có bản mới.
       </span>
       <button
         onClick={openRelease}
-        className="font-medium underline underline-offset-2 hover:text-cyan-200"
+        className="rounded-md bg-info/15 border border-info/30 px-2 py-0.5 font-medium hover:bg-info/25 transition-colors"
       >
-        Download
+        Tải xuống
       </button>
       <button
         onClick={onDismiss}
-        className="ml-1 p-0.5 text-cyan-400/70 hover:text-cyan-200"
-        title="Dismiss"
-        aria-label="Dismiss update notification"
+        className="ml-1 rounded p-0.5 opacity-70 hover:opacity-100 transition-opacity"
+        title="Bỏ qua"
+        aria-label="Bỏ qua thông báo cập nhật"
       >
         <X className="h-3.5 w-3.5" />
       </button>

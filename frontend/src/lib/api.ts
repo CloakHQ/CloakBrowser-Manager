@@ -19,11 +19,23 @@ export interface ProfileFile {
   container_path: string;
 }
 
+export type ProxyProvider = "none" | "kiotproxy" | "tmproxy";
+
 export interface Profile {
   id: string;
   name: string;
   fingerprint_seed: number;
   proxy: string | null;
+  proxy_provider: ProxyProvider;
+  proxy_provider_key_set: boolean;
+  proxy_provider_key_masked: string | null;
+  proxy_account_id: string | null;
+  proxy_key_id: string | null;
+  proxy_rotation_mode: "per_launch" | "sticky" | "manual";
+  kiotproxy_region: "bac" | "trung" | "nam" | "random";
+  tmproxy_location_id: number;
+  tmproxy_isp_id: number;
+  active_proxy: ProxyProviderInfo | null;
   timezone: string | null;
   locale: string | null;
   screen_width: number;
@@ -43,6 +55,8 @@ export interface Profile {
   restore_session: boolean;
   transparent_proxy: boolean;
   portable_cookies: boolean;
+  // Pinned pool key, or null to lease whichever key is free at launch.
+  license_key_id: string | null;
   notes: string | null;
   user_data_dir: string;
   created_at: string;
@@ -69,6 +83,14 @@ export interface ProfileCreateData {
   name: string;
   fingerprint_seed?: number | null;
   proxy?: string | null;
+  proxy_provider?: ProxyProvider;
+  proxy_provider_key?: string | null;
+  proxy_account_id?: string | null;
+  proxy_key_id?: string | null;
+  proxy_rotation_mode?: "per_launch" | "sticky" | "manual";
+  kiotproxy_region?: "bac" | "trung" | "nam" | "random";
+  tmproxy_location_id?: number;
+  tmproxy_isp_id?: number;
   timezone?: string | null;
   locale?: string | null;
   screen_width?: number;
@@ -88,6 +110,7 @@ export interface ProfileCreateData {
   restore_session?: boolean;
   transparent_proxy?: boolean;
   portable_cookies?: boolean;
+  license_key_id?: string | null;
   notes?: string | null;
   tags?: { tag: string; color: string | null }[];
 }
@@ -112,10 +135,140 @@ export interface ProxyTestResult {
   error?: string | null;
 }
 
+export interface ProxyProviderInfo {
+  provider: string;
+  host: string | null;
+  real_ip: string | null;
+  location: string | null;
+  isp: string | null;
+  expires_at: number | string | null;
+  ttl: number | null;
+  ttc: number | null;
+  next_request_at: number | null;
+}
+
+export interface TmProxyOption {
+  id: number;
+  name: string | null;
+}
+
+export interface ProxyAccount {
+  id: string;
+  provider: "kiotproxy" | "tmproxy";
+  label: string | null;
+  secret_masked: string | null;
+  added_at: string;
+  checked_at: string | null;
+}
+
+export interface ProxyKeyOption {
+  account_id: string;
+  account_label: string | null;
+  account_masked: string | null;
+  key_id: string | null;
+  key_masked: string | null;
+  fingerprint: string | null;
+  status: string | null;
+  expiration_at: number | string | null;
+  cooldown_remaining: number;
+  eligible: boolean;
+  in_use: boolean;
+  error: string | null;
+}
+
+export interface ProxyRotationState {
+  mode: "per_launch" | "sticky" | "manual";
+  cooldown_remaining: number;
+  usable: boolean;
+  running: boolean;
+  can_rotate: boolean;
+  blocked_reason: string | null;
+  eligible_key_count: number;
+  key_id: string | null;
+  key_masked: string | null;
+  account_id: string | null;
+  info: ProxyProviderInfo | null;
+}
+
+export interface KiotProxyKeyInfo {
+  id: string | null;
+  key_masked: string | null;
+  status: string | null;
+  effective_at: number | string | null;
+  expiration_at: number | string | null;
+  description: string | null;
+  package_id: string | null;
+  package_period_id: string | null;
+  quantity_day: number | null;
+  deleted: boolean;
+}
+
+export interface KiotProxyUserInfo {
+  id: string | null;
+  username: string | null;
+  max_key: number | null;
+  balance: number | null;
+  paid: number | null;
+  keys: KiotProxyKeyInfo[];
+}
+
+export interface TmProxyStatsInfo {
+  id_isp: number | null;
+  id_location: number | null;
+  expired_at: number | string | null;
+  plan: string | null;
+  price_per_day: number | null;
+  timeout: number | null;
+  base_next_request: number | null;
+  max_ip_per_day: number | null;
+  ip_used_today: number | null;
+  note: string | null;
+}
+
+export interface ProxyAccountSync {
+  account: ProxyAccount;
+  provider: "kiotproxy" | "tmproxy";
+  user: KiotProxyUserInfo | null;
+  keys: KiotProxyKeyInfo[] | null;
+  tmproxy: TmProxyStatsInfo | null;
+}
+
+export interface ProxyKeyReveal {
+  key: string;
+  provider: "kiotproxy" | "tmproxy";
+  label: string | null;
+  key_masked: string | null;
+  expiration_at: number | null;
+}
+
+export interface KiotProxyPackage {
+  id: string;
+  name: string;
+  code: string | null;
+  description: string | null;
+  price: number | null;
+  ttl: number | null;
+  ttc: number | null;
+  maxIpPerDay: number | null;
+}
+
+export interface KiotProxyPackagePeriod {
+  id: string;
+  packageId: string;
+  quantity: number | null;
+  period: string | null;
+  name: string | null;
+  code: string | null;
+  description: string | null;
+  price: number | null;
+  unitPrice: number | null;
+}
+
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
   license_tier: string; // "pro" | "free" | "none"
+  license_plan?: string | null; // server-reported plan, informational only
   profiles_total: number;
   host_os: HostOS;
   runtime_mode: RuntimeMode;
@@ -133,13 +286,34 @@ export interface UpdateInfo {
 }
 
 export interface ManagerSettings {
-  license_key_set: boolean;
-  license_key_masked: string | null;
   release_channel: string; // "stable" | "preview"
+  key_pool_size: number;
+}
+export interface LicenseKeyEntry {
+  id: string;
+  key_masked: string;
+  label: string | null;
+  // "valid" | "invalid" | "unreachable" | "unknown"
+  state: string;
+  plan: string | null;
+  expires: string | null;
+  added_at: string;
+  checked_at: string | null;
+  // The profile currently running on this key, or null.
+  leased_to: string | null;
+  // ISO UTC until which the license server still counts this key's last
+  // session. Null means the key can be leased right away.
+  available_at: string | null;
+}
+export interface LicenseKeyCheckResult {
+  id: string;
+  key_masked: string;
+  state: string;
+  plan: string | null;
+  expires: string | null;
 }
 
 export interface SettingsUpdate {
-  license_key?: string | null; // omit = unchanged; "" = clear
   release_channel?: string | null;
 }
 
@@ -173,7 +347,7 @@ async function request<T>(
   if (!res.ok) {
     if (res.status === 401 && _onUnauthorized) {
       _onUnauthorized();
-      throw new ApiError(401, "Unauthorized");
+        throw new ApiError(401, "Chưa được xác thực");
     }
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = body.detail;
@@ -187,7 +361,7 @@ async function request<T>(
         detail.upgrade_url,
       );
     }
-    throw new ApiError(res.status, detail || res.statusText);
+    throw new ApiError(res.status, detail || "Yêu cầu thất bại");
   }
   return res.json();
 }
@@ -227,6 +401,121 @@ export const api = {
       body: JSON.stringify({ proxy }),
     }),
 
+  kiotproxyNew: (key: string, region: "bac" | "trung" | "nam" | "random") =>
+    request<ProxyProviderInfo>("/api/proxy-providers/kiotproxy/new", {
+      method: "POST",
+      body: JSON.stringify({ key, region }),
+    }),
+  kiotproxyCurrent: (key: string) =>
+    request<ProxyProviderInfo>("/api/proxy-providers/kiotproxy/current", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  /** The provider proxy this profile's stored/saved key holds — no key input needed. */
+  profileCurrentProxy: (profileId: string) =>
+    request<ProxyProviderInfo>(`/api/profiles/${profileId}/proxy/current`, {
+      method: "POST",
+    }),
+  profileNewProxy: (profileId: string) =>
+    request<ProxyProviderInfo>(`/api/profiles/${profileId}/proxy/new`, {
+      method: "POST",
+    }),
+  profileProxyState: (profileId: string) =>
+    request<ProxyRotationState>(`/api/profiles/${profileId}/proxy/state`),
+  kiotproxyOut: (key: string) =>
+    request<{ ok: boolean }>("/api/proxy-providers/kiotproxy/out", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  tmproxyNew: (apiKey: string, locationId = 0, ispId = 0) =>
+    request<ProxyProviderInfo>("/api/proxy-providers/tmproxy/new", {
+      method: "POST",
+      body: JSON.stringify({ api_key: apiKey, location_id: locationId, isp_id: ispId }),
+    }),
+  tmproxyCurrent: (apiKey: string) =>
+    request<ProxyProviderInfo>("/api/proxy-providers/tmproxy/current", {
+      method: "POST",
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+  tmproxyLocations: () =>
+    request<TmProxyOption[]>("/api/proxy-providers/tmproxy/locations"),
+  tmproxyIsps: () => request<TmProxyOption[]>("/api/proxy-providers/tmproxy/isps"),
+
+  // ── Provider account / key management ──────────────────────────────────
+  listProxyAccounts: () => request<ProxyAccount[]>("/api/proxy-accounts"),
+  availableProxyKeys: (provider: "kiotproxy" | "tmproxy", profileId?: string) =>
+    request<ProxyKeyOption[]>(
+      `/api/proxy-providers/${provider}/available-keys` +
+        (profileId ? `?exclude_profile=${encodeURIComponent(profileId)}` : ""),
+    ),
+  createProxyAccount: (data: {
+    provider: "kiotproxy" | "tmproxy";
+    secret: string;
+    label?: string | null;
+  }) =>
+    request<ProxyAccount>("/api/proxy-accounts", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deleteProxyAccount: (id: string) =>
+    request<{ ok: boolean }>(`/api/proxy-accounts/${id}`, { method: "DELETE" }),
+  syncProxyAccount: (id: string) =>
+    request<ProxyAccountSync>(`/api/proxy-accounts/${id}/sync`, { method: "POST" }),
+  revealProxyKey: (accountId: string, keyId: string) =>
+    request<ProxyKeyReveal>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/reveal`,
+      { method: "POST" },
+    ),
+  extendProxyKey: (accountId: string, keyId: string, numberOfPeriods: number) =>
+    request<{ ok: boolean }>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/extend`,
+      { method: "POST", body: JSON.stringify({ number_of_periods: numberOfPeriods }) },
+    ),
+  deleteProxyKey: (accountId: string, keyId: string) =>
+    request<{ ok: boolean }>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/delete`,
+      { method: "POST" },
+    ),
+  rotateProxyKey: (
+    accountId: string,
+    keyId: string,
+    region: "bac" | "trung" | "nam" | "random",
+  ) =>
+    request<ProxyProviderInfo>(
+      `/api/proxy-accounts/${accountId}/keys/${keyId}/rotate`,
+      { method: "POST", body: JSON.stringify({ region }) },
+    ),
+  orderProxyKeys: (
+    accountId: string,
+    data: {
+      package_id: string;
+      quantity: number;
+      number_of_periods: number;
+      package_period_id?: string | null;
+      coupon_code?: string | null;
+    },
+  ) =>
+    request<{ ok: boolean; keys: KiotProxyKeyInfo[] }>(
+      `/api/proxy-accounts/${accountId}/keys/order`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+  rotateProxyAccount: (accountId: string, locationId = 0, ispId = 0) =>
+    request<ProxyProviderInfo>(`/api/proxy-accounts/${accountId}/rotate`, {
+      method: "POST",
+      body: JSON.stringify({ location_id: locationId, isp_id: ispId }),
+    }),
+  setProxyAccountNote: (accountId: string, note: string) =>
+    request<{ ok: boolean }>(`/api/proxy-accounts/${accountId}/note`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    }),
+  kiotproxyPackages: () =>
+    request<KiotProxyPackage[]>("/api/proxy-providers/kiotproxy/packages"),
+  kiotproxyPackagePeriods: (packageId: string) =>
+    request<KiotProxyPackagePeriod[]>(
+      `/api/proxy-providers/kiotproxy/packages/${packageId}/periods`,
+    ),
+
   updateProfile: (id: string, data: Partial<ProfileCreateData>) =>
     request<Profile>(`/api/profiles/${id}`, {
       method: "PUT",
@@ -262,10 +551,10 @@ export const api = {
     if (!res.ok) {
       if (res.status === 401 && _onUnauthorized) {
         _onUnauthorized();
-        throw new ApiError(401, "Unauthorized");
+      throw new ApiError(401, "Chưa được xác thực");
       }
       const body = await res.json().catch(() => ({ detail: res.statusText }));
-      const detail = typeof body.detail === "string" ? body.detail : res.statusText;
+      const detail = typeof body.detail === "string" ? body.detail : "Yêu cầu thất bại";
       throw new ApiError(res.status, detail);
     }
     return res.json();
@@ -296,6 +585,21 @@ export const api = {
     request<{ ok: boolean; message?: string }>("/api/shutdown", { method: "POST" }),
 
   getSettings: () => request<ManagerSettings>("/api/settings"),
+  listKeys: () => request<LicenseKeyEntry[]>("/api/keys"),
+  addKeys: (keys: string, label?: string) =>
+    request<LicenseKeyEntry[]>("/api/keys", {
+      method: "POST",
+      body: JSON.stringify({ keys, label: label ?? null }),
+    }),
+  deleteKey: (id: string) =>
+    request<{ ok: boolean }>(`/api/keys/${id}`, { method: "DELETE" }),
+  // No ids = re-check the whole pool. The backend field is a list, so send
+  // [] (not null) for "all" or Pydantic rejects the body with a 422.
+  checkKeys: (ids?: string[]) =>
+    request<LicenseKeyCheckResult[]>("/api/keys/check", {
+      method: "POST",
+      body: JSON.stringify({ ids: ids ?? [] }),
+    }),
 
   updateSettings: (data: SettingsUpdate) =>
     request<SystemStatus>("/api/settings", {
@@ -312,3 +616,4 @@ export const api = {
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
 };
+

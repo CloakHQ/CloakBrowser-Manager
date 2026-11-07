@@ -30,13 +30,13 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
   if (loading || status === "initializing") {
     const label =
       status === "initializing"
-        ? "First-time setup..."
+        ? "Thiết lập lần đầu..."
         : status === "running"
-          ? "Stopping..."
-          : "Launching...";
+          ? "Đang dừng..."
+          : "Đang khởi chạy...";
     return (
-      <button disabled className="btn-secondary opacity-60 cursor-not-allowed flex items-center gap-1.5">
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <button disabled className="btn-secondary h-8 text-xs opacity-70 cursor-not-allowed flex items-center gap-1.5">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-fg" />
         <span>{label}</span>
       </button>
     );
@@ -44,17 +44,17 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
 
   if (status === "running") {
     return (
-      <button onClick={handleClick} className="btn-danger flex items-center gap-1.5">
-        <Square className="h-3.5 w-3.5" />
-        <span>Stop</span>
+      <button onClick={handleClick} className="btn-danger h-8 text-xs flex items-center gap-1.5">
+        <Square className="h-3.5 w-3.5 fill-current" />
+        <span>Dừng</span>
       </button>
     );
   }
 
   return (
-    <button onClick={handleClick} className="btn-primary flex items-center gap-1.5">
-      <Play className="h-3.5 w-3.5" />
-      <span>Launch</span>
+    <button onClick={handleClick} className="btn-primary h-8 text-xs flex items-center gap-1.5">
+      <Play className="h-3.5 w-3.5 fill-current" />
+      <span>Khởi chạy</span>
     </button>
   );
 }

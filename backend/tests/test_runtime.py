@@ -26,7 +26,7 @@ def test_windows_defaults_to_native(tmp_path: Path):
     )
     assert config.runtime_mode == "native"
     assert config.viewer_mode == "native-window"
-    assert config.data_dir == tmp_path / "CloakBrowser Manager"
+    assert config.data_dir == tmp_path / "CloakBrowser Manager (Custom)"
 
 
 def test_macos_defaults_to_native(tmp_path: Path):
@@ -34,7 +34,7 @@ def test_macos_defaults_to_native(tmp_path: Path):
     assert config.runtime_mode == "native"
     assert config.viewer_mode == "native-window"
     assert config.data_dir == (
-        tmp_path / "Library" / "Application Support" / "CloakBrowser Manager"
+        tmp_path / "Library" / "Application Support" / "CloakBrowser Manager (Custom)"
     )
 
 

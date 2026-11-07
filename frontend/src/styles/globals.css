@@ -2,32 +2,123 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Theme tokens. Every colour is stored as an "R G B" triple so Tailwind's
+ * `<alpha-value>` modifiers keep working (`bg-surface-1/90`). Dark is the
+ * default; `data-theme="light"` on <html> swaps the palette. The theme module
+ * (src/lib/theme.ts) resolves "system" to one of the two.
+ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: 10 13 20;
+  --surface-1: 15 19 28;
+  --surface-2: 22 28 42;
+  --surface-3: 31 39 58;
+  --surface-4: 42 52 76;
+  --fg: 243 246 251;
+  --fg-secondary: 153 167 189;
+  --fg-muted: 112 126 148;
+  --line: 28 36 52;
+  --line-strong: 44 56 80;
+  --brand: 99 102 241;
+  --brand-hover: 114 118 248;
+  --brand-deep: 79 70 229;
+  --brand-fg: 146 153 255;
+  --brand-subtle-alpha: 0.15;
+  --success: 16 185 129;
+  --warning: 245 158 11;
+  --danger: 244 63 94;
+  --info: 56 189 248;
+
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --shadow-elevated: 0 10px 30px -6px rgba(0, 0, 0, 0.6), 0 3px 8px -2px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-popover: 0 24px 50px -10px rgba(0, 0, 0, 0.75), 0 0 1px 1px rgba(255, 255, 255, 0.08);
+  --shadow-glow: 0 0 24px -4px rgb(var(--brand) / 0.5);
+  --input-inset: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  --bg-glow: radial-gradient(ellipse 90% 60% at 50% -20%, rgb(var(--brand) / 0.12), transparent 70%),
+    radial-gradient(ellipse 60% 40% at 100% 100%, rgb(var(--info) / 0.05), transparent 60%);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --surface-0: 246 247 251;
+  --surface-1: 255 255 255;
+  --surface-2: 242 244 249;
+  --surface-3: 232 236 244;
+  --surface-4: 218 224 235;
+  --fg: 15 23 42;
+  --fg-secondary: 71 85 105;
+  /* 4.8:1 on surface-2 — the light palette has less headroom than the dark
+     one, so the muted tone has to come down further than a straight swap. */
+  --fg-muted: 91 103 121;
+  --line: 226 232 240;
+  --line-strong: 203 213 225;
+  --brand: 79 70 229;
+  --brand-hover: 81 72 231;
+  --brand-deep: 67 56 202;
+  /* On a light surface the fill is already dark enough to read as text. */
+  --brand-fg: 79 70 229;
+  --brand-subtle-alpha: 0.1;
+  /* Both are darkened from the dark-theme hue so the badge text clears 4.5:1
+     against its own 10% tint. */
+  --success: 4 120 87;
+  --warning: 159 79 6;
+  --danger: 190 18 60;
+  --info: 3 105 161;
+
+  /* A light surface separates by hairline, not by drop shadow. */
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --shadow-elevated: 0 8px 24px -6px rgba(15, 23, 42, 0.16), 0 2px 6px -2px rgba(15, 23, 42, 0.08);
+  --shadow-popover: 0 18px 44px -12px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(15, 23, 42, 0.05);
+  --shadow-glow: 0 0 18px -6px rgb(var(--brand) / 0.35);
+  --input-inset: inset 0 1px 2px rgba(15, 23, 42, 0.05);
+  --bg-glow: radial-gradient(ellipse 80% 50% at 50% -20%, rgb(var(--brand) / 0.1), transparent),
+    radial-gradient(ellipse 60% 40% at 100% 100%, rgb(var(--info) / 0.08), transparent);
+}
+
 @layer base {
   * {
     box-sizing: border-box;
   }
 
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
-      system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
+  html,
+  body,
+  #root {
+    height: 100%;
   }
 
-  /* Scrollbar styling */
+  body {
+    margin: 0;
+    font-family: "Inter Variable", "Inter", "Segoe UI Variable", "Segoe UI", system-ui,
+      -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: rgb(var(--surface-0));
+    background-image: var(--bg-glow);
+    color: rgb(var(--fg));
+  }
+
+  /* Scrollbars follow the line tokens instead of hardcoded greys. */
   ::-webkit-scrollbar {
-    width: 6px;
+    width: 8px;
+    height: 8px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: #333;
-    border-radius: 3px;
+    background: rgb(var(--line));
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #444;
+    background: rgb(var(--line-strong));
+    background-clip: content-box;
   }
 
   /* Hide number input spinners */
@@ -39,28 +130,158 @@
   input[type="number"].no-spin {
     -moz-appearance: textfield;
   }
+
+  input[type="checkbox"] {
+    accent-color: rgb(var(--brand));
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--brand));
+    outline-offset: 2px;
+  }
 }
 
 @layer components {
+  /* ---- buttons ------------------------------------------------------ */
   .btn {
-    @apply px-3 py-1.5 rounded-md text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-accent/50;
+    @apply inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-xl
+      text-xs font-medium transition-all duration-150 select-none
+      disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn:active:not(:disabled) {
+    transform: scale(0.97);
   }
   .btn-primary {
-    @apply btn bg-accent text-white hover:bg-accent-hover;
+    @apply btn bg-gradient-to-r from-brand to-brand-deep text-white font-semibold
+      hover:from-brand-hover hover:to-brand shadow-card hover:shadow-glow
+      border border-brand/40 hover:border-brand/70;
   }
   .btn-secondary {
-    @apply btn bg-surface-3 text-gray-200 hover:bg-surface-4;
+    @apply btn bg-surface-2/90 hover:bg-surface-3 text-fg border border-line hover:border-line-strong shadow-card;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent text-fg-secondary hover:bg-surface-2 hover:text-fg;
   }
   .btn-danger {
-    @apply btn bg-red-600/20 text-red-400 hover:bg-red-600/30;
+    @apply btn bg-danger/10 text-danger border border-danger/25 hover:bg-danger/20 hover:border-danger/40;
   }
+
+  /* ---- inputs ------------------------------------------------------- */
   .input {
-    @apply w-full h-9 bg-surface-2 border border-border rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/50;
+    @apply w-full h-9 bg-surface-0/90 border border-line rounded-xl px-3 py-1.5
+      text-xs text-fg placeholder-fg-muted transition-all duration-150
+      hover:border-line-strong
+      focus:outline-none focus:border-brand focus:ring-2 focus:ring-brand/20;
+    box-shadow: var(--input-inset);
+  }
+  select.input {
+    @apply pr-8 cursor-pointer bg-surface-0/90;
   }
   textarea.input {
-    @apply h-auto;
+    @apply h-auto py-2;
   }
   .label {
-    @apply block text-xs font-medium text-gray-400 mb-1;
+    @apply block text-xs font-medium text-fg-secondary mb-1.5;
+  }
+
+  /* ---- surfaces ----------------------------------------------------- */
+  .card {
+    @apply bg-surface-1/90 border border-line/80 rounded-2xl shadow-card backdrop-blur-md;
+  }
+  .section-card {
+    @apply bg-surface-1/80 border border-line/75 rounded-2xl p-5 shadow-card transition-all duration-150 hover:border-line-strong/80 backdrop-blur-sm;
+  }
+  .panel {
+    @apply bg-surface-1 border border-line rounded-2xl;
+  }
+  .section-title {
+    @apply text-2xs font-semibold uppercase tracking-wider text-fg-muted;
+  }
+  .divider {
+    @apply h-px w-full bg-line;
+  }
+
+  /* ---- badges ------------------------------------------------------- */
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5
+      text-2xs font-medium whitespace-nowrap border border-transparent transition-colors;
+  }
+  .badge-success {
+    @apply badge bg-success/10 text-success border-success/30;
+  }
+  .badge-warning {
+    @apply badge bg-warning/10 text-warning border-warning/30;
+  }
+  .badge-danger {
+    @apply badge bg-danger/10 text-danger border-danger/30;
+  }
+  .badge-info {
+    @apply badge bg-info/10 text-info border-info/30;
+  }
+  .badge-neutral {
+    @apply badge bg-surface-3/80 text-fg-secondary border-line;
+  }
+
+  /* ---- shell -------------------------------------------------------- */
+  .sidebar-item {
+    @apply relative w-full text-left rounded-xl px-3 py-2.5 transition-all duration-150
+      border border-transparent cursor-pointer font-medium text-xs;
+  }
+  .sidebar-item:hover {
+    @apply bg-surface-2/80 text-fg border-line/50;
+  }
+  .sidebar-item[data-selected="true"] {
+    @apply bg-brand/15 text-fg border-brand/35 font-semibold;
+    box-shadow: inset 3px 0 0 rgb(var(--brand));
+  }
+  .rail-item {
+    @apply flex h-8 w-8 items-center justify-center rounded-xl
+      text-fg-secondary transition-all duration-150 hover:bg-surface-3 hover:text-fg;
+  }
+  .rail-item[data-active="true"] {
+    @apply bg-brand-subtle text-brand-fg;
+  }
+  .statusbar {
+    @apply flex h-statusbar items-center gap-3 border-t border-line/75 bg-surface-1/95
+      px-4 text-2xs text-fg-muted select-none backdrop-blur-md;
+  }
+  /* ---- data table --------------------------------------------------- */
+  .data-table {
+    @apply w-full border-collapse text-sm;
+  }
+  .data-table th {
+    @apply sticky top-0 z-10 bg-surface-1/95 backdrop-blur-md px-4 py-2.5 text-left
+      text-2xs font-semibold uppercase tracking-wider text-fg-muted
+      border-b border-line select-none;
+  }
+  .data-table td {
+    @apply px-4 py-3 border-b border-line/60 align-middle transition-colors;
+  }
+  .data-table tbody tr {
+    @apply cursor-pointer transition-colors duration-100;
+  }
+  .data-table tbody tr:hover {
+    @apply bg-surface-2/60;
+  }
+  .data-table tbody tr[data-selected="true"] {
+    @apply bg-brand/10;
+  }
+
+  /* ---- misc --------------------------------------------------------- */
+  .empty-state {
+    @apply flex h-full flex-col items-center justify-center gap-3
+      px-8 py-16 text-center;
+  }
+  .kbd {
+    @apply rounded border border-line bg-surface-2 px-1.5 py-0.5
+      font-mono text-2xs text-fg-secondary shadow-sm;
+  }
+  .option-row {
+    @apply flex items-start gap-3 rounded-lg border border-line/70 bg-surface-2/30 p-3
+      text-sm text-fg-secondary cursor-pointer transition-all duration-150
+      hover:bg-surface-2/70 hover:border-line-strong;
+  }
+  .option-row:has(input:checked) {
+    @apply border-brand/40 bg-brand-subtle text-fg;
   }
 }

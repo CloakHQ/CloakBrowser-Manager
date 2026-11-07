@@ -2,6 +2,8 @@ import { Download, FileDown, FileUp, Loader2, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { ProfileFile } from "../lib/api";
+import { useConfirm } from "./ui/confirm";
+import { useToast } from "./ui/toast";
 
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -42,6 +44,8 @@ export interface Transfer {
 
 /** Files attached to one profile, shared by the toolbar panel and the drop target. */
 export function useProfileFiles(profileId: string) {
+  const confirm = useConfirm();
+  const toast = useToast();
   const [files, setFiles] = useState<ProfileFile[]>([]);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -60,7 +64,7 @@ export function useProfileFiles(profileId: string) {
       // publish a genuinely different list.
       setFiles((prev) => (sameFiles(prev, next) ? prev : next));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to list files");
+      setError(err instanceof Error ? err.message : "Không thể tải danh sách tệp");
     } finally {
       listing.current = false;
     }
@@ -80,7 +84,7 @@ export function useProfileFiles(profileId: string) {
           setFiles((prev) => [added, ...prev.filter((f) => f.id !== added.id)]);
           setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, state: "done" } : t)));
         } catch (err) {
-          const message = err instanceof Error ? err.message : "Upload failed";
+          const message = err instanceof Error ? err.message : "Tải lên thất bại";
           setTransfers((prev) =>
             prev.map((t) => (t.id === id ? { ...t, state: "failed", error: message } : t)),
           );
@@ -124,17 +128,26 @@ export function useProfileFiles(profileId: string) {
 
   const remove = useCallback(
     async (fileId: string) => {
+      const name = files.find((f) => f.id === fileId)?.name ?? "tệp này";
+      const ok = await confirm({
+        title: `Xóa "${name}" khỏi hồ sơ?`,
+        description: "Tệp sẽ bị xóa khỏi hồ sơ và không thể tải lại.",
+        confirmLabel: "Xóa tệp",
+        tone: "danger",
+      });
+      if (!ok) return;
       try {
         mutations.current += 1;
         await api.deleteProfileFile(profileId, fileId);
         setFiles((prev) => prev.filter((f) => f.id !== fileId));
+        toast.success(`Đã xóa "${name}"`);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Delete failed");
+        setError(err instanceof Error ? err.message : "Xóa thất bại");
       } finally {
         mutations.current += 1;
       }
     },
-    [profileId],
+    [profileId, files, confirm, toast],
   );
 
   useEffect(() => {
@@ -224,10 +237,10 @@ export function ProfileFilesButton({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        aria-label={`Profile files, ${files.length} ${files.length === 1 ? "file" : "files"}`}
-        title="Files available to this profile"
-        className={`relative rounded p-1 focus:outline-none focus:ring-2 focus:ring-accent/50 ${
-          open || files.length ? "text-accent" : "text-gray-500 hover:text-gray-300"
+        aria-label={`Tệp của hồ sơ, ${files.length} tệp`}
+        title="Các tệp của hồ sơ này"
+        className={`relative inline-flex items-center justify-center rounded-md p-1.5 transition-colors focus:outline-none focus:ring-2 focus:ring-brand/50 ${
+          open || files.length ? "bg-brand-subtle text-brand-fg" : "text-fg-muted hover:bg-surface-3 hover:text-fg"
         }`}
       >
         {uploading ? (
@@ -238,7 +251,7 @@ export function ProfileFilesButton({
         {files.length > 0 && !uploading && (
           <span
             aria-hidden="true"
-            className="absolute -right-1 -top-1 rounded-full bg-accent px-1 text-[9px] font-medium leading-[14px] text-white"
+            className="absolute -right-1 -top-1 rounded-full bg-brand px-1 text-[9px] font-semibold leading-[14px] text-white shadow-sm"
           >
             {files.length}
           </span>
@@ -248,60 +261,60 @@ export function ProfileFilesButton({
       {open && (
         <div
           role="dialog"
-          aria-label="Profile files"
-          className="absolute right-0 top-full z-20 mt-1 w-80 rounded-md border border-border bg-surface-2 shadow-lg"
+          aria-label="Tệp của hồ sơ"
+          className="absolute right-0 top-full z-20 mt-1.5 w-80 overflow-hidden rounded-xl border border-line-strong bg-surface-1 shadow-popover"
         >
-          <div className="flex items-center justify-between border-b border-border px-3 py-2">
-            <span className="text-xs font-medium text-gray-200">Files for this profile</span>
+          <div className="flex items-center justify-between border-b border-line bg-surface-2/50 px-3.5 py-2.5">
+            <span className="text-xs font-semibold text-fg">Tệp của hồ sơ này</span>
             <button
               type="button"
               onClick={() => {
                 setOpen(false);
                 triggerRef.current?.focus();
               }}
-              className="rounded p-1 text-gray-500 hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-accent/50"
-              aria-label="Close"
+              className="rounded p-1 text-fg-muted hover:bg-surface-3 hover:text-fg focus:outline-none focus:ring-2 focus:ring-brand/50"
+              aria-label="Đóng"
             >
               <X className="h-3.5 w-3.5" />
             </button>
           </div>
 
           {error && (
-            <div className="flex items-start justify-between gap-2 border-b border-border bg-red-600/10 px-3 py-2">
-              <span className="text-xs text-red-400">{error}</span>
+            <div className="flex items-start justify-between gap-2 border-b border-line bg-danger/10 px-3.5 py-2">
+              <span className="text-xs text-danger">{error}</span>
               <button
                 type="button"
                 onClick={onClearError}
-                className="rounded p-1 text-red-400 focus:outline-none focus:ring-2 focus:ring-accent/50"
-                aria-label="Dismiss error"
+                className="rounded p-1 text-danger focus:outline-none focus:ring-2 focus:ring-brand/50"
+                aria-label="Bỏ qua lỗi"
               >
                 <X className="h-3.5 w-3.5" />
               </button>
             </div>
           )}
 
-          <div className="max-h-64 overflow-y-auto">
+          <div className="max-h-64 divide-y divide-line/60 overflow-y-auto">
             {files.length === 0 ? (
-              <p className="px-3 py-4 text-xs text-gray-500">
-                No files yet. Upload one, drop it onto the screen, or download one in the browser.
+              <p className="px-4 py-6 text-center text-xs text-fg-muted leading-relaxed">
+                Chưa có tệp. Hãy tải lên, kéo thả vào màn hình hoặc tải xuống trong trình duyệt.
               </p>
             ) : (
               files.map((file) => (
-                <div key={file.id} className="flex items-center gap-2 px-3 py-2 hover:bg-surface-3">
+                <div key={file.id} className="flex items-center gap-2.5 px-3.5 py-2.5 hover:bg-surface-2/70 transition-colors">
                   {file.kind === "download" ? (
-                    <FileDown className="h-3.5 w-3.5 shrink-0 text-gray-500" aria-label="Downloaded by the browser" />
+                    <FileDown className="h-3.5 w-3.5 shrink-0 text-info" aria-label="Trình duyệt đã tải xuống" />
                   ) : (
-                    <FileUp className="h-3.5 w-3.5 shrink-0 text-gray-500" aria-label="Uploaded" />
+                    <FileUp className="h-3.5 w-3.5 shrink-0 text-brand-fg" aria-label="Đã tải lên" />
                   )}
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-xs text-gray-200" title={file.name}>
+                    <div className="truncate text-xs font-medium text-fg" title={file.name}>
                       {file.name}
                     </div>
-                    <div className="text-[11px] text-gray-500">
+                    <div className="text-[11px] text-fg-muted">
                       {file.state === "pending" ? (
-                        <span className="text-accent">Downloading...</span>
+                        <span className="text-brand-fg">Đang tải xuống...</span>
                       ) : file.state === "failed" ? (
-                        <span className="text-red-400">Download failed</span>
+                        <span className="text-danger">Tải xuống thất bại</span>
                       ) : (
                         formatSize(file.size)
                       )}
@@ -310,8 +323,8 @@ export function ProfileFilesButton({
                   {file.state === "ready" && (
                     <a
                       href={api.profileFileUrl(profileId, file.id)}
-                      className="rounded p-1 text-gray-500 hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-accent/50"
-                      title="Download to this computer"
+                      className="rounded p-1 text-fg-muted hover:bg-surface-3 hover:text-fg focus:outline-none focus:ring-2 focus:ring-brand/50"
+                      title="Tải về máy này"
                     >
                       <Download className="h-3.5 w-3.5" />
                     </a>
@@ -319,9 +332,9 @@ export function ProfileFilesButton({
                   <button
                     type="button"
                     onClick={() => onRemove(file.id)}
-                    className="rounded p-1 text-gray-500 hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-accent/50"
-                    title="Remove from the profile"
-                    aria-label={`Remove ${file.name}`}
+                    className="rounded p-1 text-fg-muted hover:bg-danger/10 hover:text-danger focus:outline-none focus:ring-2 focus:ring-brand/50"
+                    title="Xóa khỏi hồ sơ"
+                    aria-label={`Xóa ${file.name}`}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -330,19 +343,19 @@ export function ProfileFilesButton({
             )}
           </div>
 
-          <div className="border-t border-border px-3 py-2">
+          <div className="border-t border-line bg-surface-2/30 px-3.5 py-3">
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
               disabled={uploading}
-              className="btn-secondary flex w-full items-center justify-center gap-1.5"
+              className="btn-primary flex w-full items-center justify-center gap-1.5 text-xs py-1.5"
             >
               <FileUp className="h-3.5 w-3.5" />
-              <span>{uploading ? "Uploading..." : "Upload a file"}</span>
+              <span>{uploading ? "Đang tải lên..." : "Tải tệp lên"}</span>
             </button>
-            <p className="mt-2 text-[11px] leading-snug text-gray-500">
-              In the page's file dialog, pick{" "}
-              <span className="text-gray-400">Uploads — {profileName}</span> in the sidebar.
+            <p className="mt-2 text-[11px] leading-snug text-fg-muted">
+              Trong hộp thoại tệp của trang, chọn{" "}
+              <span className="font-medium text-fg-secondary">Uploads — {profileName}</span> ở thanh bên.
             </p>
           </div>
         </div>

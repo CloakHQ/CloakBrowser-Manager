@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from starlette.testclient import TestClient
 
 from backend import database as db
+from backend import key_pool
 from backend import main
 from backend.models import ProfileDuplicateRequest
 from backend.browser_manager import BrowserManager, RunningProfile
@@ -731,61 +732,50 @@ def settings_env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_db / "settings.json"
     monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
     monkeypatch.setattr(main.browser_mgr, "resolve_binary_status", MagicMock())
-    # Known baseline so masking/clearing is deterministic.
-    monkeypatch.setattr(main.browser_mgr, "license_key", None)
     monkeypatch.setattr(main.browser_mgr, "release_channel", "stable")
     return path
 
 
-def test_get_settings_no_key(app_client: TestClient, settings_env: Path):
+def test_get_settings_reports_the_pool(app_client: TestClient, settings_env: Path):
+    key_pool.add("cb_one\ncb_two")
     resp = app_client.get("/api/settings")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["license_key_set"] is False
-    assert data["license_key_masked"] is None
+    assert "license_key_set" not in data
+    assert "license_key_masked" not in data
+    assert data["key_pool_size"] == 2
     assert data["release_channel"] == "stable"
 
 
-def test_get_settings_masks_key(app_client: TestClient, settings_env: Path):
-    main.browser_mgr.license_key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    resp = app_client.get("/api/settings")
-    data = resp.json()
-    assert data["license_key_set"] is True
-    masked = data["license_key_masked"]
-    # Recognisable but not the whole key.
-    assert masked == "cb_ba…63aa"
-    assert "b142a68bc3088" not in masked
+def test_put_settings_sets_channel(app_client: TestClient, settings_env: Path):
+    resp = app_client.put("/api/settings", json={"release_channel": "preview"})
+    assert resp.status_code == 200
+    assert main.browser_mgr.release_channel == "preview"
+    import json
+
+    assert json.loads(settings_env.read_text())["release_channel"] == "preview"
 
 
-def test_put_settings_persists_and_hot_applies(
+def test_lifespan_seeds_the_pool_from_the_legacy_settings_key(
     app_client: TestClient, settings_env: Path
 ):
-    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    resp = app_client.put("/api/settings", json={"license_key": key})
-    assert resp.status_code == 200
-    # Hot-applied to the live browser manager.
-    assert main.browser_mgr.license_key == key
-    main.browser_mgr.resolve_binary_status.assert_called_once()
-    # Persisted to settings.json.
-    import json
-
-    assert json.loads(settings_env.read_text())["license_key"] == key
+    """An upgrade from the app-wide key keeps working without user action."""
+    settings_env.write_text('{"license_key": "cb_carried_over"}')
+    main._seed_legacy_keys_into_pool()
+    assert [entry["key"] for entry in key_pool.entries()] == ["cb_carried_over"]
 
 
-def test_put_settings_clears_key(app_client: TestClient, settings_env: Path):
-    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    main.browser_mgr.license_key = key
-    settings_env.write_text('{"license_key": "%s"}' % key)
+def test_lifespan_seeds_the_pool_from_the_environment(
+    app_client: TestClient, settings_env: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Docker/CI hand a key over via env; it must still reach the pool."""
+    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", "cb_from_env")
+    main._seed_legacy_keys_into_pool()
+    assert [entry["key"] for entry in key_pool.entries()] == ["cb_from_env"]
+    # Re-running on every start is a no-op, not a duplicate.
+    main._seed_legacy_keys_into_pool()
+    assert len(key_pool.entries()) == 1
 
-    resp = app_client.put("/api/settings", json={"license_key": ""})
-    assert resp.status_code == 200
-    assert main.browser_mgr.license_key is None
-    import json
-
-    assert "license_key" not in json.loads(settings_env.read_text())
-
-
-def test_put_settings_sets_channel(app_client: TestClient, settings_env: Path):
     resp = app_client.put("/api/settings", json={"release_channel": "preview"})
     assert resp.status_code == 200
     assert main.browser_mgr.release_channel == "preview"
@@ -829,6 +819,408 @@ def test_settings_store_ignores_corrupt_file(
     path.write_text("{not valid json")
     monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
     assert settings_store.load_settings() == {}
+
+
+# ── License key pool API ─────────────────────────────────────────────────────
+@pytest.fixture()
+def keys_env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolate the pool file and stub the license server round trip."""
+    from backend import key_pool
+
+    monkeypatch.setattr(main.browser_mgr, "_key_leases", {})
+
+    def fake_validate(keys=None, retries=1):
+        targets = keys if keys is not None else [e["key"] for e in key_pool.entries()]
+        for key in targets:
+            key_pool.set_state(key, "valid", plan="free")
+        return [
+            {
+                "id": key_pool.key_id(key),
+                "key_masked": key_pool.mask_key(key),
+                "state": "valid",
+                "plan": "free",
+                "expires": None,
+            }
+            for key in targets
+        ]
+
+    monkeypatch.setattr(key_pool, "validate", fake_validate)
+    return key_pool
+
+
+def test_add_keys_returns_masked_entries(app_client: TestClient, keys_env):
+    resp = app_client.post(
+        "/api/keys", json={"keys": "cb_aaaaaaaaaaaa\ncb_bbbbbbbbbbbb"}
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert len(data) == 2
+    assert data[0]["state"] == "valid"
+    # The raw key must never be serialised.
+    assert "cb_aaaaaaaaaaaa" not in resp.text
+    assert data[0]["key_masked"].startswith("cb_aa")
+
+
+def test_list_keys_shows_the_current_lease(app_client: TestClient, keys_env):
+    keys_env.add("cb_leased")
+    entry_id = keys_env.key_id("cb_leased")
+    main.browser_mgr._key_leases["profile-x"] = entry_id
+    data = app_client.get("/api/keys").json()
+    assert data[0]["leased_to"] == "profile-x"
+
+
+def test_delete_key_refused_while_leased(app_client: TestClient, keys_env):
+    keys_env.add("cb_leased")
+    entry_id = keys_env.key_id("cb_leased")
+    main.browser_mgr._key_leases["profile-x"] = entry_id
+    assert app_client.delete(f"/api/keys/{entry_id}").status_code == 409
+    del main.browser_mgr._key_leases["profile-x"]
+    assert app_client.delete(f"/api/keys/{entry_id}").status_code == 200
+
+
+def test_delete_unknown_key_is_404(app_client: TestClient, keys_env):
+    assert app_client.delete("/api/keys/nope").status_code == 404
+
+
+def test_list_keys_exposes_the_cooldown(app_client: TestClient, keys_env):
+    keys_env.add("cb_cooling")
+    entry_id = keys_env.key_id("cb_cooling")
+    keys_env.stamp_cooldown(entry_id, 120)
+    key = keys_env.entries()[0]["cooldown_until"]
+    data = app_client.get("/api/keys").json()
+    assert data[0]["available_at"] == key
+    assert data[0]["available_at"] is not None
+
+
+def test_delete_key_refused_while_cooling_down(app_client: TestClient, keys_env):
+    keys_env.add("cb_cooling")
+    entry_id = keys_env.key_id("cb_cooling")
+    keys_env.stamp_cooldown(entry_id, 120)
+    resp = app_client.delete(f"/api/keys/{entry_id}")
+    assert resp.status_code == 409
+    assert "cooling down" in resp.json()["detail"]
+
+
+def test_delete_key_allowed_once_the_cooldown_is_cleared(
+    app_client: TestClient, keys_env
+):
+    keys_env.add("cb_cooling")
+    entry_id = keys_env.key_id("cb_cooling")
+    keys_env.stamp_cooldown(entry_id, 120)
+    keys_env.clear_cooldown(entry_id)
+    assert app_client.delete(f"/api/keys/{entry_id}").status_code == 200
+
+
+def test_check_keys_validates_the_whole_pool(app_client: TestClient, keys_env):
+    keys_env.add("cb_one\ncb_two")
+    data = app_client.post("/api/keys/check", json={}).json()
+    assert {entry["state"] for entry in data} == {"valid"}
+
+
+def test_check_keys_rejects_an_unknown_id(app_client: TestClient, keys_env):
+    assert app_client.post("/api/keys/check", json={"ids": ["nope"]}).status_code == 404
+
+
+def test_check_keys_empty_ids_validates_the_whole_pool(app_client: TestClient, keys_env):
+    # The UI's "check all" button sends an empty list.
+    keys_env.add("cb_one\ncb_two")
+    resp = app_client.post("/api/keys/check", json={"ids": []})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+
+def test_check_keys_rejects_null_ids(app_client: TestClient, keys_env):
+    # ids is a list, not Optional: the client must send [] for "all", never null.
+    assert app_client.post("/api/keys/check", json={"ids": None}).status_code == 422
+
+
+@pytest.mark.parametrize("cleared", ["", None])
+def test_update_profile_clears_the_key_pin(app_client: TestClient, keys_env, cleared):
+    keys_env.add("cb_pinned")
+    entry_id = keys_env.key_id("cb_pinned")
+    profile_id = app_client.post("/api/profiles", json={"name": "pinned"}).json()["id"]
+    pinned = app_client.put(f"/api/profiles/{profile_id}", json={"license_key_id": entry_id})
+    assert pinned.json()["license_key_id"] == entry_id
+    resp = app_client.put(f"/api/profiles/{profile_id}", json={"license_key_id": cleared})
+    assert resp.status_code == 200
+    assert resp.json()["license_key_id"] is None
+
+
+def test_update_profile_without_the_field_keeps_the_key_pin(app_client: TestClient, keys_env):
+    keys_env.add("cb_pinned")
+    entry_id = keys_env.key_id("cb_pinned")
+    profile_id = app_client.post("/api/profiles", json={"name": "pinned"}).json()["id"]
+    app_client.put(f"/api/profiles/{profile_id}", json={"license_key_id": entry_id})
+    resp = app_client.put(f"/api/profiles/{profile_id}", json={"name": "renamed"})
+    assert resp.json()["license_key_id"] == entry_id
+
+
+def test_settings_report_the_pool_size(app_client: TestClient, settings_env, keys_env):
+    keys_env.add("cb_one")
+    assert app_client.get("/api/settings").json()["key_pool_size"] == 1
+
+
+def test_profile_current_proxy_uses_the_stored_key(
+    app_client: TestClient, monkeypatch
+):
+    """Checking the current proxy must not require retyping the API key.
+
+    The form used to need the key again just to look at what it already held,
+    so "is my key still working?" was unanswerable for a saved profile.
+    """
+    from backend import proxy_providers
+
+    profile_id = app_client.post(
+        "/api/profiles",
+        json={"name": "proxied", "proxy_provider": "kiotproxy", "proxy_provider_key": "k-secret"},
+    ).json()["id"]
+
+    seen: dict[str, str] = {}
+
+    async def fake_current(provider: str, key: str):
+        seen["provider"], seen["key"] = provider, key
+        return {"provider": "kiotproxy", "host": "1.2.3.4:8000", "real_ip": "1.2.3.4"}
+
+    monkeypatch.setattr(proxy_providers, "current_for", fake_current)
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 200
+    assert resp.json()["host"] == "1.2.3.4:8000"
+    assert seen == {"provider": "kiotproxy", "key": "k-secret"}
+
+
+def test_profile_current_proxy_rejects_a_direct_profile(app_client: TestClient):
+    profile_id = app_client.post("/api/profiles", json={"name": "direct"}).json()["id"]
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 400
+    assert "no proxy provider" in resp.json()["detail"]
+
+
+def test_profile_current_proxy_needs_a_stored_key(app_client: TestClient):
+    profile_id = app_client.post(
+        "/api/profiles", json={"name": "no-key", "proxy_provider": "tmproxy"}
+    ).json()["id"]
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 400
+    assert "no API key is stored" in resp.json()["detail"]
+
+
+def test_profile_current_proxy_404s_for_an_unknown_profile(app_client: TestClient):
+    assert app_client.post("/api/profiles/nope/proxy/current").status_code == 404
+
+
+def test_profile_saved_key_selection_resolves_at_use(app_client: TestClient, monkeypatch):
+    """A saved profile keeps ids, not the secret; the resolver supplies the key."""
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    key_row = {
+        "id": "key-1",
+        "value": "Kraw-secret",
+        "value_masked": "Kraw…cret",
+        "status": "ACTIVE",
+        "expiration_at": int(time.time() * 1000) + 86_400_000,
+        "deleted": False,
+    }
+    monkeypatch.setattr(
+        main.proxy_providers, "kiotproxy_keys", AsyncMock(return_value=[key_row])
+    )
+    account = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    created = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "saved",
+            "proxy_provider": "kiotproxy",
+            "proxy_account_id": account["id"],
+            "proxy_key_id": "key-1",
+        },
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["proxy_account_id"] == account["id"]
+    assert body["proxy_key_id"] == "key-1"
+    assert body["proxy_provider_key_set"] is False
+
+    seen: dict[str, str] = {}
+
+    async def fake_current(provider: str, key: str):
+        seen["provider"], seen["key"] = provider, key
+        return {"provider": provider, "host": "1.2.3.4:8000"}
+
+    monkeypatch.setattr(main.proxy_providers, "current_for", fake_current)
+    resp = app_client.post(f"/api/profiles/{body['id']}/proxy/current")
+    assert resp.status_code == 200
+    assert seen == {"provider": "kiotproxy", "key": "Kraw-secret"}
+
+
+def test_random_key_has_no_current_proxy_before_launch(app_client: TestClient):
+    profile_id = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "random",
+            "proxy_provider": "kiotproxy",
+            "proxy_key_id": "random",
+        },
+    ).json()["id"]
+
+    resp = app_client.post(f"/api/profiles/{profile_id}/proxy/current")
+    assert resp.status_code == 400
+    assert "random key" in resp.json()["detail"]
+
+
+def test_proxy_state_reports_cooldown_and_blocks_rotation(
+    app_client: TestClient, monkeypatch
+):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "key-1",
+                    "value": "Kraw-secret",
+                    "value_masked": "Kraw…cret",
+                    "status": "ACTIVE",
+                    "expiration_at": int(time.time() * 1000) + 86_400_000,
+                    "deleted": False,
+                }
+            ]
+        ),
+    )
+    account = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+    profile = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "state",
+            "proxy_provider": "kiotproxy",
+            "proxy_account_id": account["id"],
+            "proxy_key_id": "key-1",
+            "proxy_rotation_mode": "sticky",
+        },
+    ).json()
+
+    now = int(time.time() * 1000)
+    main.proxy_state.set_current(
+        main.proxy_key_source.key_fingerprint("kiotproxy", "Kraw-secret"),
+        "kiotproxy",
+        account_id=account["id"],
+        key_id="key-1",
+        key_masked="Kraw…cret",
+        info={
+            "http": "http://user:pass@1.2.3.4:8080",
+            "real_ip": "1.2.3.4",
+            "host": "1.2.3.4",
+            "expires_at": now + 3_600_000,
+            "next_request_at": now + 45_000,
+        },
+    )
+    main.proxy_state.bind_profile(profile["id"], main.proxy_key_source.key_fingerprint("kiotproxy", "Kraw-secret"))
+
+    state = app_client.get(f"/api/profiles/{profile['id']}/proxy/state")
+    assert state.status_code == 200
+    body = state.json()
+    assert body["mode"] == "sticky"
+    assert body["can_rotate"] is False
+    assert body["running"] is False
+    assert body["eligible_key_count"] == 0
+    assert body["key_masked"] == "Kraw…cret"
+    assert body["cooldown_remaining"] > 0
+
+    rotate = app_client.post(f"/api/profiles/{profile['id']}/proxy/new")
+    assert rotate.status_code == 429
+    assert int(rotate.headers["Retry-After"]) > 0
+
+
+
+def test_available_keys_endpoint_hides_raw_values(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "key-1",
+                    "value": "Kraw-secret",
+                    "value_masked": "Kraw…cret",
+                    "status": "ACTIVE",
+                    "expiration_at": int(time.time() * 1000) + 86_400_000,
+                    "deleted": False,
+                },
+                {
+                    "id": "key-2",
+                    "value": "Kexpired",
+                    "value_masked": "Kexpi…ired",
+                    "status": "ACTIVE",
+                    "expiration_at": 1,
+                    "deleted": False,
+                },
+            ]
+        ),
+    )
+    account = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    resp = app_client.get("/api/proxy-providers/kiotproxy/available-keys")
+    assert resp.status_code == 200
+    options = resp.json()
+    assert [option["key_id"] for option in options] == ["key-1"]
+    assert options[0]["account_id"] == account["id"]
+    assert options[0]["key_masked"] == "Kraw…cret"
+    assert "value" not in options[0]
+
+
+def test_update_profile_switches_between_saved_and_manual_keys(
+    app_client: TestClient, monkeypatch
+):
+    created = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "switch",
+            "proxy_provider": "kiotproxy",
+            "proxy_provider_key": "manual-secret",
+        },
+    ).json()
+
+    saved = app_client.put(
+        f"/api/profiles/{created['id']}",
+        json={"proxy_account_id": "acct", "proxy_key_id": "random"},
+    ).json()
+    assert saved["proxy_account_id"] == "acct"
+    assert saved["proxy_key_id"] == "random"
+    assert saved["proxy_provider_key_set"] is False
+
+    manual = app_client.put(
+        f"/api/profiles/{created['id']}",
+        json={"proxy_provider_key": "new-manual-secret"},
+    ).json()
+    assert manual["proxy_account_id"] is None
+    assert manual["proxy_key_id"] is None
+    assert manual["proxy_provider_key_set"] is True
+
+    disabled = app_client.put(
+        f"/api/profiles/{created['id']}", json={"proxy_provider": "none"}
+    ).json()
+    assert disabled["proxy_provider_key_set"] is False
+    assert disabled["proxy_account_id"] is None
+    assert disabled["proxy_key_id"] is None
+
 
 
 def test_bundle_dir_is_repo_root_when_unfrozen():
@@ -1034,7 +1426,7 @@ def test_duplicate_profile_leaves_nothing_behind_when_copy_fails(
     assert "disk full" in resp.json()["detail"]
     # No clone row was ever written, and the clone directory does not linger
     assert [p["id"] for p in app_client.get("/api/profiles").json()] == [src["id"]]
-    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [Path(src["user_data_dir"]).name]
     # The source is untouched and can still be launched (the hold was released)
     assert not main.browser_mgr._held
 
@@ -1108,7 +1500,7 @@ async def test_duplicate_state_refuses_a_launching_source(tmp_db: Path):
     finally:
         main.browser_mgr._launching.discard(src["id"])
     assert [p["id"] for p in db.list_profiles()] == [src["id"]]
-    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [Path(src["user_data_dir"]).name]
 
 
 async def test_duplicate_state_refuses_a_source_still_closing(tmp_db: Path, real_lifecycle, monkeypatch: pytest.MonkeyPatch):
@@ -1398,3 +1790,336 @@ def test_a_proxy_that_never_reached_the_browser_does_not_re_arm(app_client: Test
 ])
 def test_only_download_behaviour_commands_for_the_profile_context_count(frame: str, expected: bool):
     assert main._sets_download_behaviour(frame) is expected
+
+
+# ── Proxy providers ──────────────────────────────────────────────────────────
+
+
+def test_profile_provider_fields_round_trip_but_key_is_masked(app_client: TestClient):
+    created = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "Kiot",
+            "proxy_provider": "kiotproxy",
+            "proxy_provider_key": "kiot-secret-key-123",
+            "kiotproxy_region": "nam",
+        },
+    )
+    assert created.status_code == 201
+    data = created.json()
+    assert data["proxy_provider"] == "kiotproxy"
+    assert data["proxy_provider_key_set"] is True
+    assert data["proxy_provider_key_masked"] == "kiot-…-123"
+    assert "proxy_provider_key" not in data
+    assert data["kiotproxy_region"] == "nam"
+
+
+def test_profile_provider_key_can_be_replaced_and_cleared(app_client: TestClient):
+    pid = app_client.post(
+        "/api/profiles",
+        json={"name": "TM", "proxy_provider": "tmproxy", "proxy_provider_key": "old-key"},
+    ).json()["id"]
+
+    replaced = app_client.put(
+        f"/api/profiles/{pid}", json={"proxy_provider_key": "new-key"}
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["proxy_provider_key_set"] is True
+
+    cleared = app_client.put(f"/api/profiles/{pid}", json={"proxy_provider_key": ""})
+    assert cleared.status_code == 200
+    assert cleared.json()["proxy_provider_key_set"] is False
+
+
+def test_kiotproxy_endpoint_returns_sanitised_info(app_client: TestClient, monkeypatch):
+    async def fake_new(key: str, region: str):
+        assert key == "kiot-key"
+        assert region == "bac"
+        return {
+            "provider": "kiotproxy",
+            "http": "http://1.2.3.4:8080",
+            "socks5": "socks5://1.2.3.4:8081",
+            "host": "1.2.3.4",
+            "real_ip": "1.2.3.4",
+            "location": "Hà Nội",
+            "isp": None,
+            "expires_at": 1,
+            "ttl": 60,
+            "ttc": 10,
+            "next_request_at": 2,
+            "raw": {"secret": "do-not-leak"},
+        }
+
+    monkeypatch.setattr(main.proxy_providers, "kiotproxy_new", fake_new)
+    resp = app_client.post(
+        "/api/proxy-providers/kiotproxy/new",
+        json={"key": "kiot-key", "region": "bac"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["real_ip"] == "1.2.3.4"
+    assert data["location"] == "Hà Nội"
+    assert "http" not in data
+    assert "raw" not in data
+
+
+def test_kiotproxy_endpoint_maps_provider_failure_to_502(app_client: TestClient, monkeypatch):
+    async def fake_new(key: str, region: str):
+        raise main.ProxyProviderError("kiotproxy", "kiotproxy: Key not found", code=40400006)
+
+    monkeypatch.setattr(main.proxy_providers, "kiotproxy_new", fake_new)
+    resp = app_client.post(
+        "/api/proxy-providers/kiotproxy/new",
+        json={"key": "missing", "region": "random"},
+    )
+    assert resp.status_code == 502
+    assert "Key not found" in resp.json()["detail"]
+
+
+def test_tmproxy_options_endpoints(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_locations",
+        AsyncMock(return_value=[{"id_location": 9, "name": "TP Ho Chi Minh"}]),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_isps",
+        AsyncMock(return_value=[{"id_isp": 1, "name": "Viettel"}]),
+    )
+
+    locations = app_client.get("/api/proxy-providers/tmproxy/locations")
+    isps = app_client.get("/api/proxy-providers/tmproxy/isps")
+
+    assert locations.status_code == 200
+    assert locations.json() == [{"id": 9, "name": "TP Ho Chi Minh"}]
+    assert isps.status_code == 200
+    assert isps.json() == [{"id": 1, "name": "Viettel"}]
+
+
+
+def test_renaming_a_profile_renames_its_folder(app_client: TestClient):
+    # The folder is named after the profile, so a rename keeps it that way.
+    created = app_client.post("/api/profiles", json={"name": "Shop A"}).json()
+    before = Path(created["user_data_dir"])
+    before.mkdir(parents=True)
+    (before / "Cookies").write_text("state", encoding="utf-8")
+
+    renamed = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Shop B"})
+    assert renamed.status_code == 200
+    after = Path(renamed.json()["user_data_dir"])
+    assert after.name == "Shop B"
+    assert after.is_dir() and not before.exists()
+    # Browser state moves with the profile, it is a rename not a copy.
+    assert (after / "Cookies").read_text(encoding="utf-8") == "state"
+
+
+def test_renaming_keeps_a_unique_folder(app_client: TestClient):
+    app_client.post("/api/profiles", json={"name": "Taken"})
+    other = app_client.post("/api/profiles", json={"name": "Other"}).json()
+    Path(other["user_data_dir"]).mkdir(parents=True)
+    renamed = app_client.put(f"/api/profiles/{other['id']}", json={"name": "Taken"})
+    assert Path(renamed.json()["user_data_dir"]).name == "Taken (2)"
+
+
+def test_renaming_does_not_move_a_folder_it_did_not_name(app_client: TestClient):
+    # A UUID-era path (or one moved by hand) stays where the operator put it.
+    created = app_client.post("/api/profiles", json={"name": "Legacy"}).json()
+    legacy = Path(created["user_data_dir"]).parent / "0f4c2a2e-legacy-uuid"
+    legacy.mkdir(parents=True)
+    db.set_user_data_dir(created["id"], str(legacy))
+
+    renamed = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Renamed"})
+    assert Path(renamed.json()["user_data_dir"]) == legacy
+    assert legacy.is_dir()
+
+
+def test_renaming_while_running_leaves_the_name_unchanged(app_client: TestClient, monkeypatch):
+    from backend import main
+
+    created = app_client.post("/api/profiles", json={"name": "Live"}).json()
+    Path(created["user_data_dir"]).mkdir(parents=True)
+    monkeypatch.setattr(main.browser_mgr, "is_active", lambda _pid: True)
+
+    resp = app_client.put(f"/api/profiles/{created['id']}", json={"name": "Live 2"})
+    assert resp.status_code == 409
+    assert app_client.get(f"/api/profiles/{created['id']}").json()["name"] == "Live"
+
+
+# ── Proxy provider accounts ──────────────────────────────────────────────────
+
+
+def test_proxy_account_add_list_and_delete(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_stats",
+        AsyncMock(return_value={"plan": "VIP", "expired_at": "2026-01-01T00:00:00Z"}),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts",
+        json={"provider": "tmproxy", "secret": "tm-secret-key", "label": "chính"},
+    )
+    assert created.status_code == 201
+    data = created.json()
+    assert data["provider"] == "tmproxy"
+    assert data["label"] == "chính"
+    assert data["secret_masked"] == "tm-se…-key"
+    assert "secret" not in data
+
+    listed = app_client.get("/api/proxy-accounts")
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [data["id"]]
+
+    assert app_client.delete(f"/api/proxy-accounts/{data['id']}").status_code == 200
+    assert app_client.get("/api/proxy-accounts").json() == []
+
+
+def test_proxy_account_rejects_bad_credential(app_client: TestClient, monkeypatch):
+    from backend.proxy_providers import ProxyProviderError
+
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_stats",
+        AsyncMock(side_effect=ProxyProviderError("tmproxy", "tmproxy: invalid key")),
+    )
+
+    resp = app_client.post(
+        "/api/proxy-accounts", json={"provider": "tmproxy", "secret": "bad"}
+    )
+    assert resp.status_code == 502
+    assert "invalid key" in resp.json()["detail"]
+
+
+def test_kiotproxy_account_sync_hides_raw_key(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(
+            return_value={
+                "id": "user-1",
+                "username": "demo",
+                "max_key": 10,
+                "balance": 50000,
+                "paid": 0,
+                "keys": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_keys",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": "key-1",
+                    "value": "Ksecret123456",
+                    "value_masked": "Ksecr…3456",
+                    "status": "ACTIVE",
+                    "effective_at": 1793863073683,
+                    "expiration_at": 1793949473683,
+                    "package_id": "pkg",
+                    "package_period_id": None,
+                    "quantity_day": 30,
+                    "description": None,
+                    "deleted": False,
+                }
+            ]
+        ),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    )
+    assert created.status_code == 201
+
+    synced = app_client.post(f"/api/proxy-accounts/{created.json()['id']}/sync")
+    assert synced.status_code == 200
+    body = synced.json()
+    assert body["user"]["username"] == "demo"
+    assert body["keys"][0]["key_masked"] == "Ksecr…3456"
+    assert "value" not in body["keys"][0]
+
+
+def test_kiotproxy_account_reveal_returns_the_selected_key(
+    app_client: TestClient, monkeypatch
+):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_find_key",
+        AsyncMock(
+            return_value={
+                "id": "key-1",
+                "value": "Kraw-value",
+                "value_masked": "Kraw…alue",
+                "expiration_at": 1793872080308,
+            }
+        ),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    resp = app_client.post(
+        f"/api/proxy-accounts/{created['id']}/keys/key-1/reveal"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    body = resp.json()
+    assert body["key"] == "Kraw-value"
+    assert body["key_masked"] == "Kraw…alue"
+    assert body["expiration_at"] == 1793872080308
+
+
+def test_tmproxy_account_reveal_returns_the_account_key(
+    app_client: TestClient, monkeypatch
+):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "tmproxy_stats",
+        AsyncMock(return_value={"plan": "VIP"}),
+    )
+
+    created = app_client.post(
+        "/api/proxy-accounts",
+        json={"provider": "tmproxy", "secret": "tm-secret-key"},
+    ).json()
+
+    resp = app_client.post(
+        f"/api/proxy-accounts/{created['id']}/keys/{created['id']}/reveal"
+    )
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.json()["key"] == "tm-secret-key"
+
+
+def test_kiotproxy_account_extend_resolves_key_by_id(app_client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_user_info",
+        AsyncMock(return_value={"username": "demo", "keys": []}),
+    )
+    monkeypatch.setattr(
+        main.proxy_providers,
+        "kiotproxy_find_key",
+        AsyncMock(return_value={"id": "key-1", "value": "Kraw-value"}),
+    )
+    extend = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.proxy_providers, "kiotproxy_extend_key", extend)
+
+    created = app_client.post(
+        "/api/proxy-accounts", json={"provider": "kiotproxy", "secret": "api-token"}
+    ).json()
+
+    resp = app_client.post(
+        f"/api/proxy-accounts/{created['id']}/keys/key-1/extend",
+        json={"number_of_periods": 2},
+    )
+    assert resp.status_code == 200
+    extend.assert_awaited_once_with("api-token", "Kraw-value", 2)

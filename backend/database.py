@@ -5,7 +5,9 @@ from __future__ import annotations
 import datetime
 import json
 import random
+import re
 import sqlite3
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,11 +20,15 @@ DATA_DIR = RUNTIME.data_dir
 DB_PATH = DATA_DIR / "profiles.db"
 
 _PROFILE_COLUMNS = (
-    "id", "name", "fingerprint_seed", "proxy", "timezone", "locale",
+    "id", "name", "fingerprint_seed", "proxy", "proxy_provider",
+    "proxy_provider_key", "proxy_account_id", "proxy_key_id",
+    "proxy_rotation_mode", "kiotproxy_region", "tmproxy_location_id",
+    "tmproxy_isp_id", "timezone", "locale",
     "screen_width", "screen_height", "gpu_family", "humanize", "human_preset",
     "geoip", "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
-    "restore_session", "transparent_proxy", "portable_cookies", "notes", "user_data_dir",
+    "restore_session", "transparent_proxy", "portable_cookies", "notes", "license_key_id",
+    "user_data_dir",
     "created_at", "updated_at", "sort_order",
 )
 
@@ -32,6 +38,14 @@ CREATE TABLE profiles (
     name TEXT NOT NULL,
     fingerprint_seed INTEGER NOT NULL,
     proxy TEXT,
+    proxy_provider TEXT NOT NULL DEFAULT 'none',
+    proxy_provider_key TEXT,
+    proxy_account_id TEXT,
+    proxy_key_id TEXT,
+    proxy_rotation_mode TEXT NOT NULL DEFAULT 'per_launch',
+    kiotproxy_region TEXT NOT NULL DEFAULT 'random',
+    tmproxy_location_id INTEGER NOT NULL DEFAULT 0,
+    tmproxy_isp_id INTEGER NOT NULL DEFAULT 0,
     timezone TEXT,
     locale TEXT,
     screen_width INTEGER DEFAULT 1920,
@@ -52,6 +66,7 @@ CREATE TABLE profiles (
     transparent_proxy BOOLEAN DEFAULT 0,
     portable_cookies BOOLEAN DEFAULT 0,
     notes TEXT,
+    license_key_id TEXT,
     user_data_dir TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -198,25 +213,118 @@ def new_profile_id() -> str:
     return str(uuid.uuid4())
 
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def user_data_dir_for(profile_id: str) -> str:
-    """Where a profile keeps its Chrome user data. The one place this layout lives."""
+    """Legacy UUID-based location, kept for profiles created before name folders."""
     return str(DATA_DIR / "profiles" / profile_id)
 
 
+def _profile_folder_name(name: str) -> str:
+    value = unicodedata.normalize("NFKC", name or "").strip()
+    value = "".join(ch for ch in value if unicodedata.category(ch)[0] != "C")
+    value = re.sub(r'[<>:"/\\|?*]', "-", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    if not value or value in {".", ".."}:
+        value = "profile"
+    if value.upper() in _WINDOWS_RESERVED_NAMES:
+        value = f"{value}-profile"
+    return value[:80].rstrip(" .") or "profile"
+
+
+def _profile_dir_is_taken(path: Path, ignore_profile_id: str | None = None) -> bool:
+    if path.exists():
+        return True
+    try:
+        with get_db() as conn:
+            if ignore_profile_id is None:
+                row = conn.execute(
+                    "SELECT 1 FROM profiles WHERE lower(user_data_dir) = lower(?)",
+                    (str(path),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM profiles WHERE lower(user_data_dir) = lower(?) AND id != ?",
+                    (str(path), ignore_profile_id),
+                ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def user_data_dir_for_name(name: str, ignore_profile_id: str | None = None) -> str:
+    """A readable profile directory, with a numeric suffix when the name is taken.
+
+    ``ignore_profile_id`` lets a rename reuse the folder the profile already
+    occupies, and stop treating its own row as a collision.
+    """
+    base = _profile_folder_name(name)
+    profiles_dir = DATA_DIR / "profiles"
+    candidate = base
+    index = 2
+    while _profile_dir_is_taken(profiles_dir / candidate, ignore_profile_id):
+        candidate = f"{base} ({index})"
+        index += 1
+    return str(profiles_dir / candidate)
+
+
+def folder_follows_name(profile: dict[str, Any], name: str | None = None) -> bool:
+    """True when the profile's folder is the one ``name`` derives.
+
+    Profiles from before name-based folders (UUID paths), or whose folder was
+    moved by hand, keep their location: only a folder that still matches the
+    old name is renamed along with the profile.
+    """
+    current = profile["user_data_dir"]
+    return Path(current).name == _profile_folder_name(name if name is not None else profile["name"])
+
+
+def set_user_data_dir(profile_id: str, user_data_dir: str) -> None:
+    """Point the row at a moved profile directory (no filesystem work here)."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE profiles SET user_data_dir = ?, updated_at = ? WHERE id = ?",
+            (user_data_dir, _now(), profile_id),
+        )
+        conn.commit()
+
+
 def create_profile(
-    name: str, fingerprint_seed: int | None = None, *, profile_id: str | None = None, **fields: Any
+    name: str,
+    fingerprint_seed: int | None = None,
+    *,
+    profile_id: str | None = None,
+    user_data_dir: str | None = None,
+    **fields: Any,
 ) -> dict[str, Any]:
-    """Insert a new profile. ``profile_id`` lets a caller mint the id (and so the
-    user_data_dir) ahead of the row — used to fill a clone's directory BEFORE it
-    becomes visible, so a half-built profile is never listed."""
+    """Insert a new profile.
+
+    ``profile_id`` lets a caller mint the id ahead of the row. ``user_data_dir``
+    lets duplicate fill a clone's directory before it becomes visible; otherwise
+    the directory is derived from the profile name.
+    """
     profile_id = profile_id or new_profile_id()
     seed = fingerprint_seed if fingerprint_seed is not None else random.randint(10000, 99999)
-    user_data_dir = user_data_dir_for(profile_id)
+    user_data_dir = user_data_dir or user_data_dir_for_name(name)
     now = _now()
     tags = fields.pop("tags", None) or []
     values = {
         "id": profile_id, "name": name, "fingerprint_seed": seed,
-        "proxy": fields.get("proxy"), "timezone": fields.get("timezone"), "locale": fields.get("locale"),
+        "proxy": fields.get("proxy"),
+        "proxy_provider": fields.get("proxy_provider", "none"),
+        "proxy_provider_key": fields.get("proxy_provider_key") or None,
+        "proxy_account_id": fields.get("proxy_account_id") or None,
+        "proxy_key_id": fields.get("proxy_key_id") or None,
+        "proxy_rotation_mode": fields.get("proxy_rotation_mode", "per_launch"),
+        "kiotproxy_region": fields.get("kiotproxy_region", "random"),
+        "tmproxy_location_id": fields.get("tmproxy_location_id", 0),
+        "tmproxy_isp_id": fields.get("tmproxy_isp_id", 0),
+        "timezone": fields.get("timezone"), "locale": fields.get("locale"),
         "screen_width": fields.get("screen_width", 1920), "screen_height": fields.get("screen_height", 1080),
         "gpu_family": fields.get("gpu_family", "auto"), "humanize": fields.get("humanize", False),
         "human_preset": fields.get("human_preset", "default"), "geoip": fields.get("geoip", True),
@@ -229,6 +337,7 @@ def create_profile(
         "restore_session": fields.get("restore_session", True),
         "transparent_proxy": fields.get("transparent_proxy", False),
         "portable_cookies": fields.get("portable_cookies", False), "notes": fields.get("notes"),
+        "license_key_id": fields.get("license_key_id") or None,
         "user_data_dir": user_data_dir, "created_at": now, "updated_at": now,
     }
     with get_db() as conn:
@@ -297,6 +406,15 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     for key in ("launch_args", "extension_paths"):
         if key in fields:
             fields[key] = json.dumps(fields[key] or [])
+    if "license_key_id" in fields:
+        # An explicit null or "" both clear the pin, matching create_profile.
+        fields["license_key_id"] = fields["license_key_id"] or None
+    if "proxy_provider_key" in fields:
+        # An explicit null or "" clears the provider key.
+        fields["proxy_provider_key"] = fields["proxy_provider_key"] or None
+    for key in ("proxy_account_id", "proxy_key_id"):
+        if key in fields:
+            fields[key] = fields[key] or None
     update_cols = []
     update_vals = []
     for col in _PROFILE_COLUMNS:
@@ -345,7 +463,12 @@ def reset_profile(profile_id: str) -> dict[str, Any] | None:
     return get_profile(profile_id)
 
 
-def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str, Any] | None:
+def duplicate_profile(
+    profile_id: str,
+    *,
+    new_id: str | None = None,
+    user_data_dir: str | None = None,
+) -> dict[str, Any] | None:
     """Clone a profile's config into a brand-new profile. Returns it or None.
 
     Config-only clone: every setting, the tags, notes, and the SAME
@@ -357,16 +480,21 @@ def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str
     src = get_profile(profile_id)
     if src is None:
         return None
+    # The license-key pin is deliberately dropped: a key serves one running
+    # browser, so a clone pinned to the same key could never launch beside the
+    # original. The clone leases a free key instead.
     fields = {
         key: value
         for key, value in src.items()
-        if key not in {"id", "name", "fingerprint_seed", "tags",
+        if key not in {"id", "name", "fingerprint_seed", "tags", "license_key_id",
                        "user_data_dir", "created_at", "updated_at", "sort_order"}
     }
     return create_profile(
         name=f"{src['name']} (copy)",
         fingerprint_seed=src["fingerprint_seed"],
         profile_id=new_id,
+        # The caller may have filled this dir already (duplicate with state).
+        user_data_dir=user_data_dir,
         tags=src.get("tags"),
         **fields,
     )

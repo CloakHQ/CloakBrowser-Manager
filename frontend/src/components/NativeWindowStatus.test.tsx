@@ -16,8 +16,8 @@ describe("NativeWindowStatus", () => {
 
   it("shows that the profile runs in a native window", () => {
     render(<NativeWindowStatus profileName="Work" cdpUrl={null} />);
-    expect(screen.getByText("Opened in a native window")).toBeTruthy();
-    expect(screen.getByText(/Work is running directly/)).toBeTruthy();
+    expect(screen.getByText("Đã mở trong cửa sổ gốc")).toBeTruthy();
+    expect(screen.getByText(/Work đang chạy trực tiếp/)).toBeTruthy();
   });
 
   it("copies the Manager CDP endpoint", async () => {
@@ -27,7 +27,7 @@ describe("NativeWindowStatus", () => {
         cdpUrl="/api/profiles/profile-1/cdp"
       />,
     );
-    fireEvent.click(screen.getByTitle("Copy CDP endpoint URL"));
+    fireEvent.click(screen.getByTitle("Sao chép URL CDP"));
     await waitFor(() => {
       expect(writeText).toHaveBeenCalledWith(
         `${window.location.protocol}//${window.location.host}/api/profiles/profile-1/cdp`,

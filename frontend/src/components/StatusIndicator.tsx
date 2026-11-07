@@ -1,3 +1,5 @@
+import { PROFILE_STATUS_LABEL } from "../lib/labels";
+
 interface StatusIndicatorProps {
   status: "running" | "stopped" | "initializing";
   size?: "sm" | "md";
@@ -9,17 +11,18 @@ export function StatusIndicator({ status, size = "sm" }: StatusIndicatorProps) {
   const isInitializing = status === "initializing";
   const pulse = isRunning || isInitializing;
   const color = isRunning
-    ? "bg-emerald-400"
+    ? "bg-success shadow-[0_0_8px_rgba(16,185,129,0.6)]"
     : isInitializing
-      ? "bg-amber-400"
-      : "bg-gray-500";
-  const title = isInitializing ? "First-time setup..." : status;
+      ? "bg-warning shadow-[0_0_8px_rgba(245,158,11,0.6)]"
+      : "bg-fg-muted/60";
+  const pingColor = isRunning ? "bg-success" : "bg-warning";
+  const title = isInitializing ? "Thiết lập lần đầu..." : PROFILE_STATUS_LABEL[status];
 
   return (
-    <span className="relative inline-flex" title={title}>
+    <span className="relative inline-flex flex-shrink-0" title={title}>
       {pulse && (
         <span
-          className={`absolute inline-flex ${sizeClass} rounded-full ${color} opacity-75 animate-ping`}
+          className={`absolute inline-flex ${sizeClass} rounded-full ${pingColor} opacity-75 animate-ping`}
         />
       )}
       <span className={`relative inline-flex ${sizeClass} rounded-full ${color}`} />

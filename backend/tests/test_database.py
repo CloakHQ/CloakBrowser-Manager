@@ -353,8 +353,17 @@ def test_create_profile_honours_explicit_id(tmp_db: Path):
     pid = db.new_profile_id()
     p = db.create_profile(name="Pre-minted", profile_id=pid)
     assert p["id"] == pid
-    assert p["user_data_dir"] == db.user_data_dir_for(pid)
+    assert Path(p["user_data_dir"]).name == "Pre-minted"
     assert db.get_profile(pid)["name"] == "Pre-minted"
+
+
+def test_duplicate_profile_drops_the_license_pin(tmp_db: Path):
+    # A pinned key serves one browser, so a clone carrying the pin could never
+    # launch beside the original.
+    src = db.create_profile(name="Src", fingerprint_seed=7, license_key_id="abc123")
+    clone = db.duplicate_profile(src["id"])
+    assert src["license_key_id"] == "abc123"
+    assert clone["license_key_id"] is None
 
 
 def test_duplicate_profile_honours_new_id(tmp_db: Path):
@@ -363,4 +372,18 @@ def test_duplicate_profile_honours_new_id(tmp_db: Path):
     clone = db.duplicate_profile(src["id"], new_id=pid)
     assert clone["id"] == pid
     assert clone["fingerprint_seed"] == 7
-    assert clone["user_data_dir"] == db.user_data_dir_for(pid)
+    assert Path(clone["user_data_dir"]).name == "Src (copy)"
+
+
+def test_duplicate_profile_keeps_the_saved_proxy_selection(tmp_db: Path):
+    src = db.create_profile(
+        name="Saved",
+        fingerprint_seed=7,
+        proxy_provider="kiotproxy",
+        proxy_account_id="account-1",
+        proxy_key_id="random",
+    )
+    clone = db.duplicate_profile(src["id"])
+    assert clone["proxy_account_id"] == "account-1"
+    assert clone["proxy_key_id"] == "random"
+    assert clone["proxy_provider_key"] is None

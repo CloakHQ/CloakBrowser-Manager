@@ -7,6 +7,13 @@ name: Release
 #
 # Trigger: push a v* tag (cuts a real release). workflow_dispatch builds the
 # installers without publishing a release (green-light check before tagging).
+#
+# FORK NOTE: this is upstream's release pipeline and it is NOT wired to this
+# fork. It pushes to CloakHQ's GHCR namespace, signs with CloakHQ's secrets, and
+# its build paths still say "CloakBrowser Manager.app" — which this fork's
+# manager.spec no longer produces (APP_NAME is now "... (Custom)"). Pushing a v*
+# tag here would run it against those credentials. Either disable Actions in the
+# fork, or rewrite REGISTRY_IMAGE, the signing secrets and those paths first.
 on:
   push:
     tags: ['v*']

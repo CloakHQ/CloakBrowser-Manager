@@ -16,7 +16,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 # spec files don't get __file__; SPECPATH is injected by PyInstaller.
 ROOT = Path(SPECPATH).resolve().parent  # noqa: F821  (SPECPATH is a spec global)
 
-APP_NAME = "CloakBrowser Manager"
+APP_NAME = "CloakBrowser Manager (Custom)"
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
 
@@ -111,7 +111,7 @@ if IS_MAC:
         coll,
         name=f"{APP_NAME}.app",
         icon=ICON_ICNS,
-        bundle_identifier="dev.cloakbrowser.manager",
+        bundle_identifier="dev.cloakbrowsercustom.manager",
         info_plist={
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": APP_NAME,
