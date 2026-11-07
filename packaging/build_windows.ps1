@@ -1,7 +1,7 @@
 # Build the native Windows CloakBrowser Manager: freeze -> Inno Setup installer.
 # Unsigned (SmartScreen click-through) for the test. CI-ready.
 #
-# Requires: Python 3.10+, Node 18+, and Inno Setup 6 (iscc.exe on PATH or at the
+# Requires: Python 3.10+, Node 24.15+, and Inno Setup 6 (iscc.exe on PATH or at the
 # default install location). Run from anywhere:
 #   powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 $ErrorActionPreference = "Stop"

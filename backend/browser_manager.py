@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from cloakbrowser.license import (
     read_denial_file,
 )
 
+from . import downloads
 from .runtime import RuntimeConfig, resolve_runtime
 from .vnc_manager import VNCManager
 
@@ -90,6 +92,24 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+def _validate_transparent_proxy(url: str | None) -> None:
+    """Reject proxies the binary's transparent mode can't consume.
+
+    The binary fails closed (dead network, or exit on no proxy) unless it gets
+    one http proxy with a username and password, so refuse to launch instead.
+    """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url or "")
+    if (
+        parsed.scheme != "http"
+        or not parsed.username
+        or not parsed.password
+        or ":" in unquote(parsed.username)
+    ):
+        raise ValueError("Transparent proxy needs an http:// proxy with a username and password")
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
@@ -301,6 +321,10 @@ _MAKE_GOOGLE_DEFAULT_JS = """() => {
 }"""
 
 
+class ProfileBusyError(RuntimeError):
+    """The profile's browser or on-disk state is in use by another operation."""
+
+
 @dataclass
 class RunningProfile:
     profile_id: str
@@ -310,6 +334,8 @@ class RunningProfile:
     ws_port: int | None = None
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
+    download_task: Any = None  # asyncio.Task capturing this browser's downloads
+    download_rearm: Any = None  # asyncio.Event: a CDP client left, reassert download capture
     capture_preview: bool = True
     # Path to the wrapper's per-launch denial file (set by launch_persistent_
     # context_async on the returned context). Read on close to tell a seat/
@@ -330,7 +356,7 @@ class BrowserManager:
         self.license_key = license_key
         self.release_channel = release_channel
         # Resolved at startup by resolve_binary_status(); read by GET /api/status.
-        self.license_tier = "keyless"
+        self.license_tier = "none"
         self.license_plan: str | None = None
         self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
@@ -341,6 +367,13 @@ class BrowserManager:
         # the reason. get_status() returns this so the frontend can show it.
         self._last_errors: dict[str, dict[str, str]] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
+        # Reservations held while a context is closing (stop(), a self-exit, a
+        # failed launch's cleanup). Counted per reservation so one operation's
+        # cleanup can never release another's; see _reserve_stopping().
+        self._stopping: dict[str, int] = {}
+        # Profiles whose user_data_dir is reserved by a filesystem operation
+        # (duplicate / reset / delete). launch() refuses these; see hold_stopped().
+        self._held: set[str] = set()
         self._initializing: set[str] = set()  # profile IDs in one-time first-launch setup
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
@@ -352,9 +385,9 @@ class BrowserManager:
 
         Blocking — called once at startup (via a thread) so the multi-hundred-MB
         Pro download stays out of the launch path and auto-launch's 60s timeout.
-        Never raises: on any failure the keyless baked-in binary remains usable.
+        Never raises. Without a key there is nothing to download (wrapper 0.7+
+        needs one for every build); launches then fail with the free-key link.
         """
-        from cloakbrowser.config import CHROMIUM_VERSION, get_chromium_version
         from cloakbrowser.download import ensure_binary
         from cloakbrowser.license import (
             get_pro_latest_version,
@@ -362,28 +395,29 @@ class BrowserManager:
             validate_license,
         )
 
-        try:
-            keyless_version = get_chromium_version()
-        except Exception:
-            keyless_version = CHROMIUM_VERSION
-
-        tier = "keyless"
-        version = keyless_version
+        tier = "none"
+        version = None
 
         key = resolve_license_key(self.license_key)
-        if key:
+        if not key:
+            self.license_tier = tier
+            self.license_plan = None
+            self.binary_version = None
+            logger.info("No license key set: add one in Settings to launch profiles")
+            return
+
+        try:
+            info = validate_license(key)
+        except Exception as exc:
+            info = None
+            logger.warning("License validation failed: %s", exc)
+        if info and info.valid:
+            tier = "free" if info.plan == "free" else "pro"
+            self.license_plan = info.plan
             try:
-                info = validate_license(key)
+                version = get_pro_latest_version(self.release_channel)
             except Exception as exc:
-                info = None
-                logger.warning("License validation failed: %s", exc)
-            if info and info.valid:
-                tier = "free" if info.plan == "free" else "pro"
-                self.license_plan = info.plan
-                try:
-                    version = get_pro_latest_version(self.release_channel) or keyless_version
-                except Exception as exc:
-                    logger.warning("Could not resolve Pro version: %s", exc)
+                logger.warning("Could not resolve Pro version: %s", exc)
 
         self.license_tier = tier
         self.binary_version = version
@@ -396,7 +430,7 @@ class BrowserManager:
             logger.info("Binary ready: tier=%s version=%s", tier, version)
         except Exception as exc:
             logger.error(
-                "Binary pre-download failed (keyless fallback remains): %s",
+                "Binary pre-download failed: %s",
                 exc,
                 exc_info=True,
             )
@@ -420,6 +454,15 @@ class BrowserManager:
         )
 
         async with self._lock:
+            if profile_id in self._held:
+                raise ProfileBusyError(
+                    f"Profile {profile_id} is busy: its browser state is being copied or reset"
+                )
+            if profile_id in self._stopping:
+                # The previous browser is still closing. Starting another Chrome
+                # on the same directory now would fight it for the profile — and
+                # in Docker mode the launch would even delete its Singleton lock.
+                raise ProfileBusyError(f"Profile {profile_id} is still closing; retry shortly")
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
@@ -483,6 +526,8 @@ class BrowserManager:
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
                 _validate_proxy(proxy)
+            if profile.get("transparent_proxy"):
+                _validate_transparent_proxy(proxy)
 
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile["user_data_dir"],
@@ -618,6 +663,20 @@ class BrowserManager:
                     self._screenshot_loop(profile_id)
                 )
 
+            # Files this browser downloads become artifacts of the profile — but only under
+            # Docker. On a native install the browser writes to the user's own Downloads
+            # folder, and diverting that into the Manager's store would take their files away.
+            if self.runtime.runtime_mode == "docker":
+                running.download_rearm = asyncio.Event()
+                running.download_task = asyncio.ensure_future(
+                    downloads.watch(
+                        profile_id,
+                        cdp_port,
+                        still_running=lambda: profile_id in self.running,
+                        rearm=running.download_rearm,
+                    )
+                )
+
             logger.info(
                 "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
                 profile_id,
@@ -629,14 +688,21 @@ class BrowserManager:
             return running
 
         except BaseException:
+            # Stay "active" until the half-launched browser is really gone: swap
+            # _launching for _stopping under the lock so is_active() never sees a
+            # gap while a context may still be open, then clear it after cleanup.
             async with self._lock:
                 self._launching.discard(profile_id)
-            if context is not None:
-                await self._close_context(context, profile_id)
-            if cdp_port is not None:
-                self._release_cdp_port(cdp_port)
-            if display is not None:
-                await self.vnc.stop_vnc(display)
+                self._reserve_stopping(profile_id)
+            try:
+                if context is not None:
+                    await self._close_context(context, profile_id)
+                if cdp_port is not None:
+                    self._release_cdp_port(cdp_port)
+                if display is not None:
+                    await self.vnc.stop_vnc(display)
+            finally:
+                self._release_stopping(profile_id)
             raise
 
     async def _ensure_search_engine(
@@ -812,6 +878,20 @@ class BrowserManager:
     ) -> None:
         if running.screenshot_task is not None:
             running.screenshot_task.cancel()
+        if running.download_task is not None:
+            running.download_task.cancel()
+            # Awaited, not just cancelled: the watcher owns staged download files, and
+            # disposal must not race its cleanup.
+            await asyncio.gather(running.download_task, return_exceptions=True)
+            # The browser is gone, so a transfer still marked pending can never finish.
+            # Reconciling only on the next launch would strand it while the profile is stopped.
+            try:
+                downloads.reconcile_interrupted(running.profile_id)
+            except Exception as exc:  # noqa: BLE001 — teardown must not fail on bookkeeping
+                logger.warning(
+                    "Profile %s: could not reconcile downloads on stop: %s",
+                    running.profile_id, exc,
+                )
         if close_context:
             await self._close_context(running.context, running.profile_id)
         if running.display is not None:
@@ -839,9 +919,14 @@ class BrowserManager:
             # a concurrent launch() clearing _last_errors at its start.
             self._record_denial_if_any(profile_id, running.denial_path)
             self.running.pop(profile_id, None)
+            # Same contract as stop(): active until the dispose is really done.
+            self._reserve_stopping(profile_id)
 
         logger.info("Browser closed for profile %s, cleaning up", profile_id)
-        await self._dispose_running(running, close_context=True)
+        try:
+            await self._dispose_running(running, close_context=True)
+        finally:
+            self._release_stopping(profile_id)
 
     def _denial_error(self, denial_path: str | None) -> CloakBrowserLicenseError | None:
         """Read the wrapper's denial file → a license error, or None.
@@ -870,23 +955,82 @@ class BrowserManager:
     async def stop(self, profile_id: str):
         """Stop a running browser instance and release all owned resources."""
         # Pop before close so the close event observes an already-clean state.
+        # _stopping keeps the profile "active" for is_active() until the context
+        # is really closed: Chrome is still flushing its profile dir in between.
         async with self._lock:
             running = self.running.pop(profile_id, None)
+            if running:
+                self._reserve_stopping(profile_id)
 
         if not running:
             return
 
         logger.info("Stopping profile %s", profile_id)
-        # Final preview capture while the context is still alive (the on-close
-        # path can't screenshot — the browser is already gone by then).
-        if running.capture_preview:
-            try:
-                await self._capture_screenshot(running)
-            except Exception as exc:
-                logger.debug(
-                    "Final preview screenshot failed for %s: %s", profile_id, exc
+        try:
+            # Final preview capture while the context is still alive (the on-close
+            # path can't screenshot — the browser is already gone by then).
+            if running.capture_preview:
+                try:
+                    await self._capture_screenshot(running)
+                except Exception as exc:
+                    logger.debug(
+                        "Final preview screenshot failed for %s: %s", profile_id, exc
+                    )
+            await self._dispose_running(running, close_context=True)
+        finally:
+            self._release_stopping(profile_id)
+
+    def _reserve_stopping(self, profile_id: str) -> None:
+        """Mark a context-close in progress for the profile (counted)."""
+        self._stopping[profile_id] = self._stopping.get(profile_id, 0) + 1
+
+    def _release_stopping(self, profile_id: str) -> None:
+        """Release ONE close reservation; the profile stays active while others remain."""
+        left = self._stopping.get(profile_id, 0) - 1
+        if left > 0:
+            self._stopping[profile_id] = left
+        else:
+            self._stopping.pop(profile_id, None)
+
+    def is_active(self, profile_id: str) -> bool:
+        """True while a browser owns the profile dir: launching, running or still
+        closing. ``running`` alone is not enough — launch() registers there only
+        at the very end, and stop() pops it before the context is closed."""
+        return (
+            profile_id in self.running
+            or profile_id in self._launching
+            or profile_id in self._stopping
+        )
+
+    def cdp_client_detached(self, running: RunningProfile) -> None:
+        """A proxied CDP client that changed download behaviour has disconnected. Chromium
+        reverts to its default, so capture is re-armed. ``running`` is the browser the
+        client was attached to: a late notification must not touch a relaunched one."""
+        if self.running.get(running.profile_id) is running and running.download_rearm is not None:
+            running.download_rearm.set()
+
+    @asynccontextmanager
+    async def hold_stopped(self, profile_id: str):
+        """Exclusive access to a stopped profile's on-disk state for the block.
+
+        Refuses with ProfileBusyError if a browser is launching, running or
+        closing for the profile, or another hold is active. While held, launch()
+        refuses the profile. Every operation that reads or rewrites a
+        user_data_dir (duplicate, reset, delete) takes this, so a launch and a
+        filesystem operation can never interleave on the same directory.
+        """
+        async with self._lock:
+            if self.is_active(profile_id):
+                raise ProfileBusyError(f"Profile {profile_id} is running or changing state")
+            if profile_id in self._held:
+                raise ProfileBusyError(
+                    f"Profile {profile_id} is busy: its browser state is being copied or reset"
                 )
-        await self._dispose_running(running, close_context=True)
+            self._held.add(profile_id)
+        try:
+            yield
+        finally:
+            self._held.discard(profile_id)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status and viewer capabilities for a profile."""
@@ -1043,6 +1187,10 @@ class BrowserManager:
 
         if profile.get("allow_3p_cookies", False):
             args.append("--fingerprint-allow-3p-cookies")
+        if profile.get("transparent_proxy", False):
+            args.append("--fingerprint-transparent-proxy")
+        if profile.get("portable_cookies", False):
+            args.append("--fingerprint-portable-cookies")
 
         sw = profile.get("screen_width")
         sh = profile.get("screen_height")

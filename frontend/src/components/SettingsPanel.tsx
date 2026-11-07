@@ -98,7 +98,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               placeholder={
                 current?.license_key_set
                   ? `Current: ${current.license_key_masked ?? "set"} — type to replace`
-                  : "cb_… (leave empty to run the free keyless build)"
+                  : "cb_… (a free key works)"
               }
             />
             <p className="mt-1 text-xs text-gray-500">

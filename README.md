@@ -51,7 +51,7 @@ cd CloakBrowser-Manager
 ./run-macos.sh      # macOS  (or run-windows.bat on Windows)
 ```
 
-This path requires Python 3.10+ and Node 18+; the first run creates a local Python environment, installs dependencies, and builds the React UI before starting the Manager.
+This path requires Python 3.10+ and Node 24.15+; the first run creates a local Python environment, installs dependencies, and builds the React UI before starting the Manager.
 
 ### Linux server
 
@@ -74,7 +74,7 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 ## CloakBrowser license key
 
 The Manager runs on the CloakBrowser engine, so it needs a key.<br>
-[Get a free one with GitHub](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
+[Get a free one by email](https://cloakbrowser.dev/free) to run one profile at a time on the current build.<br>
 [Paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time, from a handful to thousands.
 
 Add your key once and every profile uses it.
@@ -127,6 +127,8 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
+- **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage
+- **Profile files** — send files to a profile and, on a Linux server, keep everything its browser downloads
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
 - **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
 - **Playwright/Puppeteer API** — connect to any running profile through CDP while watching the same session live
@@ -171,7 +173,7 @@ docker compose up --build
 
 ## Requirements
 
-- Windows or macOS native: Python 3.10+, Node.js 18+
+- Windows or macOS native: Python 3.10+, Node.js 24.15+
 - Linux server: Docker 20.10+
 - ~2 GB disk (application + browser binary)
 - ~512 MB RAM per running profile
@@ -231,6 +233,62 @@ await page.goto("https://example.com");
 
 The CDP URL is available from the running-profile view. The same browser session is accessible through its native window on Windows/macOS or through VNC on Linux Docker, and programmatically through the API on every platform.
 
+## Profile files
+
+A profile can exchange files with the outside world. This matters most under Docker, where the
+browser cannot see your filesystem: a file you want to upload to a website is not reachable from
+the guest's file dialog, and anything the browser downloads is trapped in the container.
+
+```bash
+# Put a file where the profile's browser can use it: the body is the file, the header its name
+curl --data-binary @report.csv -H "X-File-Name: report.csv" http://localhost:8080/api/profiles/<id>/files
+
+# What this profile holds
+curl http://localhost:8080/api/profiles/<id>/files
+
+# Fetch one back (also serves what the browser downloaded)
+curl -OJ http://localhost:8080/api/profiles/<id>/files/<artifact-id>
+
+curl -X DELETE http://localhost:8080/api/profiles/<id>/files/<artifact-id>
+```
+
+The upload body is the file itself, not a form: it streams straight into the profile's store,
+so a file costs one copy on disk and an oversized one is refused from its `Content-Length`
+before a byte is read. `X-File-Name` is URL-encoded (`%20` for a space), though a raw UTF-8 name
+works too; the stored type is the request's `Content-Type` when it is a real one, otherwise a
+guess from the name. An upload
+reports a `container_path`, which is what a CDP call that takes a path
+(`DOM.setFileInputFiles`, `Input.dispatchDragEvent`) hands to the page.
+
+In the Docker build the live viewer gains a files button: upload from your own machine, drop a
+file straight onto the screen, or pull one back. Uploaded files also appear in the guest's own
+file dialog under **Uploads — <profile>** in the sidebar, so a website's "Choose file" button can
+reach them, and files the browser downloads are captured automatically and land in the same list.
+
+On the native macOS and Windows builds the browser already shares your filesystem and writes to
+your own Downloads folder, so neither the sidebar shortcut nor download capture applies there.
+The endpoints above still work.
+
+Download behaviour is browser-wide and last-writer-wins, so an automation client attached to the
+profile's CDP endpoint controls it: Playwright's `connect_over_cdp`, for example, sets its own
+download directory (or disables downloads entirely) as it initialises. While such a client is
+attached its downloads go where it asked, not into the profile's files — the Manager records
+nothing it cannot see, and never cancels a transfer it does not own. When such a client
+disconnects, Chromium falls back to its default download behaviour rather than to the Manager's,
+so capture is re-armed as soon as a proxied CDP connection closes.
+
+Files live beside the profile, not inside it, so duplicating a profile's browser state never
+copies its documents. Deleting a profile deletes its files. Nothing expires on its own: the
+limits below are per profile. A file larger than `ARTIFACT_MAX_BYTES` is refused with `413`, and
+an upload that would breach a profile's count or total is refused with `507`; nothing is evicted
+to make room.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ARTIFACT_MAX_BYTES` | `268435456` (256 MiB) | Largest single file |
+| `ARTIFACT_MAX_COUNT` | `200` | Files per profile |
+| `ARTIFACT_MAX_TOTAL_BYTES` | `2147483648` (2 GiB) | Total per profile |
+
 ## Remote Access
 
 The container binds to localhost only. To access from a remote server:
@@ -287,7 +345,7 @@ Supported units are `px`, `rem`, `em`, and `vw`. Invalid values fall back to `16
 - **This application** (GUI source code) — MIT. See [LICENSE](LICENSE).
 - **CloakBrowser binary** (compiled Chromium) — governed by version-specific subscription terms and may not be redistributed. See [BINARY-LICENSE.md](BINARY-LICENSE.md).
 
-The GUI application requires the CloakBrowser Chromium binary to function. The binary is automatically downloaded on first launch and is governed by its own license terms. If you fork or redistribute this application, your users must comply with the [CloakBrowser Binary License](BINARY-LICENSE.md).
+The GUI application requires the CloakBrowser Chromium binary to function. The binary is automatically downloaded once you add a license key and is governed by its own license terms. If you fork or redistribute this application, your users must comply with the [CloakBrowser Binary License](BINARY-LICENSE.md).
 
 ## Contributing
 
@@ -297,8 +355,9 @@ Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/Clo
 
 - [lhq1363511234-arch](https://github.com/lhq1363511234-arch) — native Windows support foundation
 - [quorentindupres-dev](https://github.com/quorentindupres-dev) — native macOS workflow and Manager integration concepts
-- [shellus](https://github.com/shellus) — auth-gated status endpoint and unauthenticated health probe
+- [shellus](https://github.com/shellus) — auth-gated status endpoint and unauthenticated health probe, offline VNC startup
 - [hayka-pacha](https://github.com/hayka-pacha) — profile reset endpoint
+- [theaafofficial](https://github.com/theaafofficial) — duplicating a profile with its browser state, and per-profile files with download capture
 
 ## Links
 

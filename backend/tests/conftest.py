@@ -13,15 +13,10 @@ import pytest
 # Mock cloakbrowser BEFORE any backend module is imported.
 # browser_manager.py does `from cloakbrowser import launch_persistent_context_async`
 # at module level, and main.py imports BrowserManager which triggers it.
-# main.py:381 also does `from cloakbrowser.config import CHROMIUM_VERSION`.
 # ---------------------------------------------------------------------------
 
 _mock_cloakbrowser = types.ModuleType("cloakbrowser")
 _mock_cloakbrowser.launch_persistent_context_async = AsyncMock()  # type: ignore[attr-defined]
-
-_mock_config = types.ModuleType("cloakbrowser.config")
-_mock_config.CHROMIUM_VERSION = "0.0.0-test"  # type: ignore[attr-defined]
-_mock_config.get_chromium_version = lambda: "0.0.0-test"  # type: ignore[attr-defined]
 
 # BrowserManager.resolve_binary_status() (run in the lifespan) imports these.
 _mock_download = types.ModuleType("cloakbrowser.download")
@@ -40,7 +35,6 @@ _mock_license.license_error_for_code = lambda code: None  # type: ignore[attr-de
 _mock_license.read_denial_file = lambda path: None  # type: ignore[attr-defined]
 
 sys.modules.setdefault("cloakbrowser", _mock_cloakbrowser)
-sys.modules.setdefault("cloakbrowser.config", _mock_config)
 sys.modules.setdefault("cloakbrowser.download", _mock_download)
 sys.modules.setdefault("cloakbrowser.license", _mock_license)
 
@@ -88,3 +82,36 @@ def app_client(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
 
     with TestClient(main.app) as client:
         yield client
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path_factory, monkeypatch: pytest.MonkeyPatch):
+    """Keep the suite out of the developer's real ``$HOME``.
+
+    On Linux the Manager resolves to the Docker runtime, where it writes a GTK bookmarks file
+    into ``$HOME`` so the guest's file chooser can reach a profile's uploads. A test run must
+    never clobber a real one.
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+@pytest.fixture()
+def native_runtime(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run as the native macOS/Windows build, where the guest shares the user's filesystem."""
+    monkeypatch.setattr(db, "RUNTIME", RuntimeConfig("macos", "native", "native-window", tmp_db))
+    return db.RUNTIME
+
+
+@pytest.fixture()
+def docker_runtime(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run as the Linux/Docker build, the only one with a containerised file chooser.
+
+    Symlinks and the GTK bookmarks file are Docker-only, so tests that exercise them must
+    say so rather than depending on the host the suite happens to run on (CI covers
+    ubuntu, windows and macos).
+    """
+    monkeypatch.setattr(db, "RUNTIME", RuntimeConfig("linux", "docker", "vnc", tmp_db))
+    return db.RUNTIME

@@ -32,6 +32,8 @@ class ProfileCreate(BaseModel):
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    transparent_proxy: bool = False
+    portable_cookies: bool = False
     notes: str | None = None
     tags: list[TagCreate] | None = None
 
@@ -59,6 +61,8 @@ class ProfileUpdate(BaseModel):
     set_google_default: bool | None = None
     capture_preview: bool | None = None
     restore_session: bool | None = None
+    transparent_proxy: bool | None = None
+    portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
@@ -68,6 +72,30 @@ class ProfileUpdate(BaseModel):
         if value is None:
             raise ValueError("gpu_family cannot be null")
         return value
+
+
+class ArtifactResponse(BaseModel):
+    id: str
+    profile_id: str
+    name: str
+    size: int
+    kind: str
+    state: str
+    content_type: str | None = None
+    created_at: str
+    # The name this file carries in the container's file-chooser view; stable for its lifetime.
+    picker_name: str
+    # Where the file is visible to the browser process, for CDP calls that take a path.
+    container_path: str
+
+
+class ProfileDuplicateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Also copy the source's user_data_dir (cookies, logged-in sessions, history,
+    # local storage) so the clone launches as the same identity AND the same
+    # session. Off by default: the clone starts with fresh, empty browser state.
+    include_browser_state: bool = False
 
 
 class TagCreate(BaseModel):
@@ -112,6 +140,8 @@ class ProfileResponse(BaseModel):
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    transparent_proxy: bool = False
+    portable_cookies: bool = False
     notes: str | None = None
     user_data_dir: str
     created_at: str
@@ -141,7 +171,7 @@ class LaunchResponse(BaseModel):
 class StatusResponse(BaseModel):
     running_count: int
     binary_version: str
-    license_tier: str = "keyless"
+    license_tier: str = "none"
     profiles_total: int
     host_os: HostOS
     runtime_mode: RuntimeMode
@@ -169,7 +199,7 @@ class SettingsResponse(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    # None = leave unchanged; "" = clear the license key (back to keyless).
+    # None = leave unchanged; "" = clear the license key.
     license_key: str | None = None
     release_channel: str | None = None
 

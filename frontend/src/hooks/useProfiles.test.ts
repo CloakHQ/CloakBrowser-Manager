@@ -12,6 +12,7 @@ vi.mock("../lib/api", () => ({
     reorderProfiles: vi.fn(),
     launchProfile: vi.fn(),
     stopProfile: vi.fn(),
+    duplicateProfile: vi.fn(),
   },
 }));
 
@@ -25,6 +26,7 @@ const mockApi = api as {
   reorderProfiles: ReturnType<typeof vi.fn>;
   launchProfile: ReturnType<typeof vi.fn>;
   stopProfile: ReturnType<typeof vi.fn>;
+  duplicateProfile: ReturnType<typeof vi.fn>;
 };
 
 const fakeProfile = {
@@ -157,6 +159,23 @@ describe("useProfiles", () => {
     // (refresh clears the transient error, matching launch/stop behavior.)
     expect(mockApi.reorderProfiles).toHaveBeenCalled();
     expect(result.current.profiles.map((p) => p.id)).toEqual(["abc-123", "xyz-789"]);
+  });
+
+  it("duplicate prepends the clone and forwards includeBrowserState", async () => {
+    mockApi.listProfiles.mockResolvedValue([fakeProfile]);
+    const clone = { ...fakeProfile, id: "clone-1", name: "Test (copy)" };
+    mockApi.duplicateProfile.mockResolvedValue(clone);
+    const { result } = renderHook(() => useProfiles());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    let returned: unknown;
+    await act(async () => {
+      returned = await result.current.duplicate("abc-123", true);
+    });
+
+    expect(mockApi.duplicateProfile).toHaveBeenCalledWith("abc-123", true);
+    expect(returned).toEqual(clone);
+    expect(result.current.profiles.map((p) => p.id)).toEqual(["clone-1", "abc-123"]);
   });
 
   it("sets error on fetch failure", async () => {

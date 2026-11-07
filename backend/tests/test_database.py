@@ -63,7 +63,12 @@ def test_init_db_rebuilds_old_schema_preserving_profile_and_tags(tmp_db: Path):
         "platform", "user_agent", "gpu_vendor", "gpu_renderer",
         "hardware_concurrency", "headless",
     }.isdisjoint(columns)
-    assert {"launch_args", "extension_paths", "allow_3p_cookies"}.issubset(columns)
+    assert {
+        "launch_args", "extension_paths", "allow_3p_cookies",
+        "transparent_proxy", "portable_cookies",
+    }.issubset(columns)
+    assert profile["transparent_proxy"] == 0
+    assert profile["portable_cookies"] == 0
 
 
 # ── create_profile ───────────────────────────────────────────────────────────
@@ -130,6 +135,8 @@ def test_create_profile_defaults(tmp_db: Path):
     assert p["geoip"] == 1
     assert p["extension_paths"] == []
     assert p["allow_3p_cookies"] == 1
+    assert p["transparent_proxy"] == 0
+    assert p["portable_cookies"] == 0
     assert p["human_preset"] == "default"
     assert p["launch_args"] == []
 
@@ -340,3 +347,20 @@ def test_reset_profile_bumps_updated_at(tmp_db: Path):
 
 def test_reset_profile_not_found(tmp_db: Path):
     assert db.reset_profile("nonexistent") is None
+
+
+def test_create_profile_honours_explicit_id(tmp_db: Path):
+    pid = db.new_profile_id()
+    p = db.create_profile(name="Pre-minted", profile_id=pid)
+    assert p["id"] == pid
+    assert p["user_data_dir"] == db.user_data_dir_for(pid)
+    assert db.get_profile(pid)["name"] == "Pre-minted"
+
+
+def test_duplicate_profile_honours_new_id(tmp_db: Path):
+    src = db.create_profile(name="Src", fingerprint_seed=7)
+    pid = db.new_profile_id()
+    clone = db.duplicate_profile(src["id"], new_id=pid)
+    assert clone["id"] == pid
+    assert clone["fingerprint_seed"] == 7
+    assert clone["user_data_dir"] == db.user_data_dir_for(pid)

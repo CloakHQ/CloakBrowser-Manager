@@ -74,6 +74,7 @@ class VNCManager:
             "-SecurityTypes", "None",
             "-DisableBasicAuth",
             "-interface", "127.0.0.1",  # internal only, proxied by FastAPI
+            "-publicIP", "127.0.0.1",  # skip KasmVNC STUN discovery
             "-AlwaysShared",
             "-httpd", httpd_dir,
         ]

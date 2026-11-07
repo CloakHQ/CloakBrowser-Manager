@@ -1,5 +1,5 @@
 # Stage 1: Build React frontend
-FROM node:20-slim AS frontend-builder
+FROM node:24.22.2-slim AS frontend-builder
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
@@ -50,9 +50,6 @@ COPY backend/ /app/backend/
 
 # Frontend build from stage 1
 COPY --from=frontend-builder /build/dist /app/frontend/dist
-
-# Pre-download CloakBrowser binary
-RUN python -c "from cloakbrowser.download import ensure_binary; ensure_binary()"
 
 EXPOSE 8080
 

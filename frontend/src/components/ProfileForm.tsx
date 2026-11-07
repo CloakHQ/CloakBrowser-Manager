@@ -1,4 +1,4 @@
-import { Check, Copy, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
@@ -16,7 +16,7 @@ interface ProfileFormProps {
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
   onReset?: () => Promise<void>;
-  onDuplicate?: () => Promise<void>;
+  onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -57,6 +57,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     set_google_default: true,
     capture_preview: true,
     restore_session: true,
+    transparent_proxy: false,
+    portable_cookies: false,
     extension_paths: [],
     launch_args: [],
     tags: [],
@@ -71,6 +73,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [resetting, setResetting] = useState(false);
   const [resetDone, setResetDone] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
+  const [duplicateMenuOpen, setDuplicateMenuOpen] = useState(false);
+  const duplicateMenuRef = useRef<HTMLDivElement>(null);
+  const duplicateTriggerRef = useRef<HTMLButtonElement>(null);
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -106,6 +111,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         set_google_default: profile.set_google_default,
         capture_preview: profile.capture_preview,
         restore_session: profile.restore_session,
+        transparent_proxy: profile.transparent_proxy,
+        portable_cookies: profile.portable_cookies,
         launch_args: profile.launch_args ?? [],
         notes: profile.notes,
         tags: profile.tags ?? [],
@@ -186,18 +193,38 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     }
   };
 
-  const handleDuplicate = async () => {
+  useEffect(() => {
+    if (!duplicateMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (!duplicateMenuRef.current?.contains(e.target as Node)) setDuplicateMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setDuplicateMenuOpen(false);
+      // A focused menu item is about to unmount; hand focus back to the trigger
+      // so keyboard users are not dropped onto the document body.
+      duplicateTriggerRef.current?.focus();
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [duplicateMenuOpen]);
+
+  const handleDuplicate = async (includeBrowserState: boolean) => {
+    setDuplicateMenuOpen(false);
     if (!onDuplicate) return;
-    if (
-      !confirm(
-        "Duplicate this profile? A new profile with the same settings and " +
-          "fingerprint is created. Browser state (cookies, history) is not copied.",
-      )
-    )
-      return;
+    const message = includeBrowserState
+      ? "Duplicate this profile with its browser state? A new profile with the " +
+        "same settings, fingerprint, cookies and logged-in sessions is created."
+      : "Duplicate this profile? A new profile with the same settings and " +
+        "fingerprint is created. Browser state (cookies, history) is not copied.";
+    if (!confirm(message)) return;
     setDuplicating(true);
     try {
-      await onDuplicate();
+      await onDuplicate(includeBrowserState);
     } finally {
       setDuplicating(false);
     }
@@ -254,15 +281,60 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
           {isEdit && onDuplicate && (
-            <button
-              type="button"
-              onClick={handleDuplicate}
-              disabled={duplicating}
-              className="btn-secondary flex items-center gap-1.5"
-            >
-              <Copy className="h-3.5 w-3.5" />
-              <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
-            </button>
+            <div ref={duplicateMenuRef} className="relative flex items-stretch">
+              <button
+                type="button"
+                onClick={() => handleDuplicate(false)}
+                disabled={duplicating}
+                title="Duplicate settings and fingerprint only"
+                className="btn-secondary flex items-center gap-1.5 rounded-r-none"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
+              </button>
+              <button
+                ref={duplicateTriggerRef}
+                type="button"
+                onClick={() => setDuplicateMenuOpen((open) => !open)}
+                disabled={duplicating}
+                aria-haspopup="menu"
+                aria-expanded={duplicateMenuOpen}
+                aria-label="Duplicate options"
+                className="btn-secondary flex items-center rounded-l-none border-l border-border px-2"
+              >
+                <ChevronDown className="h-3.5 w-3.5" />
+              </button>
+              {duplicateMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute left-0 top-full z-20 mt-1 w-64 rounded-md border border-border bg-surface-2 py-1 shadow-lg"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => handleDuplicate(false)}
+                    className="w-full px-3 py-2 text-left hover:bg-surface-3"
+                  >
+                    <div className="text-sm text-gray-200">Settings and fingerprint only</div>
+                    <div className="text-xs text-gray-500">Starts with empty browser state</div>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={profile?.status !== "stopped"}
+                    onClick={() => handleDuplicate(true)}
+                    className="w-full px-3 py-2 text-left hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                  >
+                    <div className="text-sm text-gray-200">With browser state</div>
+                    <div className="text-xs text-gray-500">
+                      {profile?.status === "stopped"
+                        ? "Cookies, logged-in sessions and history"
+                        : "Stop the profile first"}
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
           )}
           {isEdit && onReset && (
             <button
@@ -607,6 +679,34 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               className="rounded border-border bg-surface-2"
             />
             Allow third-party cookies for login, SSO, and challenge flows
+          </label>
+          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+            <input
+              type="checkbox"
+              checked={form.transparent_proxy ?? false}
+              onChange={(e) => set("transparent_proxy", e.target.checked)}
+              className="rounded border-border bg-surface-2 mt-0.5"
+            />
+            <span>
+              Transparent proxy connection
+              <span className="block text-xs text-gray-500">
+                Stronger proxy connection mode. Requires an http:// proxy with a username and password.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
+            <input
+              type="checkbox"
+              checked={form.portable_cookies ?? false}
+              onChange={(e) => set("portable_cookies", e.target.checked)}
+              className="rounded border-border bg-surface-2 mt-0.5"
+            />
+            <span>
+              Portable cookies
+              <span className="block text-xs text-gray-500">
+                Lets this profile move to another machine with its logins. Only cookies saved while this is on are portable, so turn it on before logging in.
+              </span>
+            </span>
           </label>
           <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
             <input

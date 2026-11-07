@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, mock_open
 
 import pytest
 
@@ -83,6 +84,26 @@ async def test_allocate_instance_fields(vnc: VNCManager):
     assert instance.display == 100
     assert instance.ws_port == 6100
     assert instance.process is None  # not started yet
+
+
+# ── start_vnc ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_vnc_uses_loopback_public_ip(monkeypatch: pytest.MonkeyPatch):
+    process = MagicMock()
+    process.poll.return_value = None
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr("backend.vnc_manager.shutil.which", lambda _: "/usr/bin/Xvnc")
+    monkeypatch.setattr("backend.vnc_manager.subprocess.Popen", popen)
+    monkeypatch.setattr("backend.vnc_manager.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("builtins.open", mock_open())
+
+    await VNCManager().start_vnc(display=100, ws_port=6100)
+
+    command = popen.call_args.args[0]
+    public_ip_index = command.index("-publicIP")
+    assert command[public_ip_index + 1] == "127.0.0.1"
 
 
 # ── get_ws_port ──────────────────────────────────────────────────────────────

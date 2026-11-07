@@ -122,12 +122,14 @@ export function useProfiles() {
     [refresh],
   );
 
-  // Clone a profile's config into a new profile (same settings + fingerprint,
-  // fresh browser state). Returns the clone so the caller can select it.
+  // Clone a profile into a new profile (same settings + fingerprint). With
+  // includeBrowserState the source's cookies, logged-in sessions and history
+  // come along too, so the clone opens already signed in. Returns the clone so
+  // the caller can select it.
   const duplicate = useCallback(
-    async (id: string): Promise<Profile | undefined> => {
+    async (id: string, includeBrowserState = false): Promise<Profile | undefined> => {
       try {
-        const profile = await api.duplicateProfile(id);
+        const profile = await api.duplicateProfile(id, includeBrowserState);
         setProfiles((prev) => [profile, ...prev]);
         return profile;
       } catch (err) {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -12,7 +13,9 @@ from backend.browser_manager import (
     _init_profile_defaults,
     _normalize_proxy,
     _validate_proxy,
+    _validate_transparent_proxy,
     BrowserManager,
+    ProfileBusyError,
     RunningProfile,
     SEARCH_ENGINE_MARKER,
 )
@@ -101,6 +104,26 @@ def test_validate_no_port():
         _validate_proxy("http://host")
 
 
+# ── _validate_transparent_proxy ──────────────────────────────────────────────
+
+
+def test_transparent_proxy_accepts_http_with_credentials():
+    _validate_transparent_proxy("http://user:pass@proxy.com:8080")  # should not raise
+
+
+@pytest.mark.parametrize("proxy", [
+    None,
+    "socks5://user:pass@proxy.com:1080",
+    "https://user:pass@proxy.com:443",
+    "http://proxy.com:8080",
+    "http://user@proxy.com:8080",
+    "http://us%3Aer:pass@proxy.com:8080",
+])
+def test_transparent_proxy_rejects_unusable_proxy(proxy):
+    with pytest.raises(ValueError, match="Transparent proxy needs"):
+        _validate_transparent_proxy(proxy)
+
+
 # ── _build_fingerprint_args ──────────────────────────────────────────────────
 
 # Use the BrowserManager instance to call the method
@@ -147,6 +170,15 @@ def test_build_args_gpu_family_and_cookie_compatibility():
     intel = _mgr._build_fingerprint_args({"gpu_family": "intel"})
     assert "--fingerprint-gpu-vendor=Intel" in intel
     assert not any("gpu-vendor" in arg for arg in _mgr._build_fingerprint_args({"gpu_family": "auto"}))
+
+
+def test_build_args_transparent_proxy_and_portable_cookies():
+    args = _mgr._build_fingerprint_args({"transparent_proxy": True, "portable_cookies": True})
+    assert "--fingerprint-transparent-proxy" in args
+    assert "--fingerprint-portable-cookies" in args
+    off = _mgr._build_fingerprint_args({"transparent_proxy": False, "portable_cookies": 0})
+    assert "--fingerprint-transparent-proxy" not in off
+    assert "--fingerprint-portable-cookies" not in off
 
 
 def test_build_args_screen():
@@ -284,7 +316,7 @@ async def test_launch_rejects_user_debugging_flags(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
+async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path, tmp_db):
     from backend import browser_manager as module
 
     context = MagicMock()
@@ -298,6 +330,12 @@ async def test_docker_launch_keeps_vnc_display(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
 
     running = await manager.launch(_launch_profile(tmp_path))
+    background_tasks = [
+        task for task in (running.download_task, running.screenshot_task) if task is not None
+    ]
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
 
     assert running.display == 100
     assert running.ws_port == 6100
@@ -380,6 +418,96 @@ async def test_launch_retries_failed_cdp_and_closes_first_context(
     assert launch.await_count == 2
     first_context.close.assert_awaited_once()
     assert running.cdp_port in manager._cdp_ports
+
+
+@pytest.mark.asyncio
+async def test_failed_launch_stays_active_until_its_context_is_closed(monkeypatch, tmp_path: Path):
+    """A launch that fails AFTER the browser is up must keep the profile active
+    while the half-launched context is being closed — the failure path used to
+    drop _launching before awaiting the close, leaving a window in which
+    hold_stopped() (duplicate / reset / delete) would touch a live profile dir."""
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.on = MagicMock(side_effect=RuntimeError("post-startup wiring failed"))
+    closing, finish = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(*_args):
+        closing.set()
+        await finish.wait()
+
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    monkeypatch.setattr(manager, "_close_context", blocked_close)
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    profile = _launch_profile(tmp_path)
+    pid = profile["id"]
+
+    task = asyncio.create_task(manager.launch(profile))
+    await asyncio.wait_for(closing.wait(), 2)
+    try:
+        assert pid not in manager._launching  # the exact window: cleanup pending
+        assert manager.is_active(pid)
+        with pytest.raises(ProfileBusyError):
+            async with manager.hold_stopped(pid):
+                pass
+    finally:
+        finish.set()
+    with pytest.raises(RuntimeError, match="post-startup wiring failed"):
+        await task
+
+    # Once cleanup has finished the profile is genuinely stopped again
+    assert not manager.is_active(pid)
+    async with manager.hold_stopped(pid):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_launch_is_refused_while_the_previous_browser_is_still_closing(monkeypatch):
+    """A relaunch during shutdown used to be admitted, and if it then failed its
+    cleanup cleared the shutdown's `_stopping` entry — leaving the still-closing
+    profile inactive to hold_stopped(). Now the relaunch is refused outright."""
+    manager = BrowserManager(DOCKER_RUNTIME)
+    closing, finish = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(*_args):
+        closing.set()
+        await finish.wait()
+
+    monkeypatch.setattr(manager, "_close_context", blocked_close)
+    manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
+    manager.vnc.start_vnc = AsyncMock(side_effect=RuntimeError("Xvnc failed to start"))
+    manager.vnc.stop_vnc = AsyncMock()
+    manager.running["profile-1"] = RunningProfile("profile-1", object(), 19001, capture_preview=False)
+
+    stop = asyncio.create_task(manager.stop("profile-1"))
+    await asyncio.wait_for(closing.wait(), 2)
+    try:
+        assert manager.is_active("profile-1")
+        with pytest.raises(ProfileBusyError, match="still closing"):
+            await manager.launch({"id": "profile-1", "user_data_dir": "/nonexistent"})
+        # The refused launch touched nothing: the shutdown reservation is intact
+        assert not stop.done()
+        assert manager.is_active("profile-1")
+        manager.vnc.allocate.assert_not_awaited()
+    finally:
+        finish.set()
+        await stop
+    assert not manager.is_active("profile-1")
+
+
+def test_stopping_reservations_are_counted_per_operation():
+    """One operation's cleanup must never release another's reservation."""
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._reserve_stopping("p")
+    manager._reserve_stopping("p")
+    manager._release_stopping("p")
+    assert manager.is_active("p")
+    manager._release_stopping("p")
+    assert not manager.is_active("p")
+    manager._release_stopping("p")  # over-release is harmless
+    assert not manager.is_active("p")
 
 
 @pytest.mark.asyncio
@@ -474,3 +602,103 @@ def test_init_idempotent(tmp_path: Path):
     # Second call should NOT overwrite (file already exists)
     _init_profile_defaults(tmp_path)
     assert bookmarks_path.read_text() == "SENTINEL"
+
+
+@pytest.mark.asyncio
+async def test_downloads_are_captured_only_under_docker(monkeypatch, tmp_path: Path):
+    """Natively the browser writes to the user's own Downloads folder. Diverting that into
+    the Manager's artifact store would take their files away from where they expect them."""
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    watch = AsyncMock()
+    monkeypatch.setattr(module.downloads, "watch", watch)
+
+    running = await manager.launch(_launch_profile(tmp_path))
+
+    assert running.download_task is None
+    watch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_downloads_are_captured_under_docker(monkeypatch, tmp_db: Path, tmp_path: Path):
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(DOCKER_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
+    manager.vnc.start_vnc = AsyncMock()
+    manager.vnc.stop_vnc = AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(module.downloads, "watch", AsyncMock())
+
+    running = await manager.launch(_launch_profile(tmp_path))
+    try:
+        assert running.download_task is not None
+    finally:
+        await manager.stop(running.profile_id)
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_browser_settles_its_pending_downloads(
+    monkeypatch, tmp_db: Path, tmp_path: Path
+):
+    """Reconciling only on the next launch strands the row while the profile sits stopped."""
+    from backend import browser_manager as module
+    from backend import database as db
+    from backend import downloads
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(DOCKER_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
+    manager.vnc.start_vnc = AsyncMock()
+    manager.vnc.stop_vnc = AsyncMock()
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    monkeypatch.setattr(module.downloads, "watch", AsyncMock())
+
+    profile = db.create_profile(name="Downloader")
+    launch_profile = _launch_profile(tmp_path)
+    launch_profile["id"] = profile["id"]
+    running = await manager.launch(launch_profile)
+    artifact_id = downloads.DownloadTracker(profile["id"]).begin("guid-1", "half.csv")
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "pending"
+
+    await manager.stop(running.profile_id)
+
+    assert db.get_artifact(profile["id"], artifact_id)["state"] == "failed"
+
+
+def test_a_detaching_cdp_client_re_arms_download_capture():
+    manager = BrowserManager(DOCKER_RUNTIME)
+    running = RunningProfile("p1", MagicMock(), 9222, download_rearm=asyncio.Event())
+    manager.running["p1"] = running
+    manager.cdp_client_detached(running)
+    assert running.download_rearm.is_set()
+    # Running without capture (native): nothing to re-arm, nothing raised.
+    native = RunningProfile("native", MagicMock(), 9223)
+    manager.running["native"] = native
+    manager.cdp_client_detached(native)
+
+
+def test_a_late_detach_notification_does_not_touch_a_relaunched_browser():
+    manager = BrowserManager(DOCKER_RUNTIME)
+    stale = RunningProfile("p1", MagicMock(), 9222, download_rearm=asyncio.Event())
+    current = RunningProfile("p1", MagicMock(), 9224, download_rearm=asyncio.Event())
+    manager.running["p1"] = current  # the profile was stopped and launched again
+    manager.cdp_client_detached(stale)
+    assert not current.download_rearm.is_set()
+    assert not stale.download_rearm.is_set()
+    manager.running.pop("p1")
+    manager.cdp_client_detached(current)  # nor a browser that is gone altogether
+    assert not current.download_rearm.is_set()
