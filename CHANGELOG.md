@@ -4,6 +4,16 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-08
+
+### Added
+- **Profile tag filters with counts.** Show all profiles, only untagged profiles, or profiles matching every selected tag. Search now includes profile names, proxies, and notes, and the list shows tags and notes together. Drag-and-drop reordering stays available when no filters are active. Thanks to [shellus](https://github.com/shellus) (#46).
+- **Configurable sidebar width.** Set `SIDEBAR_WIDTH` without rebuilding the frontend. Supports `px`, `rem`, `em`, and `vw`, with a `16rem` fallback for invalid values. Thanks to [shellus](https://github.com/shellus) (#46).
+
+### Changed
+- **Upgrades the CloakBrowser engine dependency to 0.7.1 or newer.**
+- **Updated Python, frontend, and build/CI dependencies.** Running from source now requires Node.js 24.15+. Native setup installs shared build tooling before application dependencies, while retaining Python 3.10 support.
+
 ## [0.2.0] - 2026-11-01
 
 ### Changed

@@ -126,7 +126,8 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Each profile is a different machine** — its own fingerprint seed, GPU family, screen, cookies, localStorage, cache, and history, persistent across restarts
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
-- **Profile organization** — create, search, tag, edit, auto-launch, and delete profiles
+- **Profile organization**: create, edit, auto-launch, and delete profiles. Filter by tags or untagged profiles, with counts; selecting multiple tags matches profiles with every selected tag. Search names, proxies, and notes. Tags and notes appear together in the list.
+- **Configurable sidebar width**: set `SIDEBAR_WIDTH` without rebuilding the frontend (see [Runtime UI configuration](#runtime-ui-configuration)).
 - **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage
 - **Profile files** — send files to a profile and, on a Linux server, keep everything its browser downloads
 - **Platform-native browsing** — Windows and macOS profiles open in normal desktop windows
@@ -355,7 +356,7 @@ Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/Clo
 
 - [lhq1363511234-arch](https://github.com/lhq1363511234-arch) — native Windows support foundation
 - [quorentindupres-dev](https://github.com/quorentindupres-dev) — native macOS workflow and Manager integration concepts
-- [shellus](https://github.com/shellus) — auth-gated status endpoint and unauthenticated health probe, offline VNC startup
+- [shellus](https://github.com/shellus): auth-gated status endpoint and unauthenticated health probe, offline VNC startup, multi-tag profile filters, and configurable sidebar width
 - [hayka-pacha](https://github.com/hayka-pacha) — profile reset endpoint
 - [theaafofficial](https://github.com/theaafofficial) — duplicating a profile with its browser state, and per-profile files with download capture
 
