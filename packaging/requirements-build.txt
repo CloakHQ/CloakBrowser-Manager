@@ -1,3 +1,4 @@
-# Build-time only — NOT shipped to end users. Installed on the build machine to
-# freeze the app. The app's own runtime deps are in backend/requirements.txt.
+# Shared setup/build tooling, installed before application dependencies.
+pip>=26.3
+setuptools>=84.1.0
 pyinstaller>=6.22.3

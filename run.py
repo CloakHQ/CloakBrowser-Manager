@@ -56,6 +56,15 @@ def _ensure_environment() -> Path:
         venv.EnvBuilder(with_pip=True).create(VENV_DIR)
 
     state = _load_setup_state()
+    bootstrap = ROOT / "packaging" / "requirements-build.txt"
+    bootstrap_hash = _file_hash(bootstrap)
+    if state.get("bootstrap") != bootstrap_hash:
+        _run([
+            str(python), "-m", "pip", "install", "--disable-pip-version-check",
+            "-r", str(bootstrap),
+        ])
+        state["bootstrap"] = bootstrap_hash
+
     requirements = ROOT / "backend" / "requirements.txt"
     requirements_hash = _file_hash(requirements)
     if state.get("requirements") != requirements_hash:

@@ -9,6 +9,9 @@ RUN npm run build
 # Stage 2: Production image
 FROM python:3.12-slim
 
+COPY packaging/requirements-build.txt /tmp/requirements-build.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements-build.txt
+
 # Chromium system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
