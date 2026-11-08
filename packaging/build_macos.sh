@@ -40,7 +40,9 @@ if [ ! -x "$BUILD_VENV/bin/python" ]; then
   "$PYTHON" -m venv "$BUILD_VENV"
 fi
 "$BUILD_VENV/bin/python" -m pip install --disable-pip-version-check -q \
-  -r backend/requirements.txt -r packaging/requirements-build.txt
+  -r packaging/requirements-build.txt
+"$BUILD_VENV/bin/python" -m pip install --disable-pip-version-check -q \
+  -r backend/requirements.txt
 
 # 2a. Pin cryptography to the self-contained universal2 wheel (static OpenSSL).
 # The newest cryptography ships no single-arch macOS wheel, so on the Intel

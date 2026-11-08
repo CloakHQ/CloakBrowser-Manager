@@ -18,7 +18,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: |
+            backend/requirements.txt
+            packaging/requirements-build.txt
+      - run: python -m pip install -r packaging/requirements-build.txt
       - run: python -m pip install -r backend/requirements.txt pytest pytest-asyncio
       - run: python -m pytest backend/tests -q
 

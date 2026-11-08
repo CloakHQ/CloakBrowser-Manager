@@ -48,8 +48,10 @@ if (-not (Test-Path $VenvPy)) {
   python -m venv $BuildVenv
 }
 & $VenvPy -m pip install --disable-pip-version-check -q `
-  -r (Join-Path $Root "backend\requirements.txt") `
   -r (Join-Path $Root "packaging\requirements-build.txt")
+if ($LASTEXITCODE -ne 0) { throw "[error] Bootstrap tooling installation failed" }
+& $VenvPy -m pip install --disable-pip-version-check -q `
+  -r (Join-Path $Root "backend\requirements.txt")
 
 # 3. Freeze.
 Write-Host "[build] pyinstaller"
