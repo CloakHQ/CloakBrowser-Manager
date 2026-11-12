@@ -8,10 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Per-profile license keys and browser versions.** Every profile now owns its CloakBrowser key, Stable/Preview channel, and optional exact Chromium version pin, so one Manager runs profiles on several keys at once. Paid-key profiles can track their channel or roll back to an exact version; free keys always run the latest build.
+- **Keyless profiles on engine 0.7.** A profile without a key runs CloakHQ's signed public build (145.0.7632.109.2 by default, or a pinned public version). The Manager downloads it from GitHub Releases, verifies the Ed25519-signed manifest the same way the engine verifies Pro builds, and launches it through the engine. Transparent proxy and portable cookies are refused on keyless profiles because those builds lack them.
 - **Persistent multi-version browser cache.** Browser binaries download on demand when a profile starts, default to the Manager data directory, can use an external `CLOAKBROWSER_CACHE_DIR` mount, and can be inspected or cleaned from the gear panel.
 
 ### Changed
-- **Removed global browser licensing.** `CLOAKBROWSER_LICENSE_KEY` and `CLOAKBROWSER_RELEASE_CHANNEL` are no longer runtime settings, and the Settings key field is replaced by the browser cache view. Existing values migrate once to existing profiles. A profile without its own key is refused at launch with a free-key link instead of falling back to a shared key.
+- **Removed global browser licensing.** `CLOAKBROWSER_LICENSE_KEY` and `CLOAKBROWSER_RELEASE_CHANNEL` are no longer runtime settings, and the Settings key field is replaced by the browser cache view. Existing values migrate once to existing profiles. A profile without its own key runs keyless instead of falling back to a shared key.
 
 ### Fixed
 - **Linux Docker font identity now matches the Windows persona more closely.** The image includes the recommended emoji and CJK baseline fonts, replaces the incomplete XP-era core-font download with a private licensed-font mount, refreshes that mount at startup, and enables CloakBrowser's Windows font-metrics profile for Linux sessions.

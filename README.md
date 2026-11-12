@@ -75,15 +75,16 @@ Open [http://localhost:8080](http://localhost:8080), create a profile, and click
 
 Browser selection belongs to the profile, not the Manager deployment. Each profile carries its own CloakBrowser license key, release channel, and exact Chromium version, so one Manager can run profiles on several keys at the same time. Seats are counted per key: profiles that share a key share its concurrent-session limit.
 
-The CloakBrowser engine (0.7+) needs a key for every build. [Get a free one by email](https://cloakbrowser.dev/free) to run one profile at a time on the current build; [paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time.
+The CloakBrowser engine (0.7+) only downloads builds for a key. [Get a free one by email](https://cloakbrowser.dev/free) to run one profile at a time on the current build; [paid plans](https://cloakbrowser.dev) raise how many profiles run at the same time.
 
-- A profile without a key is refused at launch (HTTP 400) before the engine is called. The Manager never falls back to a Manager-wide key: `CLOAKBROWSER_LICENSE_KEY` and `CLOAKBROWSER_RELEASE_CHANNEL` are only read once to migrate older installs, and a `license.key` file in the binary cache stops startup.
+- A profile without a key runs keyless on a public build that CloakHQ still publishes on [GitHub Releases](https://github.com/CloakHQ/cloakbrowser/releases): `145.0.7632.109.2` by default (`146.0.7680.177.4` on Linux ARM64), or any other public version you pin. The Manager downloads it itself and refuses it unless its `SHA256SUMS` carries a valid signature from a key the engine pins, declares the requested version, and matches the archive. Keyless builds lack transparent proxy and portable cookies, so a keyless profile with either option on is refused at launch.
+- The Manager never falls back to a Manager-wide key: `CLOAKBROWSER_LICENSE_KEY` and `CLOAKBROWSER_RELEASE_CHANNEL` are only read once to migrate older installs, and a `license.key` file in the binary cache stops startup.
 - Leave **Browser version** empty for the latest build of the Stable or Preview channel, or enter a full version such as `148.0.7778.215.2` to pin or roll back a paid-key profile. Free keys always resolve to the latest build.
 - Click **Save and download/update now** to prepare a stopped profile immediately. Otherwise the Manager checks and downloads the binary when the profile launches.
 
 The API never returns the raw key after it is saved; profile responses expose only whether a key exists and a masked value. Existing installations migrate the former global key and channel to every existing profile once. New profiles have no key until configured. Duplicating a profile copies its key.
 
-The gear panel lists installed versions and can delete versions not referenced by any profile or running session, including keyless builds left by engines before 0.7.
+The gear panel lists installed versions and can delete versions not referenced by any profile or running session.
 
 ## Why Not a Cloud Anti-Detect Browser?
 

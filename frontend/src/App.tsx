@@ -370,8 +370,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
                 <p className="text-sm font-medium text-gray-200">Select or create a profile</p>
                 <p className="mt-1.5 text-sm text-gray-500">
                   Each profile owns its license key, release channel, and browser version.
-                  A profile launches only with its own key; a free key takes one email and
-                  runs the latest build.
+                  Without a key it runs CloakHQ&apos;s signed public 145 build; a free key takes one
+                  email and runs the latest build.
                 </p>
                 <div className="mt-5 flex flex-col items-center gap-2">
                   <button onClick={handleNew} className="btn-primary w-56">

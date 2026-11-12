@@ -97,7 +97,7 @@ export function SettingsPanel({ onClose, onChanged }: SettingsPanelProps) {
                       <div>
                         <div className="font-mono text-sm text-gray-200">{binary.version}</div>
                         <div className="mt-1 text-xs text-gray-500">
-                          {binary.tier === "licensed" ? "Licensed" : "Legacy keyless (unused)"} · {formatBytes(binary.size_bytes)}
+                          {binary.tier === "licensed" ? "Licensed" : "Keyless"} · {formatBytes(binary.size_bytes)}
                         </div>
                       </div>
                       <span className={binary.in_use ? "text-xs text-emerald-400" : "text-xs text-gray-500"}>

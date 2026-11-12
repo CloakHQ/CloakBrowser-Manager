@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 import json
 import logging
 import os
@@ -26,8 +26,8 @@ from .runtime import RuntimeConfig, resolve_runtime
 from .binary_cache import (
     PreparedBinary,
     ensure_profile_binary,
-    launch_binary_request,
     profile_binary_request,
+    wrapper_binary,
 )
 from .vnc_manager import VNCManager
 
@@ -116,6 +116,26 @@ def _validate_transparent_proxy(url: str | None) -> None:
         or ":" in unquote(parsed.username)
     ):
         raise ValueError("Transparent proxy needs an http:// proxy with a username and password")
+
+
+_LICENSED_ONLY_OPTIONS = (
+    ("transparent_proxy", "Transparent proxy connection"),
+    ("portable_cookies", "Portable cookies"),
+)
+
+
+def _reject_licensed_only_options(profile: dict[str, Any]) -> None:
+    """Refuse options the public keyless builds don't have.
+
+    Their switches don't exist in those binaries, so Chromium would ignore them and
+    the profile would silently run without the behaviour it was configured for.
+    """
+    enabled = [label for key, label in _LICENSED_ONLY_OPTIONS if profile.get(key)]
+    if enabled:
+        raise ValueError(
+            f"{', '.join(enabled)} needs a licensed build: add a license key to this "
+            "profile or turn the option off"
+        )
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
@@ -392,8 +412,6 @@ class BrowserManager:
         # produced it. Proxy credentials are redacted; never log the key.
         from . import diagnostics
 
-        # Logging only; prepare_binary() refuses a keyless profile after the
-        # busy checks, so a busy profile still answers 409 first.
         request = profile_binary_request(profile)
         logger.info(
             "Launching profile %s: seed=%s proxy=%s browser=%s channel=%s runtime=%s",
@@ -427,8 +445,13 @@ class BrowserManager:
         cdp_port: int | None = None
         context: Any | None = None
         prepared: PreparedBinary | None = None
+        # Holds the keyless executable pin for every wrapper launch below.
+        binary_pin = ExitStack()
         try:
             prepared = await self.prepare_binary(profile)
+            binary_pin.enter_context(wrapper_binary(prepared))
+            if prepared.tier == "keyless":
+                _reject_licensed_only_options(profile)
             if self.runtime.viewer_mode == "vnc":
                 display, ws_port = await self.vnc.allocate()
 
@@ -600,7 +623,7 @@ class BrowserManager:
                 capture_preview=bool(profile.get("capture_preview", True)),
                 denial_path=getattr(context, "_cloak_denial_path", None),
                 browser_version=prepared.version if prepared else request.browser_version,
-                binary_tier=prepared.tier if prepared else "licensed",
+                binary_tier=prepared.tier if prepared else request.tier,
             )
             context.on(
                 "close",
@@ -661,6 +684,8 @@ class BrowserManager:
             finally:
                 self._release_stopping(profile_id)
             raise
+        finally:
+            binary_pin.close()
 
     async def _ensure_search_engine(
         self, profile: dict[str, Any], user_data_dir: Path
@@ -781,7 +806,7 @@ class BrowserManager:
         """Short headless launch used only by the one-time search-engine setup."""
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             (user_data_dir / lock_file).unlink(missing_ok=True)
-        request = launch_binary_request(profile)
+        request = profile_binary_request(profile)
         return await launch_persistent_context_async(
             user_data_dir=str(user_data_dir),
             headless=True,

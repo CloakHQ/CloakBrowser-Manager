@@ -165,7 +165,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     try {
       await onSave(form);
       const result = await api.downloadProfileBrowser(profile.id);
-      setBrowserMessage(`Browser ${result.version ?? "external"} is ready.`);
+      setBrowserMessage(
+        `${result.tier === "licensed" ? "Licensed" : "Keyless"} browser ${result.version ?? "external"} is ready.`,
+      );
       onBrowserPrepared?.();
     } catch (err) {
       setBrowserError(err instanceof Error ? err.message : "Failed to prepare browser");
@@ -487,7 +489,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   placeholder={
                     profile?.license_key_set && form.license_key !== null
                       ? `Current: ${profile.license_key_masked ?? "set"} — type to replace`
-                      : "cb_… (required to launch; a free key works)"
+                      : "Leave empty for a keyless public build"
                   }
                 />
                 {profile?.license_key_set && form.license_key !== null && (
@@ -500,7 +502,8 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 <p className="mt-1 text-xs text-amber-400">The saved license key will be removed.</p>
               )}
               <p className="mt-1 text-xs text-gray-500">
-                Stored on this profile only. Profiles that use the same key share its concurrent-session seats.{" "}
+                Stored on this profile only. Profiles that use the same key share its concurrent-session seats.
+                Keyless profiles run CloakHQ&apos;s signed public builds (145 by default) without transparent proxy or portable cookies.{" "}
                 <a
                   href="https://cloakbrowser.dev/free"
                   target="_blank"
@@ -530,14 +533,14 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   className="input font-mono"
                   value={form.browser_version ?? ""}
                   onChange={(event) => set("browser_version", event.target.value || null)}
-                  placeholder="Latest"
+                  placeholder={form.license_key || (profile?.license_key_set && form.license_key !== null) ? "Latest" : "145.0.7632.109.2"}
                   pattern="[0-9]+(\.[0-9]+){3,4}"
                   title="Use a full numeric Chromium version"
                 />
               </div>
             </div>
             <p className="text-xs text-gray-500">
-              Leave empty for the latest build of the channel. Exact pins need a paid key; free keys always use the latest build.
+              Leave empty for automatic selection. Exact pins work for paid keys and for keyless profiles (any signed public build); free keys always use the latest build.
             </p>
 
             {isEdit && (
