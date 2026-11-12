@@ -286,6 +286,54 @@ async def test_native_launch_skips_vnc_and_display(monkeypatch, tmp_path: Path):
     assert options["extension_paths"] == []
 
 
+async def _launch_args_with(monkeypatch, tmp_path: Path, **overrides) -> list[str]:
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    launch = AsyncMock(return_value=context)
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+    await manager.launch({**_launch_profile(tmp_path), **overrides})
+    return launch.await_args.kwargs["args"]
+
+
+@pytest.mark.asyncio
+async def test_memory_saver_enables_discarding_and_keeps_other_features(monkeypatch, tmp_path: Path):
+    args = await _launch_args_with(
+        monkeypatch, tmp_path,
+        memory_saver="aggressive",
+        launch_args=["--enable-features=WebMCP", "--lang=en-US"],
+    )
+
+    feature_switches = [arg for arg in args if arg.startswith("--enable-features=")]
+    # Chromium honours only the last switch, so it must carry Playwright's and the user's too.
+    assert feature_switches == [
+        "--enable-features=CDPScreenshotNewSurface,WebMCP,AllowDevtoolsConnectedDiscard"
+    ]
+    assert "--lang=en-US" in args
+    local_state = json.loads((tmp_path / "profile-1" / "Local State").read_text())
+    assert local_state["performance_tuning"]["high_efficiency_mode"] == {"state": 2, "aggressiveness": 2}
+
+
+@pytest.mark.asyncio
+async def test_memory_saver_off_turns_a_previous_choice_off(monkeypatch, tmp_path: Path):
+    user_data_dir = tmp_path / "profile-1"
+    user_data_dir.mkdir()
+    (user_data_dir / "Local State").write_text(json.dumps({
+        "browser": {"enabled_labs_experiments": []},
+        "performance_tuning": {"high_efficiency_mode": {"state": 2, "aggressiveness": 0}},
+    }))
+
+    args = await _launch_args_with(monkeypatch, tmp_path, memory_saver="off")
+
+    assert not any(arg.startswith("--enable-features=") for arg in args)
+    local_state = json.loads((user_data_dir / "Local State").read_text())
+    assert local_state["performance_tuning"]["high_efficiency_mode"]["state"] == 0
+    assert local_state["browser"] == {"enabled_labs_experiments": []}
+
+
 @pytest.mark.asyncio
 async def test_native_close_event_releases_session(monkeypatch, tmp_path: Path):
     from backend import browser_manager as module

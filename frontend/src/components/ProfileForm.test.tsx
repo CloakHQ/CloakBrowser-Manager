@@ -26,6 +26,7 @@ function profile(status: Profile["status"]): Profile {
     set_google_default: true,
     capture_preview: true,
     restore_session: true,
+    memory_saver: "off",
     transparent_proxy: false,
     portable_cookies: false,
     notes: null,

@@ -23,7 +23,7 @@ _PROFILE_COLUMNS = (
     "screen_height", "gpu_family", "humanize", "human_preset", "geoip",
     "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
     "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
-    "restore_session", "transparent_proxy", "portable_cookies", "notes", "user_data_dir",
+    "restore_session", "memory_saver", "transparent_proxy", "portable_cookies", "notes", "user_data_dir",
     "created_at", "updated_at", "sort_order",
 )
 
@@ -53,6 +53,7 @@ CREATE TABLE profiles (
     set_google_default BOOLEAN DEFAULT 1,
     capture_preview BOOLEAN DEFAULT 1,
     restore_session BOOLEAN DEFAULT 1,
+    memory_saver TEXT NOT NULL DEFAULT 'off',
     transparent_proxy BOOLEAN DEFAULT 0,
     portable_cookies BOOLEAN DEFAULT 0,
     notes TEXT,
@@ -281,6 +282,7 @@ def create_profile(
         "set_google_default": fields.get("set_google_default", True),
         "capture_preview": fields.get("capture_preview", True),
         "restore_session": fields.get("restore_session", True),
+        "memory_saver": fields.get("memory_saver", "off"),
         "transparent_proxy": fields.get("transparent_proxy", False),
         "portable_cookies": fields.get("portable_cookies", False), "notes": fields.get("notes"),
         "user_data_dir": user_data_dir, "created_at": now, "updated_at": now,

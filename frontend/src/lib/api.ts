@@ -19,6 +19,10 @@ export interface ProfileFile {
   container_path: string;
 }
 
+// Chromium Memory Saver: off, or how long a tab stays hidden before it is
+// discarded (conservative 6 h, medium 4 h, aggressive 2 h).
+export type MemorySaver = "off" | "conservative" | "medium" | "aggressive";
+
 export interface Profile {
   id: string;
   name: string;
@@ -45,6 +49,7 @@ export interface Profile {
   set_google_default: boolean;
   capture_preview: boolean;
   restore_session: boolean;
+  memory_saver: MemorySaver;
   transparent_proxy: boolean;
   portable_cookies: boolean;
   notes: string | null;
@@ -93,6 +98,7 @@ export interface ProfileCreateData {
   set_google_default?: boolean;
   capture_preview?: boolean;
   restore_session?: boolean;
+  memory_saver?: MemorySaver;
   transparent_proxy?: boolean;
   portable_cookies?: boolean;
   notes?: string | null;

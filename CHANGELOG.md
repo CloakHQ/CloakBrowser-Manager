@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Per-profile license keys and browser versions.** Every profile now owns its CloakBrowser key, Stable/Preview channel, and optional exact Chromium version pin, so one Manager runs profiles on several keys at once. Paid-key profiles can track their channel or roll back to an exact version; free keys always run the latest build.
 - **Keyless profiles on engine 0.7.** A profile without a key runs CloakHQ's signed public build (145.0.7632.109.2 by default, or a pinned public version). The Manager downloads it from GitHub Releases, verifies the Ed25519-signed manifest the same way the engine verifies Pro builds, and launches it through the engine. Transparent proxy and portable cookies are refused on keyless profiles because those builds lack them.
+- **Per-profile Memory Saver.** A new Behavior setting turns on Chromium's Memory Saver for a profile, unloading tabs left in the background for 2, 4 or 6 hours. The Manager enables `AllowDevtoolsConnectedDiscard` with it, because Chromium otherwise never unloads a tab with a CDP client attached, and every tab carries the Manager's own connection.
 - **Persistent multi-version browser cache.** Browser binaries download on demand when a profile starts, default to the Manager data directory, can use an external `CLOAKBROWSER_CACHE_DIR` mount, and can be inspected or cleaned from the gear panel.
 
 ### Changed

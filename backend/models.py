@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from .runtime import HostOS, RuntimeMode, ViewerMode
 from .binary_cache import normalize_version
+
+# Chromium Memory Saver: "off", or how eagerly background tabs are discarded
+# (6 h / 4 h / 2 h hidden in Chromium 145).
+MemorySaver = Literal["off", "conservative", "medium", "aggressive"]
 
 
 class ProfileCreate(BaseModel):
@@ -36,6 +40,7 @@ class ProfileCreate(BaseModel):
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    memory_saver: MemorySaver = "off"
     transparent_proxy: bool = False
     portable_cookies: bool = False
     notes: str | None = None
@@ -81,6 +86,7 @@ class ProfileUpdate(BaseModel):
     set_google_default: bool | None = None
     capture_preview: bool | None = None
     restore_session: bool | None = None
+    memory_saver: MemorySaver | None = None
     transparent_proxy: bool | None = None
     portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
@@ -106,11 +112,11 @@ class ProfileUpdate(BaseModel):
         return value
 
 
-    @field_validator("gpu_family", mode="before")
+    @field_validator("gpu_family", "memory_saver", mode="before")
     @classmethod
-    def reject_null_gpu_family(cls, value: object) -> object:
+    def reject_null_choice(cls, value: object, info: ValidationInfo) -> object:
         if value is None:
-            raise ValueError("gpu_family cannot be null")
+            raise ValueError(f"{info.field_name} cannot be null")
         return value
 
 
@@ -184,6 +190,7 @@ class ProfileResponse(BaseModel):
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    memory_saver: MemorySaver = "off"
     transparent_proxy: bool = False
     portable_cookies: bool = False
     notes: str | None = None

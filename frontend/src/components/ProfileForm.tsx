@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
   HostOS,
+  MemorySaver,
   Profile,
   ProfileCreateData,
   ProxyTestResult,
@@ -61,6 +62,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     set_google_default: true,
     capture_preview: true,
     restore_session: true,
+    memory_saver: "off",
     transparent_proxy: false,
     portable_cookies: false,
     extension_paths: [],
@@ -121,6 +123,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         set_google_default: profile.set_google_default,
         capture_preview: profile.capture_preview,
         restore_session: profile.restore_session,
+        memory_saver: profile.memory_saver ?? "off",
         transparent_proxy: profile.transparent_proxy,
         portable_cookies: profile.portable_cookies,
         launch_args: profile.launch_args ?? [],
@@ -783,6 +786,24 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 </span>
               </span>
             </label>
+            <div>
+              <label className="label" htmlFor="memory-saver">Memory Saver</label>
+              <select
+                id="memory-saver"
+                className="input"
+                value={form.memory_saver ?? "off"}
+                onChange={(e) => set("memory_saver", e.target.value as MemorySaver)}
+              >
+                <option value="off">Off</option>
+                <option value="aggressive">Unload background tabs after 2 hours</option>
+                <option value="medium">Unload background tabs after 4 hours</option>
+                <option value="conservative">Unload background tabs after 6 hours</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                Frees the memory of tabs left in the background that long; they reload when you switch back.
+                Automation holding such a tab over CDP loses it. Applies on the next launch.
+              </p>
+            </div>
           </div>
         </section>
 

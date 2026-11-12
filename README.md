@@ -86,6 +86,12 @@ The API never returns the raw key after it is saved; profile responses expose on
 
 The gear panel lists installed versions and can delete versions not referenced by any profile or running session.
 
+## Memory Saver
+
+**Memory Saver** under Behavior turns on Chromium's own Memory Saver for one profile: a tab left in the background for 2, 4 or 6 hours is unloaded and reloads when you switch back to it. It is off by default and applies from the next launch.
+
+The Manager writes the choice into the profile's `Local State` and launches with `AllowDevtoolsConnectedDiscard`. Without that feature Chromium never unloads a tab with a CDP client attached, and the Manager's own connection is attached to every tab. The same holds for your automation: a background tab a script drives over `/cdp` can be unloaded under it, and its Page handle closes. Only background tabs are freed. The browser's own processes and the visible tab keep their memory, so a single-tab profile saves nothing.
+
 ## Why Not a Cloud Anti-Detect Browser?
 
 The popular anti-detect browsers solve the fingerprint, then hand you a new problem: every account you own, every cookie, every session, sits on someone else's servers. And the disguise increasingly doesn't survive real detection, shortcuts in how fingerprints are faked, GPU and WebGL values that don't add up, identities that pass a test page and fail the real site.
@@ -110,6 +116,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Persistent multi-version cache** — binaries download on first use, survive container recreation, and unused versions can be cleaned from the gear panel
 - **Per-profile network and locale** — proxy, GeoIP, timezone, locale, and screen, per profile; timezone and language follow the proxy exit IP automatically
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
+- **Per-profile Memory Saver** — unload tabs left in the background for 2, 4 or 6 hours to save memory on small servers
 - **Profile organization**: create, edit, auto-launch, and delete profiles. Filter by tags or untagged profiles, with counts; selecting multiple tags matches profiles with every selected tag. Search names, proxies, and notes. Tags and notes appear together in the list.
 - **Configurable sidebar width**: set `SIDEBAR_WIDTH` without rebuilding the frontend (see [Runtime UI configuration](#runtime-ui-configuration)).
 - **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage

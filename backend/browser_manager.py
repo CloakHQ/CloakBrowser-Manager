@@ -12,7 +12,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from cloakbrowser import launch_persistent_context_async
 from cloakbrowser.license import (
@@ -179,6 +179,62 @@ def _test_proxy_sync(proxy: str) -> dict[str, Any]:
         "timezone": timezone,
         "latency_ms": latency_ms,
     }
+
+
+# Chromium Memory Saver lives in Local State (browser-wide; each Manager profile
+# is its own browser). State 2 = on, 0 = off; aggressiveness picks the hidden time
+# before a tab is discarded (6 h / 4 h / 2 h in Chromium 145).
+_MEMORY_SAVER_AGGRESSIVENESS = {"conservative": 0, "medium": 1, "aggressive": 2}
+# Every page carries the Manager's own CDP session, which Chromium counts as
+# "DevTools open" and never discards. This feature lifts that protection.
+_MEMORY_SAVER_FEATURES = ("AllowDevtoolsConnectedDiscard",)
+# Playwright launches Chromium with this before our args, and Chromium honours only
+# the last --enable-features switch, so a merged switch must list it again.
+_PLAYWRIGHT_ENABLED_FEATURES = ("CDPScreenshotNewSurface",)
+_ENABLE_FEATURES = "--enable-features="
+
+
+def _apply_memory_saver(user_data_dir: Path, mode: str) -> None:
+    """Write the profile's Memory Saver choice into its Local State before launch."""
+    path = user_data_dir / "Local State"
+    try:
+        local_state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if mode == "off":
+            return  # Chromium's default is off
+        local_state = {}
+    except (OSError, ValueError) as exc:
+        logger.warning("Memory Saver not applied, unreadable %s: %s", path, exc)
+        return
+    if not isinstance(local_state, dict):
+        logger.warning("Memory Saver not applied, unexpected %s", path)
+        return
+
+    tuning = local_state.setdefault("performance_tuning", {})
+    current = tuning.get("high_efficiency_mode") or {}
+    if mode == "off":
+        wanted = {**current, "state": 0}
+    else:
+        wanted = {**current, "state": 2, "aggressiveness": _MEMORY_SAVER_AGGRESSIVENESS[mode]}
+    if wanted == current or (mode == "off" and not current.get("state")):
+        return
+    tuning["high_efficiency_mode"] = wanted
+    tmp = path.with_name("Local State.manager-tmp")
+    tmp.write_text(json.dumps(local_state), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _merge_enabled_features(args: list[str], features: Iterable[str]) -> list[str]:
+    """Fold every --enable-features switch, plus ``features``, into one final switch."""
+    merged = list(_PLAYWRIGHT_ENABLED_FEATURES)
+    kept: list[str] = []
+    for arg in args:
+        if arg.startswith(_ENABLE_FEATURES):
+            merged += [name for name in arg[len(_ENABLE_FEATURES):].split(",") if name]
+        else:
+            kept.append(arg)
+    merged += features
+    return [*kept, _ENABLE_FEATURES + ",".join(dict.fromkeys(merged))]
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
@@ -498,6 +554,11 @@ class BrowserManager:
             # Chrome's persistent session is saved on disk but only restored when told to.
             if profile.get("restore_session", True):
                 extra_args.append("--restore-last-session")
+            memory_saver = profile.get("memory_saver") or "off"
+            # After the search-engine launch above, which rewrites Local State on exit.
+            _apply_memory_saver(user_data_dir, memory_saver)
+            if memory_saver != "off":
+                extra_args = _merge_enabled_features(extra_args, _MEMORY_SAVER_FEATURES)
 
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
