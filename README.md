@@ -118,6 +118,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Platform-aware hardware profiles** — automatic Apple Silicon selection and configurable Windows GPU families, coherent within each profile
 - **Per-profile Memory Saver** — unload tabs left in the background for 2, 4 or 6 hours to save memory on small servers
 - **Profile organization**: create, edit, auto-launch, and delete profiles. Filter by tags or untagged profiles, with counts; selecting multiple tags matches profiles with every selected tag. Search names, proxies, and notes. Tags and notes appear together in the list.
+- **Destructive operations behind a fold** — Reset identity (new fingerprint, fresh cookies and site data, settings and bookmarks kept), Clear browser data (the whole browser data folder, settings, fingerprint and files kept), and Delete sit in a collapsed red block at the end of the profile form, and each needs a second confirming click
 - **Configurable sidebar width**: set `SIDEBAR_WIDTH` without rebuilding the frontend (see [Runtime UI configuration](#runtime-ui-configuration)).
 - **Duplicate with browser state** — clone a profile with just its settings, or together with its cookies, logged-in sessions, and storage
 - **Profile files** — send files to a profile and, on a Linux server, keep everything its browser downloads

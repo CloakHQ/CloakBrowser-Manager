@@ -109,14 +109,32 @@ export function useProfiles() {
 
   // Wipe browser state + re-roll fingerprint. Stays stopped — the profile keeps
   // its config (proxy, locale, bookmarks, default search) and takes a fresh
-  // identity; the user launches it when ready.
+  // identity; the user launches it when ready. Resolves to whether it worked.
   const reset = useCallback(
-    async (id: string) => {
+    async (id: string): Promise<boolean> => {
       try {
         await api.resetProfile(id);
         await refresh();
+        return true;
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to reset profile");
+        return false;
+      }
+    },
+    [refresh],
+  );
+
+  // Delete the profile's whole browser data folder; settings and fingerprint
+  // stay. Resolves to whether it worked.
+  const clearData = useCallback(
+    async (id: string): Promise<boolean> => {
+      try {
+        await api.clearProfileData(id);
+        await refresh();
+        return true;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to clear browser data");
+        return false;
       }
     },
     [refresh],
@@ -139,5 +157,5 @@ export function useProfiles() {
     [],
   );
 
-  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, duplicate };
+  return { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, clearData, duplicate };
 }

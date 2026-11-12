@@ -759,6 +759,37 @@ async def reset_profile(profile_id: str):
     return _profile_response(updated)
 
 
+@app.post("/api/profiles/{profile_id}/clear-data", response_model=ProfileResponse)
+async def clear_profile_data(profile_id: str):
+    """Delete the profile's whole browser data directory; keep its Manager settings.
+
+    Unlike reset, nothing inside the directory survives (bookmarks, preferences,
+    search-engine setup, preview) and the fingerprint seed is unchanged. Uploaded
+    and downloaded files live outside it and are kept. The next launch starts
+    from an empty directory and redoes the one-time setup.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    if profile_id in browser_mgr.running:
+        await browser_mgr.stop(profile_id)
+
+    user_data_dir = Path(profile["user_data_dir"])
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            if user_data_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, user_data_dir)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        logger.error("Failed to clear data of profile %s: %s", profile_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Browser data was only partly removed; try again"
+        ) from exc
+    return _profile_response(db.get_profile(profile_id))
+
+
 # Never travels with a copy: Chromium's single-instance lock (SingletonLock is
 # a dangling symlink; a copy would make the clone think another Chrome owns its
 # dir) and the manager's preview frame, which shows the source, not the clone.

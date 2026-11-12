@@ -271,6 +271,9 @@ export const api = {
   resetProfile: (id: string) =>
     request<Profile>(`/api/profiles/${id}/reset`, { method: "POST" }),
 
+  clearProfileData: (id: string) =>
+    request<Profile>(`/api/profiles/${id}/clear-data`, { method: "POST" }),
+
   duplicateProfile: (id: string, includeBrowserState = false) =>
     request<Profile>(`/api/profiles/${id}/duplicate`, {
       method: "POST",

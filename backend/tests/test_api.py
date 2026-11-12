@@ -959,6 +959,41 @@ def test_reset_profile_preserves_search_engine_marker(app_client: TestClient):
     assert marker.read_text().strip() == "google"
 
 
+def test_clear_data_removes_whole_browser_dir_but_keeps_settings_and_files(app_client: TestClient):
+    create = app_client.post(
+        "/api/profiles", json={"name": "ClearMe", "fingerprint_seed": 4242, "proxy": "http://h:1"}
+    )
+    pid = create.json()["id"]
+    user_data_dir = Path(create.json()["user_data_dir"])
+    (user_data_dir / "Default").mkdir(parents=True, exist_ok=True)
+    (user_data_dir / "Default" / "Bookmarks").write_text("{}")
+    (user_data_dir / "Local State").write_text("{}")
+    upload = app_client.post(
+        f"/api/profiles/{pid}/files", content=b"keep", headers={"X-File-Name": "keep.txt"}
+    )
+    assert upload.status_code == 201
+
+    resp = app_client.post(f"/api/profiles/{pid}/clear-data")
+
+    assert resp.status_code == 200
+    assert not user_data_dir.exists()
+    assert resp.json()["fingerprint_seed"] == 4242
+    assert resp.json()["proxy"] == "http://h:1"
+    files = app_client.get(f"/api/profiles/{pid}/files").json()
+    assert [item["name"] for item in files] == ["keep.txt"]
+
+
+def test_clear_data_stops_a_running_profile_first(app_client: TestClient):
+    pid = app_client.post("/api/profiles", json={"name": "ClearRunning"}).json()["id"]
+    main.browser_mgr.running[pid] = MagicMock(spec=RunningProfile)
+    main.browser_mgr.stop = AsyncMock(side_effect=lambda p: main.browser_mgr.running.pop(p, None))
+
+    resp = app_client.post(f"/api/profiles/{pid}/clear-data")
+
+    assert resp.status_code == 200
+    main.browser_mgr.stop.assert_called_once_with(pid)
+
+
 # ── Duplicate ────────────────────────────────────────────────────────────────
 
 

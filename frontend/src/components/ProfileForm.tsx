@@ -1,6 +1,7 @@
-import { Check, ChevronDown, Copy, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Loader2, Save, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { DangerZone } from "./DangerZone";
 import type {
   HostOS,
   MemorySaver,
@@ -16,7 +17,8 @@ interface ProfileFormProps {
   viewerMode: ViewerMode | null;
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
-  onReset?: () => Promise<void>;
+  onReset?: () => Promise<boolean | void>;
+  onClearData?: () => Promise<boolean | void>;
   onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
   onBrowserPrepared?: () => void;
   onCancel: () => void;
@@ -42,7 +44,7 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onDuplicate, onBrowserPrepared, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onClearData, onDuplicate, onBrowserPrepared, onCancel }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -75,9 +77,6 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [resetting, setResetting] = useState(false);
-  const [resetDone, setResetDone] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
   const [duplicateMenuOpen, setDuplicateMenuOpen] = useState(false);
   const duplicateMenuRef = useRef<HTMLDivElement>(null);
@@ -88,11 +87,9 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [browserMessage, setBrowserMessage] = useState<string | null>(null);
   const [browserError, setBrowserError] = useState<string | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => () => {
     clearTimeout(savedTimer.current);
-    clearTimeout(resetTimer.current);
   }, []);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
@@ -191,37 +188,6 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       savedTimer.current = setTimeout(() => setSaved(false), 1500);
     } finally {
       setSaving(false);
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!onDelete) return;
-    if (!confirm("Delete this profile? Browser data will be permanently removed.")) return;
-    setDeleting(true);
-    try {
-      await onDelete();
-    } finally {
-      setDeleting(false);
-    }
-  };
-
-  const handleReset = async () => {
-    if (!onReset) return;
-    if (
-      !confirm(
-        "Reset this profile? Cookies, history and site data will be wiped and a " +
-          "new fingerprint generated. Bookmarks, settings and default search are kept.",
-      )
-    )
-      return;
-    setResetting(true);
-    try {
-      await onReset();
-      setResetDone(true);
-      clearTimeout(resetTimer.current);
-      resetTimer.current = setTimeout(() => setResetDone(false), 1500);
-    } finally {
-      setResetting(false);
     }
   };
 
@@ -367,28 +333,6 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 </div>
               )}
             </div>
-          )}
-          {isEdit && onReset && (
-            <button
-              type="button"
-              onClick={handleReset}
-              disabled={resetting || resetDone}
-              className="btn-secondary flex items-center gap-1.5"
-            >
-              {resetDone ? <Check className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" />}
-              <span>{resetDone ? "Reset done" : resetting ? "Resetting..." : "Reset"}</span>
-            </button>
-          )}
-          {isEdit && onDelete && (
-            <button
-              type="button"
-              onClick={handleDelete}
-              disabled={deleting}
-              className="btn-danger flex items-center gap-1.5"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              <span>{deleting ? "Deleting..." : "Delete"}</span>
-            </button>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -988,6 +932,10 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             placeholder="Optional notes about this profile..."
           />
         </section>
+
+        {isEdit && (
+          <DangerZone key={profile!.id} onReset={onReset} onClearData={onClearData} onDelete={onDelete} />
+        )}
       </div>
 
     </form>

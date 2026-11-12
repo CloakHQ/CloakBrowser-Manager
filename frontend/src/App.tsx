@@ -98,7 +98,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, reorder, launch, stop, reset, duplicate } = useProfiles();
+  const { profiles, loading, error, create, update, remove, reorder, launch, stop, reset, clearData, duplicate } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -225,10 +225,15 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   }, [selectedId, stop]);
 
   const handleReset = useCallback(async () => {
-    if (!selectedId) return;
-    await reset(selectedId);
+    if (!selectedId) return false;
     // Stays in the edit view — the profile is wiped but not launched.
+    return reset(selectedId);
   }, [selectedId, reset]);
+
+  const handleClearData = useCallback(async () => {
+    if (!selectedId) return false;
+    return clearData(selectedId);
+  }, [selectedId, clearData]);
 
   const handleDuplicate = useCallback(async (includeBrowserState: boolean) => {
     if (!selectedId) return;
@@ -409,6 +414,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               onDelete={handleDelete}
               onBrowserPrepared={() => api.getStatus().then(setSystemStatus).catch(() => undefined)}
               onReset={handleReset}
+              onClearData={handleClearData}
               onDuplicate={handleDuplicate}
               onCancel={() => {
                 setSelectedId(null);
