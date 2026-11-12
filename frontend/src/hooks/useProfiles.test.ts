@@ -47,6 +47,7 @@ const fakeProfile = {
   color_scheme: null,
   launch_args: [],
   extension_paths: [],
+  extension_ids: [],
   allow_3p_cookies: false,
   notes: null,
   user_data_dir: "/data/profiles/abc-123",

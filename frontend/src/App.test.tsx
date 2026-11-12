@@ -36,6 +36,7 @@ vi.mock("./lib/api", async (importOriginal) => {
       getStatus: vi.fn(),
       checkUpdate: vi.fn(),
       logout: vi.fn(),
+      listExtensions: vi.fn(),
     },
     setOnUnauthorized: vi.fn(),
   };
@@ -51,6 +52,7 @@ const mockApi = api as typeof api & {
   getStatus: ReturnType<typeof vi.fn>;
   checkUpdate: ReturnType<typeof vi.fn>;
   logout: ReturnType<typeof vi.fn>;
+  listExtensions: ReturnType<typeof vi.fn>;
 };
 const mockUseProfiles = useProfiles as ReturnType<typeof vi.fn>;
 
@@ -60,6 +62,7 @@ beforeEach(() => {
   mockApi.getStatus.mockRejectedValue(new Error("not available in unit test"));
   mockApi.checkUpdate.mockRejectedValue(new Error("not available in unit test"));
   mockApi.logout.mockResolvedValue({ ok: true });
+  mockApi.listExtensions.mockResolvedValue([]);
   mockUseProfiles.mockReturnValue({
     profiles: [],
     loading: false,
@@ -105,6 +108,7 @@ describe("running VNC profile details", () => {
       screen_height: 1080,
       launch_args: [],
       extension_paths: [],
+      extension_ids: [],
       tags: [],
     } as unknown as Profile;
     mockUseProfiles.mockReturnValue({ ...mockUseProfiles(), profiles: [running] });

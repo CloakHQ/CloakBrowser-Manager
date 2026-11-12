@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Lock, PanelLeftClose, PanelLeft, Settings, Power } from "lucide-react";
+import { Lock, PanelLeftClose, PanelLeft, Puzzle, Settings, Power } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial, type RuntimeConfig } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
@@ -12,6 +12,7 @@ import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { ExtensionsPanel } from "./components/ExtensionsPanel";
 import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
@@ -99,7 +100,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, reorder, launch, stop, reset, clearData, duplicate } = useProfiles();
+  const { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, clearData, duplicate } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -108,8 +109,22 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [launchError, setLaunchError] = useState<LaunchDenial | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [extensionsOpen, setExtensionsOpen] = useState(false);
+  // Bumped on every library close so an open profile form re-reads the library.
+  const [extensionLibraryVersion, setExtensionLibraryVersion] = useState(0);
   const [stopped, setStopped] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig>(DEFAULT_RUNTIME_CONFIG);
+
+  const closeExtensions = useCallback(() => {
+    setExtensionsOpen(false);
+    setExtensionLibraryVersion((version) => version + 1);
+  }, []);
+
+  // A library change alters profile_count (and can change what a profile
+  // launches with), so re-read the profiles too.
+  const handleExtensionsChanged = useCallback(() => {
+    void refresh();
+  }, [refresh]);
 
   const handleQuit = useCallback(async () => {
     if (!window.confirm("Quit CloakBrowser Manager? This stops the server and closes all running profiles.")) {
@@ -282,6 +297,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           onChanged={() => api.getStatus().then(setSystemStatus).catch(() => undefined)}
         />
       )}
+      {extensionsOpen && (
+        <ExtensionsPanel onClose={closeExtensions} onChanged={handleExtensionsChanged} />
+      )}
       {updateInfo?.update_available && !updateDismissed && (
         <UpdateBanner info={updateInfo} onDismiss={() => setUpdateDismissed(true)} />
       )}
@@ -327,6 +345,13 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           </div>
           <div className="flex items-center gap-3">
             <SystemStatusBadge status={systemStatus} />
+            <button
+              onClick={() => setExtensionsOpen(true)}
+              className="text-gray-500 hover:text-gray-300 p-1"
+              title="Extension library"
+            >
+              <Puzzle className="h-4 w-4" />
+            </button>
             <button
               onClick={() => setSettingsOpen(true)}
               className="text-gray-500 hover:text-gray-300 p-1"
@@ -402,6 +427,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               hostOs={systemStatus?.host_os ?? null}
               viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleCreate}
+              onManageExtensions={() => setExtensionsOpen(true)}
+              extensionLibraryVersion={extensionLibraryVersion}
               onCancel={() => setView("empty")}
             />
           )}
@@ -417,6 +444,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               onReset={handleReset}
               onClearData={handleClearData}
               onDuplicate={handleDuplicate}
+              onManageExtensions={() => setExtensionsOpen(true)}
+              extensionLibraryVersion={extensionLibraryVersion}
               onCancel={() => {
                 setSelectedId(null);
                 setView("empty");

@@ -44,6 +44,7 @@ os.environ.pop("CLOAKBROWSER_BINARY_PATH", None)
 
 from . import artifacts
 from . import database as db
+from . import extensions
 
 # Persist downloaded binaries with Manager data unless an external cache mount
 # was explicitly configured.
@@ -66,6 +67,10 @@ from .models import (
     BrowserCleanupResponse,
     BrowserDownloadResponse,
     ClipboardRequest,
+    ExtensionCreateRequest,
+    ExtensionResponse,
+    ExtensionUpdateRequest,
+    ExtensionUpdateResponse,
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
@@ -525,6 +530,15 @@ async def lifespan(app: FastAPI):
     for profile_id in db.profile_ids_with_artifacts():
         artifacts.sync_picker_view(profile_id, refresh_bookmarks=False)
     artifacts.refresh_picker_bookmarks()
+    # Same repair for the extension library: half-written staging trees and version
+    # folders no row references (nothing is running yet, so none is in use).
+    try:
+        removed = extensions.reclaim()
+    except OSError as exc:
+        logger.warning("Could not clean up the extension library: %s", exc)
+    else:
+        if removed:
+            logger.info("Removed %d stale extension library path(s)", removed)
     migrated = db.migrate_legacy_browser_settings(
         _LEGACY_LICENSE_KEY,
         _LEGACY_RELEASE_CHANNEL,
@@ -635,6 +649,7 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
+    _require_extensions(data.get("extension_ids"))
     return _profile_response(db.create_profile(**data))
 
 
@@ -659,6 +674,8 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     tags = data.pop("tags", None)
     if tags is not None:
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
+    if "extension_ids" in data:
+        _require_extensions(data["extension_ids"])
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -1054,6 +1071,193 @@ async def delete_profile_file(profile_id: str, artifact_id: str):
     artifacts.delete_file(profile_id, artifact_id)
     artifacts.sync_picker_view(profile_id)
     return {"ok": True}
+
+
+# ── Extension library ─────────────────────────────────────────────────────────
+
+
+def _require_extensions(extension_ids: list[str] | None) -> None:
+    """Refuse a profile that attaches an id the library does not have."""
+    unknown = [
+        extension_id
+        for extension_id in (extension_ids or [])
+        if db.get_extension(extension_id) is None
+    ]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown extension(s): " + ", ".join(sorted(set(unknown))),
+        )
+
+
+def _extension_error(exc: extensions.ExtensionError) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=str(exc))
+
+
+def _extension_response(
+    row: dict, usage: dict[str, list[str]] | None = None
+) -> ExtensionResponse:
+    usage = db.extension_usage() if usage is None else usage
+    return ExtensionResponse(
+        id=row["id"],
+        name=row["name"],
+        description=row.get("description"),
+        version=row["version"],
+        previous_version=row.get("previous_version"),
+        manifest_version=row["manifest_version"],
+        source_kind=row["source_kind"],
+        source_url=row.get("source_url"),
+        webstore_id=row.get("webstore_id"),
+        icon_url=(
+            f"/api/extensions/{row['id']}/icon"
+            if extensions.icon_path(row) is not None
+            else None
+        ),
+        profile_count=len(usage.get(row["id"], [])),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _require_extension(extension_id: str) -> dict:
+    row = db.get_extension(extension_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    return row
+
+
+@app.get("/api/extensions", response_model=list[ExtensionResponse])
+async def list_extensions():
+    """Every library extension, by name."""
+    usage = db.extension_usage()
+    return [_extension_response(row, usage) for row in db.list_extensions()]
+
+
+@app.post("/api/extensions", response_model=ExtensionResponse, status_code=201)
+async def add_extension(req: ExtensionCreateRequest):
+    """Add an extension from a Web Store link/ID or a CRX/ZIP URL."""
+    try:
+        row, _ = await asyncio.to_thread(
+            extensions.import_source,
+            req.source,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    except OSError as exc:
+        logger.exception("Failed to install extension from %s", req.source)
+        raise HTTPException(status_code=500, detail=f"Failed to install extension: {exc}") from exc
+    return _extension_response(row)
+
+
+@app.post("/api/extensions/upload", response_model=ExtensionResponse, status_code=201)
+async def upload_extension(request: Request, extension_id: str | None = None):
+    """Store the raw request body as an extension, or as a new version of one.
+
+    ``X-File-Name`` carries the file name (URL-encoded), like the profile file upload.
+    ``?extension_id=<id>`` updates that entry; without it a new entry is created.
+    """
+    encoded_name = request.headers.get("x-file-name")
+    if encoded_name is None:
+        raise HTTPException(
+            status_code=400, detail="X-File-Name header (the URL-encoded file name) is required"
+        )
+    name = unquote_to_bytes(encoded_name.encode("latin-1")).decode("utf-8", "replace")
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="X-File-Name must name the file")
+    stop_sending = {"Connection": "close"}  # a refusal before the body is read must end it
+    declared = _content_length(request)
+    if declared is not None and declared > extensions.MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"upload exceeds {extensions.MAX_ARCHIVE_BYTES} bytes",
+            headers=stop_sending,
+        )
+    if extension_id is not None:
+        if db.get_extension(extension_id) is None:
+            raise HTTPException(
+                status_code=404, detail="Extension not found", headers=stop_sending
+            )
+    try:
+        archive = await extensions.save_upload(request.stream())
+    except extensions.ExtensionError as exc:
+        raise HTTPException(
+            status_code=exc.status, detail=str(exc), headers=stop_sending
+        ) from exc
+    except ClientDisconnect as exc:
+        raise HTTPException(status_code=400, detail="client disconnected during upload") from exc
+    try:
+        row, _ = await asyncio.to_thread(
+            extensions.install_upload,
+            archive,
+            extension_id=extension_id,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    except OSError as exc:
+        logger.exception("Failed to install uploaded extension %s", name)
+        raise HTTPException(status_code=500, detail=f"Failed to install extension: {exc}") from exc
+    payload = _extension_response(row)
+    if extension_id is not None:
+        # A new version of an existing entry: the resource existed before this call, and
+        # FastAPI only honours the route's 201 for a returned model.
+        return JSONResponse(status_code=200, content=payload.model_dump())
+    return payload
+
+
+@app.post("/api/extensions/{extension_id}/update", response_model=ExtensionUpdateResponse)
+async def update_extension(extension_id: str, req: ExtensionUpdateRequest | None = None):
+    """Re-download an entry from its stored source, or from a new one."""
+    row = _require_extension(extension_id)
+    source = req.source if req is not None else None
+    try:
+        source = source if source and source.strip() else extensions.stored_source(row)
+        row, updated = await asyncio.to_thread(
+            extensions.import_source,
+            source,
+            extension_id=extension_id,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    except OSError as exc:
+        logger.exception("Failed to update extension %s", extension_id)
+        raise HTTPException(status_code=500, detail=f"Failed to update extension: {exc}") from exc
+    return ExtensionUpdateResponse(extension=_extension_response(row), updated=updated)
+
+
+@app.post("/api/extensions/{extension_id}/rollback", response_model=ExtensionResponse)
+async def rollback_extension(extension_id: str):
+    """Go back to the previous version folder."""
+    try:
+        row = await asyncio.to_thread(
+            extensions.rollback,
+            extension_id,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    return _extension_response(row)
+
+
+@app.delete("/api/extensions/{extension_id}")
+async def delete_extension(extension_id: str):
+    """Remove an entry and its files. Refused while any profile attaches it."""
+    try:
+        await asyncio.to_thread(extensions.delete, extension_id)
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    return {"ok": True}
+
+
+@app.get("/api/extensions/{extension_id}/icon")
+async def extension_icon(extension_id: str):
+    """Serve the entry's icon from its current version folder."""
+    path = extensions.icon_path(_require_extension(extension_id))
+    if path is None:
+        raise HTTPException(status_code=404, detail="This extension has no icon")
+    return FileResponse(path)
 
 
 # ── Launch / Stop ─────────────────────────────────────────────────────────────

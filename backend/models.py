@@ -36,6 +36,7 @@ class ProfileCreate(BaseModel):
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
+    extension_ids: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
     set_google_default: bool = True
     capture_preview: bool = True
@@ -82,6 +83,7 @@ class ProfileUpdate(BaseModel):
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
     launch_args: list[str] | None = None
     extension_paths: list[str] | None = None
+    extension_ids: list[str] | None = None
     allow_3p_cookies: bool | None = None
     set_google_default: bool | None = None
     capture_preview: bool | None = None
@@ -186,6 +188,7 @@ class ProfileResponse(BaseModel):
     color_scheme: str | None = None
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
+    extension_ids: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
     set_google_default: bool = True
     capture_preview: bool = True
@@ -299,3 +302,38 @@ class ProxyTestResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     token: str
+
+
+class ExtensionResponse(BaseModel):
+    """One entry of the global extension library."""
+
+    id: str
+    name: str
+    description: str | None = None
+    version: str
+    previous_version: str | None = None
+    manifest_version: int
+    source_kind: Literal["webstore", "crx", "zip", "upload"]
+    source_url: str | None = None
+    webstore_id: str | None = None
+    # "/api/extensions/{id}/icon" when the current version carries an icon.
+    icon_url: str | None = None
+    profile_count: int = 0
+    created_at: str
+    updated_at: str
+
+
+class ExtensionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source: str = Field(min_length=1, max_length=2048)
+
+
+class ExtensionUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # None re-downloads the stored source (an upload has none: pick a file instead).
+    source: str | None = Field(default=None, max_length=2048)
+
+
+class ExtensionUpdateResponse(BaseModel):
+    extension: ExtensionResponse
+    updated: bool

@@ -22,7 +22,7 @@ _PROFILE_COLUMNS = (
     "fingerprint_seed", "proxy", "timezone", "locale", "screen_width",
     "screen_height", "gpu_family", "humanize", "human_preset", "geoip",
     "clipboard_sync", "auto_launch", "color_scheme", "launch_args",
-    "extension_paths", "allow_3p_cookies", "set_google_default", "capture_preview",
+    "extension_paths", "extension_ids", "allow_3p_cookies", "set_google_default", "capture_preview",
     "restore_session", "memory_saver", "transparent_proxy", "portable_cookies", "notes", "user_data_dir",
     "created_at", "updated_at", "sort_order",
 )
@@ -49,6 +49,7 @@ CREATE TABLE profiles (
     color_scheme TEXT,
     launch_args TEXT NOT NULL DEFAULT '[]',
     extension_paths TEXT NOT NULL DEFAULT '[]',
+    extension_ids TEXT NOT NULL DEFAULT '[]',
     allow_3p_cookies BOOLEAN DEFAULT 1,
     set_google_default BOOLEAN DEFAULT 1,
     capture_preview BOOLEAN DEFAULT 1,
@@ -113,6 +114,28 @@ def _create_artifacts_table(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_profile ON artifacts(profile_id)")
+
+
+def _create_extensions_table(conn: sqlite3.Connection) -> None:
+    """The global extension library. Rows are metadata; the unpacked extension
+    lives under DATA_DIR/extensions/<id>/<version>."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS extensions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            version TEXT NOT NULL,
+            previous_version TEXT,
+            manifest_version INTEGER NOT NULL,
+            icon TEXT,
+            public_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_url TEXT,
+            webstore_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
 
 def _rebuild_profiles(conn: sqlite3.Connection, old_columns: set[str]) -> None:
@@ -187,6 +210,7 @@ def init_db():
             conn.execute(_PROFILE_SCHEMA)
             _create_tags_table(conn)
             _create_artifacts_table(conn)
+            _create_extensions_table(conn)
             _create_metadata_table(conn)
             conn.commit()
             return
@@ -198,6 +222,7 @@ def init_db():
         else:
             _create_tags_table(conn)
         _create_artifacts_table(conn)
+        _create_extensions_table(conn)
         _create_metadata_table(conn)
         conn.commit()
 
@@ -278,6 +303,7 @@ def create_profile(
         "clipboard_sync": fields.get("clipboard_sync", True), "auto_launch": fields.get("auto_launch", False),
         "color_scheme": fields.get("color_scheme"), "launch_args": json.dumps(fields.get("launch_args") or []),
         "extension_paths": json.dumps(fields.get("extension_paths") or []),
+        "extension_ids": json.dumps(fields.get("extension_ids") or []),
         "allow_3p_cookies": fields.get("allow_3p_cookies", True),
         "set_google_default": fields.get("set_google_default", True),
         "capture_preview": fields.get("capture_preview", True),
@@ -314,6 +340,7 @@ def _hydrate_profile(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
     profile = dict(row)
     profile["launch_args"] = _json_list(profile.get("launch_args"))
     profile["extension_paths"] = _json_list(profile.get("extension_paths"))
+    profile["extension_ids"] = _json_list(profile.get("extension_ids"))
     tags = conn.execute(
         "SELECT tag, color FROM profile_tags WHERE profile_id = ?",
         (profile["id"],),
@@ -350,7 +377,7 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     if not get_profile(profile_id):
         return None
     tags = fields.pop("tags", None)
-    for key in ("launch_args", "extension_paths"):
+    for key in ("launch_args", "extension_paths", "extension_ids"):
         if key in fields:
             fields[key] = json.dumps(fields[key] or [])
     update_cols = []
@@ -530,3 +557,82 @@ def delete_artifact(profile_id: str, artifact_id: str) -> bool:
         )
         conn.commit()
     return cur.rowcount > 0
+
+
+# ── Extensions ───────────────────────────────────────────────────────────────
+
+
+_EXTENSION_COLUMNS = (
+    "id", "name", "description", "version", "previous_version", "manifest_version",
+    "icon", "public_key", "source_kind", "source_url", "webstore_id",
+    "created_at", "updated_at",
+)
+
+
+def get_extension(extension_id: str) -> dict[str, Any] | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM extensions WHERE id = ?", (extension_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_extensions() -> list[dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM extensions ORDER BY name COLLATE NOCASE").fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_extension(**fields: Any) -> dict[str, Any]:
+    """Record a library entry. Its files are published before the row, so a row always
+    names a folder that can be loaded."""
+    now = _now()
+    values = {column: fields.get(column) for column in _EXTENSION_COLUMNS}
+    values["created_at"] = now
+    values["updated_at"] = now
+    cols = ", ".join(_EXTENSION_COLUMNS)
+    placeholders = ", ".join("?" for _ in _EXTENSION_COLUMNS)
+    with get_db() as conn:
+        conn.execute(
+            f"INSERT INTO extensions ({cols}) VALUES ({placeholders})",
+            [values[column] for column in _EXTENSION_COLUMNS],
+        )
+        conn.commit()
+    extension = get_extension(values["id"])
+    if extension is None:
+        raise RuntimeError(f"Created extension {values['id']} could not be reloaded")
+    return extension
+
+
+def update_extension(extension_id: str, **fields: Any) -> dict[str, Any] | None:
+    update_cols = []
+    update_vals = []
+    for col in _EXTENSION_COLUMNS:
+        if col not in {"id", "created_at", "updated_at"} and col in fields:
+            update_cols.append(f"{col} = ?")
+            update_vals.append(fields[col])
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE extensions SET {', '.join(update_cols + ['updated_at = ?'])} WHERE id = ?",
+            [*update_vals, _now(), extension_id],
+        )
+        conn.commit()
+    return get_extension(extension_id)
+
+
+def delete_extension(extension_id: str) -> bool:
+    with get_db() as conn:
+        cursor = conn.execute("DELETE FROM extensions WHERE id = ?", (extension_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def extension_usage() -> dict[str, list[str]]:
+    """``extension_id -> [profile names]`` for every profile that attaches a library
+    extension. The list is JSON in a TEXT column, so counting happens here rather
+    than in SQL."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT name, extension_ids FROM profiles").fetchall()
+    usage: dict[str, list[str]] = {}
+    for row in rows:
+        for extension_id in _json_list(row["extension_ids"]):
+            usage.setdefault(extension_id, []).append(row["name"])
+    return usage

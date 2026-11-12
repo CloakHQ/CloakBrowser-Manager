@@ -92,6 +92,15 @@ The gear panel lists installed versions and can delete versions not referenced b
 
 The Manager writes the choice into the profile's `Local State` and launches with `AllowDevtoolsConnectedDiscard`. Without that feature Chromium never unloads a tab with a CDP client attached, and the Manager's own connection is attached to every tab. The same holds for your automation: a background tab a script drives over `/cdp` can be unloaded under it, and its Page handle closes. Only background tabs are freed. The browser's own processes and the visible tab keep their memory, so a single-tab profile saves nothing.
 
+## Extension library
+
+The puzzle icon in the top bar opens the Manager-wide extension library. Add an extension by pasting a Chrome Web Store link or extension ID, or a direct CRX or ZIP URL, or upload a CRX/ZIP file. The Manager downloads it, unpacks it under the data directory (`/data/extension-library` in Docker), and reads its name, icon, version and manifest version. In a profile's **Extensions** section, tick library extensions under *From library*; local folders still go under *Custom paths*. Changes apply from the next launch. The library manages only its own folder, so hand-unpacked extensions elsewhere (for example `/data/extensions/...`) are never touched.
+
+- **Updating** — **Update** re-downloads from the saved source (a Web Store entry always fetches the latest listing), or takes a new URL or file. The previous version is kept for **Roll back**; older versions are removed once no running profile loads them.
+- **Stable extension IDs** — every installed version gets the same `key` in its `manifest.json`, so an update keeps the extension's ID and therefore its settings and data. Web Store and CRX entries keep their store ID.
+- **Manifest V2** — CloakBrowser 145 and 156 disable unpacked MV2 extensions (`chrome://extensions` shows them as unsupported), with or without `--disable-features=ExtensionManifestV2Unsupported,ExtensionManifestV2Disabled`. MV2 entries can be stored but are flagged; use the MV3 edition where one exists, for example uBlock Origin Lite instead of uBlock Origin. The Web Store no longer serves uBlock Origin at all.
+- **Writable folders** — unpacked MV3 extensions with declarative rule sets need a writable folder: Chromium writes their indexed rules next to the extension, and a read-only mount makes the browser hang at launch. Library folders are writable; mount custom paths read-write too.
+
 ## Why Not a Cloud Anti-Detect Browser?
 
 The popular anti-detect browsers solve the fingerprint, then hand you a new problem: every account you own, every cookie, every session, sits on someone else's servers. And the disguise increasingly doesn't survive real detection, shortcuts in how fingerprints are faked, GPU and WebGL values that don't add up, identities that pass a test page and fail the real site.
@@ -126,7 +135,8 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Linux server viewing** — interact with Docker-launched browsers through KasmVNC in the web GUI
 - **Playwright/Puppeteer API** — connect to any running profile through CDP while watching the same session live
 - **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
-- **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
+- **Extension library** — add extensions once from a Chrome Web Store link, CRX/ZIP URL or file, update or roll them back in one place, and tick them per profile; custom unpacked folders still work
+- **Compatibility controls** — third-party-cookie support and advanced Chromium arguments
 - **Clipboard sync** — copy and paste between the Manager and Linux VNC browser profiles
 - **Profile details while connected** — the sliders icon next to *Connected* in the Linux VNC viewer shows the running profile's settings read-only; **Back to browser** (or clicking the profile in the sidebar) returns to the same VNC session without reconnecting
 - **System status** — see the number and location of cached browser versions and Windows font health in the top bar

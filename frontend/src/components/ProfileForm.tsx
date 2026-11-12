@@ -1,9 +1,11 @@
-import { Check, ChevronDown, Copy, Loader2, Lock, Monitor, Save, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Loader2, Lock, Monitor, Puzzle, Save, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import { DangerZone } from "./DangerZone";
+import { ExtensionIcon } from "./ExtensionsPanel";
 import type {
   HostOS,
+  LibraryExtension,
   MemorySaver,
   Profile,
   ProfileCreateData,
@@ -21,6 +23,10 @@ interface ProfileFormProps {
   onClearData?: () => Promise<boolean | void>;
   onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
   onBrowserPrepared?: () => void;
+  // Opens the Manager-wide extension library. The form re-reads the library
+  // whenever extensionLibraryVersion changes (App bumps it when the panel closes).
+  onManageExtensions?: () => void;
+  extensionLibraryVersion?: number;
   onCancel: () => void;
   // Browse a running profile's settings without changing them; onCancel returns to the browser.
   readOnly?: boolean;
@@ -46,7 +52,23 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onClearData, onDuplicate, onBrowserPrepared, onCancel, readOnly = false }: ProfileFormProps) {
+/** What a library extension looks like in the picker: icon, name, version, warning. */
+function LibraryRow({ extension }: { extension: LibraryExtension }) {
+  return (
+    <>
+      <ExtensionIcon extension={extension} />
+      <span className="truncate text-xs text-gray-300">{extension.name}</span>
+      <span className="shrink-0 text-[10px] text-gray-500">{extension.version}</span>
+      {extension.manifest_version === 2 && (
+        <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">
+          MV2 — disabled by Chromium
+        </span>
+      )}
+    </>
+  );
+}
+
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onClearData, onDuplicate, onBrowserPrepared, onManageExtensions, extensionLibraryVersion = 0, onCancel, readOnly = false }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -70,6 +92,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     transparent_proxy: false,
     portable_cookies: false,
     extension_paths: [],
+    extension_ids: [],
     launch_args: [],
     tags: [],
   });
@@ -97,6 +120,29 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [extensionPathInput, setExtensionPathInput] = useState("");
   const [launchArgInput, setLaunchArgInput] = useState("");
+  const [library, setLibrary] = useState<LibraryExtension[]>([]);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+
+  // The library is Manager-wide, not part of the profile: read it fresh when
+  // the form opens and after the library panel closes.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listExtensions()
+      .then((extensions) => {
+        if (cancelled) return;
+        setLibrary(extensions);
+        setLibraryError(null);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLibraryError(err instanceof Error ? err.message : "Failed to load the extension library");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [extensionLibraryVersion]);
 
   useEffect(() => {
     if (profile) {
@@ -118,6 +164,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
         extension_paths: profile.extension_paths ?? [],
+        extension_ids: profile.extension_ids ?? [],
         allow_3p_cookies: profile.allow_3p_cookies,
         set_google_default: profile.set_google_default,
         capture_preview: profile.capture_preview,
@@ -261,6 +308,11 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     set("extension_paths", (form.extension_paths ?? []).filter((_, i) => i !== index));
   };
 
+  const toggleLibraryExtension = (id: string, checked: boolean) => {
+    const ids = form.extension_ids ?? [];
+    set("extension_ids", checked ? [...ids, id] : ids.filter((item) => item !== id));
+  };
+
   const addLaunchArg = () => {
     const arg = launchArgInput.trim();
     if (!arg) return;
@@ -272,6 +324,13 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const removeLaunchArg = (idx: number) => {
     set("launch_args", (form.launch_args ?? []).filter((_, i) => i !== idx));
   };
+
+  const selectedExtensionIds = form.extension_ids ?? [];
+  const selectedLibrary = library.filter((extension) => selectedExtensionIds.includes(extension.id));
+  // An attached ID the list does not know about (still loading, or fetch failed).
+  const unresolvedExtensionIds = selectedExtensionIds.filter(
+    (id) => !library.some((extension) => extension.id === id),
+  );
 
   return (
     <form onSubmit={handleSubmit} className="p-6 max-w-3xl mx-auto">
@@ -887,35 +946,122 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
         {/* Extensions */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
-          <p className="text-xs text-gray-500 mb-2">Add one unpacked Chrome extension directory per path.</p>
-          {(form.extension_paths ?? []).length > 0 && (
-            <div className="space-y-1.5 mb-3">
-              {(form.extension_paths ?? []).map((path, index) => (
-                <div key={`${path}-${index}`} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
-                  <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
-                  {!readOnly && (
-                    <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
-                      <X className="h-3 w-3" />
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-          {readOnly ? (
-            (form.extension_paths ?? []).length === 0 && <p className="text-xs text-gray-500">None</p>
-          ) : (
-          <div className="flex gap-2">
-            <input
-              className="input flex-1 font-mono"
-              value={extensionPathInput}
-              onChange={(e) => setExtensionPathInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addExtensionPath(); } }}
-              placeholder="/data/extensions/ublock"
-            />
-            <button type="button" onClick={addExtensionPath} className="btn-secondary text-xs">Add</button>
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Extensions</h3>
+            {!readOnly && onManageExtensions && (
+              <button
+                type="button"
+                onClick={onManageExtensions}
+                className="text-xs text-indigo-400 hover:text-indigo-300"
+              >
+                Manage library
+              </button>
+            )}
           </div>
+
+          {readOnly ? (
+            selectedLibrary.length === 0 &&
+            unresolvedExtensionIds.length === 0 &&
+            (form.extension_paths ?? []).length === 0 ? (
+              <p className="text-xs text-gray-500">None</p>
+            ) : (
+              <>
+                {libraryError && <p className="mb-2 text-xs text-red-400">{libraryError}</p>}
+                {(selectedLibrary.length > 0 || unresolvedExtensionIds.length > 0) && (
+                  <>
+                    <p className="mb-2 text-xs text-gray-500">From library</p>
+                    <div className="mb-3 space-y-1.5">
+                      {selectedLibrary.map((extension) => (
+                        <div
+                          key={extension.id}
+                          className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                        >
+                          <LibraryRow extension={extension} />
+                        </div>
+                      ))}
+                      {unresolvedExtensionIds.map((id) => (
+                        <div key={id} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
+                          <Puzzle className="h-5 w-5 shrink-0 text-gray-500" />
+                          <code className="truncate text-xs text-gray-400">{id}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {(form.extension_paths ?? []).length > 0 && (
+                  <>
+                    <p className="mb-2 text-xs text-gray-500">Custom paths</p>
+                    <div className="space-y-1.5">
+                      {(form.extension_paths ?? []).map((path, index) => (
+                        <div
+                          key={`${path}-${index}`}
+                          className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                        >
+                          <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </>
+            )
+          ) : (
+            <>
+              <p className="mb-2 text-xs text-gray-500">From library</p>
+              {libraryError && <p className="mb-2 text-xs text-red-400">{libraryError}</p>}
+              {library.length === 0 ? (
+                <p className="mb-3 text-xs text-gray-500">
+                  No extensions in the library yet. Use Manage library to add one.
+                </p>
+              ) : (
+                <div className="mb-3 space-y-1.5">
+                  {library.map((extension) => (
+                    <label
+                      key={extension.id}
+                      className="flex cursor-pointer items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedExtensionIds.includes(extension.id)}
+                        onChange={(e) => toggleLibraryExtension(extension.id, e.target.checked)}
+                        className="shrink-0 rounded border-border bg-surface-2"
+                      />
+                      <LibraryRow extension={extension} />
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <p className="mb-2 mt-4 text-xs text-gray-500">Custom paths</p>
+              <p className="mb-2 text-xs text-gray-500">
+                Add one unpacked Chrome extension directory per path.
+              </p>
+              {(form.extension_paths ?? []).length > 0 && (
+                <div className="mb-3 space-y-1.5">
+                  {(form.extension_paths ?? []).map((path, index) => (
+                    <div
+                      key={`${path}-${index}`}
+                      className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                    >
+                      <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
+                      <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1 font-mono"
+                  value={extensionPathInput}
+                  onChange={(e) => setExtensionPathInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addExtensionPath(); } }}
+                  placeholder="/data/extensions/ublock"
+                />
+                <button type="button" onClick={addExtensionPath} className="btn-secondary text-xs">Add</button>
+              </div>
+            </>
           )}
         </section>
 

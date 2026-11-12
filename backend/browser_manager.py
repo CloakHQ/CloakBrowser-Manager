@@ -22,6 +22,7 @@ from cloakbrowser.license import (
 )
 
 from . import downloads
+from . import extensions
 from .runtime import RuntimeConfig, resolve_runtime
 from .binary_cache import (
     PreparedBinary,
@@ -425,6 +426,8 @@ class RunningProfile:
     denial_path: str | None = None
     browser_version: str | None = None
     binary_tier: str = "licensed"
+    # Library folders this browser loaded. Nothing may delete them while it runs.
+    extension_dirs: tuple[str, ...] = ()
 
 
 class BrowserManager:
@@ -560,6 +563,8 @@ class BrowserManager:
             if memory_saver != "off":
                 extra_args = _merge_enabled_features(extra_args, _MEMORY_SAVER_FEATURES)
 
+            # Library extensions come first: a profile's own paths are the override.
+            library_dirs = extensions.profile_extension_paths(profile)
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
@@ -578,7 +583,10 @@ class BrowserManager:
                 "human_preset": profile.get("human_preset", "default"),
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
-                "extension_paths": profile.get("extension_paths") or [],
+                "extension_paths": [
+                    *library_dirs,
+                    *(profile.get("extension_paths") or []),
+                ],
                 "license_key": request.license_key,
                 "browser_version": request.browser_version,
                 "release_channel": request.release_channel,
@@ -685,6 +693,7 @@ class BrowserManager:
                 denial_path=getattr(context, "_cloak_denial_path", None),
                 browser_version=prepared.version if prepared else request.browser_version,
                 binary_tier=prepared.tier if prepared else request.tier,
+                extension_dirs=tuple(library_dirs),
             )
             context.on(
                 "close",
@@ -1051,6 +1060,15 @@ class BrowserManager:
             or profile_id in self._launching
             or profile_id in self._stopping
         )
+
+    def extension_dirs_in_use(self) -> set[str]:
+        """Library folders the running browsers loaded, so the library never deletes
+        one out from under a profile (Chromium reads its rulesets from there)."""
+        return {
+            str(Path(directory).resolve())
+            for running in list(self.running.values())
+            for directory in running.extension_dirs
+        }
 
     def cdp_client_detached(self, running: RunningProfile) -> None:
         """A proxied CDP client that changed download behaviour has disconnected. Chromium
