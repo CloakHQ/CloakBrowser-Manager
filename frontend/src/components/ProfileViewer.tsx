@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertCircle, CheckCircle2, ClipboardCopy, Loader2, Maximize2, Minimize2, X } from "lucide-react";
+import { AlertCircle, CheckCircle2, ClipboardCopy, Loader2, Maximize2, Minimize2, SlidersHorizontal, X } from "lucide-react";
 import { api } from "../lib/api";
 import { CdpEndpointButton } from "./CdpEndpointButton";
 import { ProfileFilesButton, useProfileFiles } from "./ProfileFiles";
@@ -11,6 +11,8 @@ interface ProfileViewerProps {
   profileName: string;
   onClipboardSyncChange: (enabled: boolean) => Promise<void>;
   onDisconnect: () => void;
+  // Opens the profile's read-only details; the viewer stays mounted, so the session survives.
+  onShowDetails?: () => void;
 }
 
 // X11 keysym for V key (Ctrl is already held in VNC by the time we intercept)
@@ -23,6 +25,7 @@ export function ProfileViewer({
   profileName,
   onClipboardSyncChange,
   onDisconnect,
+  onShowDetails,
 }: ProfileViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // The canvas plus the drop overlay and transfer feedback; fullscreening the bare canvas
@@ -307,6 +310,17 @@ export function ProfileViewer({
           <span className="text-xs text-gray-400">
             {connected ? "Connected" : "Connecting..."}
           </span>
+          {onShowDetails && (
+            <button
+              type="button"
+              onClick={onShowDetails}
+              className="text-gray-500 hover:text-gray-300 p-1"
+              title="Profile details (read-only, stays connected)"
+              aria-label="Profile details"
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-1">
           <CdpEndpointButton cdpUrl={cdpUrl} />

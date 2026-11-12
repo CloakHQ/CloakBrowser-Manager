@@ -1,8 +1,12 @@
-import { Check, ChevronDown, Copy, Loader2, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Loader2, Lock, Monitor, Puzzle, Save, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { DangerZone } from "./DangerZone";
+import { ExtensionIcon } from "./ExtensionsPanel";
 import type {
   HostOS,
+  LibraryExtension,
+  MemorySaver,
   Profile,
   ProfileCreateData,
   ProxyTestResult,
@@ -15,9 +19,17 @@ interface ProfileFormProps {
   viewerMode: ViewerMode | null;
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
-  onReset?: () => Promise<void>;
+  onReset?: () => Promise<boolean | void>;
+  onClearData?: () => Promise<boolean | void>;
   onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
+  onBrowserPrepared?: () => void;
+  // Opens the Manager-wide extension library. The form re-reads the library
+  // whenever extensionLibraryVersion changes (App bumps it when the panel closes).
+  onManageExtensions?: () => void;
+  extensionLibraryVersion?: number;
   onCancel: () => void;
+  // Browse a running profile's settings without changing them; onCancel returns to the browser.
+  readOnly?: boolean;
 }
 
 const RESOLUTION_PRESETS: Record<string, { width: number; height: number }> = {
@@ -40,11 +52,30 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onDuplicate, onCancel }: ProfileFormProps) {
+/** What a library extension looks like in the picker: icon, name, version, warning. */
+function LibraryRow({ extension }: { extension: LibraryExtension }) {
+  return (
+    <>
+      <ExtensionIcon extension={extension} />
+      <span className="truncate text-xs text-gray-300">{extension.name}</span>
+      <span className="shrink-0 text-[10px] text-gray-500">{extension.version}</span>
+      {extension.manifest_version === 2 && (
+        <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">
+          MV2 — disabled by Chromium
+        </span>
+      )}
+    </>
+  );
+}
+
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onClearData, onDuplicate, onBrowserPrepared, onManageExtensions, extensionLibraryVersion = 0, onCancel, readOnly = false }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
     name: "",
+    license_key: null,
+    release_channel: "stable",
+    browser_version: null,
     screen_width: 1920,
     screen_height: 1080,
     gpu_family: "auto",
@@ -57,9 +88,11 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     set_google_default: true,
     capture_preview: true,
     restore_session: true,
+    memory_saver: "off",
     transparent_proxy: false,
     portable_cookies: false,
     extension_paths: [],
+    extension_ids: [],
     launch_args: [],
     tags: [],
   });
@@ -69,31 +102,55 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [resetting, setResetting] = useState(false);
-  const [resetDone, setResetDone] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
   const [duplicateMenuOpen, setDuplicateMenuOpen] = useState(false);
   const duplicateMenuRef = useRef<HTMLDivElement>(null);
   const duplicateTriggerRef = useRef<HTMLButtonElement>(null);
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
+  const [browserPreparing, setBrowserPreparing] = useState(false);
+  const [browserMessage, setBrowserMessage] = useState<string | null>(null);
+  const [browserError, setBrowserError] = useState<string | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => () => {
     clearTimeout(savedTimer.current);
-    clearTimeout(resetTimer.current);
   }, []);
   const [tagInput, setTagInput] = useState("");
   const [tagColor, setTagColor] = useState<string | null>("#6366f1");
   const [extensionPathInput, setExtensionPathInput] = useState("");
   const [launchArgInput, setLaunchArgInput] = useState("");
+  const [library, setLibrary] = useState<LibraryExtension[]>([]);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+
+  // The library is Manager-wide, not part of the profile: read it fresh when
+  // the form opens and after the library panel closes.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listExtensions()
+      .then((extensions) => {
+        if (cancelled) return;
+        setLibrary(extensions);
+        setLibraryError(null);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLibraryError(err instanceof Error ? err.message : "Failed to load the extension library");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [extensionLibraryVersion]);
 
   useEffect(() => {
     if (profile) {
       setForm({
         name: profile.name,
+        license_key: undefined,
+        release_channel: profile.release_channel,
+        browser_version: profile.browser_version,
         fingerprint_seed: profile.fingerprint_seed,
         proxy: profile.proxy,
         timezone: profile.timezone,
@@ -107,10 +164,12 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         clipboard_sync: profile.clipboard_sync,
         auto_launch: profile.auto_launch,
         extension_paths: profile.extension_paths ?? [],
+        extension_ids: profile.extension_ids ?? [],
         allow_3p_cookies: profile.allow_3p_cookies,
         set_google_default: profile.set_google_default,
         capture_preview: profile.capture_preview,
         restore_session: profile.restore_session,
+        memory_saver: profile.memory_saver ?? "off",
         transparent_proxy: profile.transparent_proxy,
         portable_cookies: profile.portable_cookies,
         launch_args: profile.launch_args ?? [],
@@ -147,6 +206,25 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       setTestingProxy(false);
     }
   };
+  const handlePrepareBrowser = async () => {
+    if (!profile) return;
+    setBrowserPreparing(true);
+    setBrowserMessage(null);
+    setBrowserError(null);
+    try {
+      await onSave(form);
+      const result = await api.downloadProfileBrowser(profile.id);
+      setBrowserMessage(
+        `${result.tier === "licensed" ? "Licensed" : "Keyless"} browser ${result.version ?? "external"} is ready.`,
+      );
+      onBrowserPrepared?.();
+    } catch (err) {
+      setBrowserError(err instanceof Error ? err.message : "Failed to prepare browser");
+    } finally {
+      setBrowserPreparing(false);
+    }
+  };
+
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -159,37 +237,6 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       savedTimer.current = setTimeout(() => setSaved(false), 1500);
     } finally {
       setSaving(false);
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!onDelete) return;
-    if (!confirm("Delete this profile? Browser data will be permanently removed.")) return;
-    setDeleting(true);
-    try {
-      await onDelete();
-    } finally {
-      setDeleting(false);
-    }
-  };
-
-  const handleReset = async () => {
-    if (!onReset) return;
-    if (
-      !confirm(
-        "Reset this profile? Cookies, history and site data will be wiped and a " +
-          "new fingerprint generated. Bookmarks, settings and default search are kept.",
-      )
-    )
-      return;
-    setResetting(true);
-    try {
-      await onReset();
-      setResetDone(true);
-      clearTimeout(resetTimer.current);
-      resetTimer.current = setTimeout(() => setResetDone(false), 1500);
-    } finally {
-      setResetting(false);
     }
   };
 
@@ -261,6 +308,11 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     set("extension_paths", (form.extension_paths ?? []).filter((_, i) => i !== index));
   };
 
+  const toggleLibraryExtension = (id: string, checked: boolean) => {
+    const ids = form.extension_ids ?? [];
+    set("extension_ids", checked ? [...ids, id] : ids.filter((item) => item !== id));
+  };
+
   const addLaunchArg = () => {
     const arg = launchArgInput.trim();
     if (!arg) return;
@@ -273,14 +325,29 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     set("launch_args", (form.launch_args ?? []).filter((_, i) => i !== idx));
   };
 
+  const selectedExtensionIds = form.extension_ids ?? [];
+  const selectedLibrary = library.filter((extension) => selectedExtensionIds.includes(extension.id));
+  // An attached ID the list does not know about (still loading, or fetch failed).
+  const unresolvedExtensionIds = selectedExtensionIds.filter(
+    (id) => !library.some((extension) => extension.id === id),
+  );
+
   return (
     <form onSubmit={handleSubmit} className="p-6 max-w-3xl mx-auto">
-      <div className="flex items-center justify-between mb-6">
+      <div
+        className={`flex items-center justify-between mb-6 ${readOnly ? "sticky top-0 z-10 -mx-6 -mt-6 px-6 py-3 bg-surface-0 border-b border-border" : ""}`}
+      >
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">
-            {isEdit ? "Edit Profile" : "New Profile"}
+            {readOnly ? "Profile Details" : isEdit ? "Edit Profile" : "New Profile"}
           </h2>
-          {isEdit && onDuplicate && (
+          {readOnly && (
+            <span className="flex items-center gap-1 rounded bg-surface-3 px-1.5 py-0.5 text-xs text-gray-400">
+              <Lock className="h-3 w-3" />
+              Read-only while running
+            </span>
+          )}
+          {isEdit && onDuplicate && !readOnly && (
             <div ref={duplicateMenuRef} className="relative flex items-stretch">
               <button
                 type="button"
@@ -336,41 +403,27 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               )}
             </div>
           )}
-          {isEdit && onReset && (
-            <button
-              type="button"
-              onClick={handleReset}
-              disabled={resetting || resetDone}
-              className="btn-secondary flex items-center gap-1.5"
-            >
-              {resetDone ? <Check className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" />}
-              <span>{resetDone ? "Reset done" : resetting ? "Resetting..." : "Reset"}</span>
-            </button>
-          )}
-          {isEdit && onDelete && (
-            <button
-              type="button"
-              onClick={handleDelete}
-              disabled={deleting}
-              className="btn-danger flex items-center gap-1.5"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              <span>{deleting ? "Deleting..." : "Delete"}</span>
-            </button>
-          )}
         </div>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={onCancel} className="btn-secondary">
-            Cancel
+        {readOnly ? (
+          <button type="button" onClick={onCancel} className="btn-primary flex items-center gap-1.5">
+            <Monitor className="h-3.5 w-3.5" />
+            <span>Back to browser</span>
           </button>
-          <button type="submit" disabled={saving || saved} className="btn-primary flex items-center gap-1.5">
-            {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
-            <span>{saved ? "Saved" : saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
-          </button>
-        </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={onCancel} className="btn-secondary">
+              Cancel
+            </button>
+            <button type="submit" disabled={saving || saved} className="btn-primary flex items-center gap-1.5">
+              {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
+              <span>{saved ? "Saved" : saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
+            </button>
+          </div>
+        )}
       </div>
 
-      <div className="space-y-5">
+      {/* A disabled fieldset turns every control inside read-only at once. */}
+      <fieldset disabled={readOnly} className="min-w-0 space-y-5">
         {/* Last preview — the last frame captured before the browser stopped */}
         {isEdit && !previewError && (
           <section>
@@ -408,6 +461,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   onChange={(e) => set("fingerprint_seed", e.target.value ? Number(e.target.value) : null)}
                   placeholder="Auto (random)"
                 />
+                {!readOnly && (
                 <button
                   type="button"
                   onClick={randomizeSeed}
@@ -439,10 +493,100 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                     <circle cx="24" cy="20" r="0.9" fill="currentColor" opacity="0.5" />
                   </svg>
                 </button>
+                )}
               </div>
             </div>
           </div>
         </section>
+        {/* Browser */}
+        <section>
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Browser</h3>
+          <div className="space-y-3">
+            <div>
+              <label className="label">CloakBrowser license key</label>
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1 font-mono"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={typeof form.license_key === "string" ? form.license_key : ""}
+                  onChange={(event) => set("license_key", event.target.value || undefined)}
+                  placeholder={
+                    profile?.license_key_set && form.license_key !== null
+                      ? `Current: ${profile.license_key_masked ?? "set"} — type to replace`
+                      : "Leave empty for a keyless public build"
+                  }
+                />
+                {profile?.license_key_set && form.license_key !== null && (
+                  <button type="button" className="btn-secondary text-xs" onClick={() => set("license_key", null)}>
+                    Remove key
+                  </button>
+                )}
+              </div>
+              {form.license_key === null && profile?.license_key_set && (
+                <p className="mt-1 text-xs text-amber-400">The saved license key will be removed.</p>
+              )}
+              <p className="mt-1 text-xs text-gray-500">
+                Stored on this profile only. Profiles that use the same key share its concurrent-session seats.
+                Keyless profiles run CloakHQ&apos;s signed public builds (145 by default) without transparent proxy or portable cookies.{" "}
+                <a
+                  href="https://cloakbrowser.dev/free"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-gray-400 underline hover:text-gray-200"
+                >
+                  Get a free key
+                </a>
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="label">Release channel</label>
+                <select
+                  className="input"
+                  value={form.release_channel ?? "stable"}
+                  onChange={(event) => set("release_channel", event.target.value as "stable" | "preview")}
+                >
+                  <option value="stable">Stable</option>
+                  <option value="preview">Preview</option>
+                </select>
+              </div>
+              <div>
+                <label className="label">Browser version</label>
+                <input
+                  className="input font-mono"
+                  value={form.browser_version ?? ""}
+                  onChange={(event) => set("browser_version", event.target.value || null)}
+                  placeholder={form.license_key || (profile?.license_key_set && form.license_key !== null) ? "Latest" : "145.0.7632.109.2"}
+                  pattern="[0-9]+(\.[0-9]+){3,4}"
+                  title="Use a full numeric Chromium version"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-gray-500">
+              Leave empty for automatic selection. Exact pins work for paid keys and for keyless profiles (any signed public build); free keys always use the latest build.
+            </p>
+
+            {isEdit && !readOnly && (
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handlePrepareBrowser}
+                  disabled={browserPreparing}
+                  className="btn-secondary flex items-center gap-1.5"
+                >
+                  {browserPreparing && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  {browserPreparing ? "Preparing browser..." : "Save and download/update now"}
+                </button>
+                {browserMessage && <span className="text-xs text-emerald-400">{browserMessage}</span>}
+                {browserError && <span className="text-xs text-red-400">{browserError}</span>}
+              </div>
+            )}
+          </div>
+        </section>
+
 
         {/* Network */}
         <section>
@@ -665,6 +809,24 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 </span>
               </span>
             </label>
+            <div>
+              <label className="label" htmlFor="memory-saver">Memory Saver</label>
+              <select
+                id="memory-saver"
+                className="input"
+                value={form.memory_saver ?? "off"}
+                onChange={(e) => set("memory_saver", e.target.value as MemorySaver)}
+              >
+                <option value="off">Off</option>
+                <option value="aggressive">Unload background tabs after 2 hours</option>
+                <option value="medium">Unload background tabs after 4 hours</option>
+                <option value="conservative">Unload background tabs after 6 hours</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                Frees the memory of tabs left in the background that long; they reload when you switch back.
+                Automation holding such a tab over CDP loses it. Applies on the next launch.
+              </p>
+            </div>
           </div>
         </section>
 
@@ -736,17 +898,22 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   style={t.color ? { backgroundColor: `${t.color}20`, color: t.color } : undefined}
                 >
                   {t.tag}
-                  <button
-                    type="button"
-                    onClick={() => removeTag(t.tag)}
-                    className="hover:opacity-70"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
+                  {!readOnly && (
+                    <button
+                      type="button"
+                      onClick={() => removeTag(t.tag)}
+                      className="hover:opacity-70"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </span>
               ))}
             </div>
           )}
+          {readOnly ? (
+            (form.tags ?? []).length === 0 && <p className="text-xs text-gray-500">None</p>
+          ) : (
           <div className="flex gap-2 items-center">
             <div className="flex gap-1">
               {TAG_COLORS.map((c) => (
@@ -774,34 +941,128 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               Add
             </button>
           </div>
+          )}
         </section>
 
         {/* Extensions */}
         <section>
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Extensions</h3>
-          <p className="text-xs text-gray-500 mb-2">Add one unpacked Chrome extension directory per path.</p>
-          {(form.extension_paths ?? []).length > 0 && (
-            <div className="space-y-1.5 mb-3">
-              {(form.extension_paths ?? []).map((path, index) => (
-                <div key={`${path}-${index}`} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
-                  <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
-                  <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
-                    <X className="h-3 w-3" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="flex gap-2">
-            <input
-              className="input flex-1 font-mono"
-              value={extensionPathInput}
-              onChange={(e) => setExtensionPathInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addExtensionPath(); } }}
-              placeholder="/data/extensions/ublock"
-            />
-            <button type="button" onClick={addExtensionPath} className="btn-secondary text-xs">Add</button>
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Extensions</h3>
+            {!readOnly && onManageExtensions && (
+              <button
+                type="button"
+                onClick={onManageExtensions}
+                className="text-xs text-indigo-400 hover:text-indigo-300"
+              >
+                Manage library
+              </button>
+            )}
           </div>
+
+          {readOnly ? (
+            selectedLibrary.length === 0 &&
+            unresolvedExtensionIds.length === 0 &&
+            (form.extension_paths ?? []).length === 0 ? (
+              <p className="text-xs text-gray-500">None</p>
+            ) : (
+              <>
+                {libraryError && <p className="mb-2 text-xs text-red-400">{libraryError}</p>}
+                {(selectedLibrary.length > 0 || unresolvedExtensionIds.length > 0) && (
+                  <>
+                    <p className="mb-2 text-xs text-gray-500">From library</p>
+                    <div className="mb-3 space-y-1.5">
+                      {selectedLibrary.map((extension) => (
+                        <div
+                          key={extension.id}
+                          className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                        >
+                          <LibraryRow extension={extension} />
+                        </div>
+                      ))}
+                      {unresolvedExtensionIds.map((id) => (
+                        <div key={id} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
+                          <Puzzle className="h-5 w-5 shrink-0 text-gray-500" />
+                          <code className="truncate text-xs text-gray-400">{id}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {(form.extension_paths ?? []).length > 0 && (
+                  <>
+                    <p className="mb-2 text-xs text-gray-500">Custom paths</p>
+                    <div className="space-y-1.5">
+                      {(form.extension_paths ?? []).map((path, index) => (
+                        <div
+                          key={`${path}-${index}`}
+                          className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                        >
+                          <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </>
+            )
+          ) : (
+            <>
+              <p className="mb-2 text-xs text-gray-500">From library</p>
+              {libraryError && <p className="mb-2 text-xs text-red-400">{libraryError}</p>}
+              {library.length === 0 ? (
+                <p className="mb-3 text-xs text-gray-500">
+                  No extensions in the library yet. Use Manage library to add one.
+                </p>
+              ) : (
+                <div className="mb-3 space-y-1.5">
+                  {library.map((extension) => (
+                    <label
+                      key={extension.id}
+                      className="flex cursor-pointer items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedExtensionIds.includes(extension.id)}
+                        onChange={(e) => toggleLibraryExtension(extension.id, e.target.checked)}
+                        className="shrink-0 rounded border-border bg-surface-2"
+                      />
+                      <LibraryRow extension={extension} />
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <p className="mb-2 mt-4 text-xs text-gray-500">Custom paths</p>
+              <p className="mb-2 text-xs text-gray-500">
+                Add one unpacked Chrome extension directory per path.
+              </p>
+              {(form.extension_paths ?? []).length > 0 && (
+                <div className="mb-3 space-y-1.5">
+                  {(form.extension_paths ?? []).map((path, index) => (
+                    <div
+                      key={`${path}-${index}`}
+                      className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5"
+                    >
+                      <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
+                      <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex gap-2">
+                <input
+                  className="input flex-1 font-mono"
+                  value={extensionPathInput}
+                  onChange={(e) => setExtensionPathInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addExtensionPath(); } }}
+                  placeholder="/data/extensions/ublock"
+                />
+                <button type="button" onClick={addExtensionPath} className="btn-secondary text-xs">Add</button>
+              </div>
+            </>
+          )}
         </section>
 
         {/* Advanced */}
@@ -820,13 +1081,18 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-gray-300 font-mono"
                 >
                   {arg}
-                  <button type="button" onClick={() => removeLaunchArg(index)} className="hover:opacity-70">
-                    <X className="h-3 w-3" />
-                  </button>
+                  {!readOnly && (
+                    <button type="button" onClick={() => removeLaunchArg(index)} className="hover:opacity-70">
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </span>
               ))}
             </div>
           )}
+          {readOnly ? (
+            (form.launch_args ?? []).length === 0 && <p className="text-xs text-gray-500">None</p>
+          ) : (
           <div className="flex gap-2">
             <input
               className="input flex-1 font-mono"
@@ -837,6 +1103,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">Add</button>
           </div>
+          )}
         </details>
 
         {/* Notes */}
@@ -849,7 +1116,11 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             placeholder="Optional notes about this profile..."
           />
         </section>
-      </div>
+
+        {isEdit && !readOnly && (
+          <DangerZone key={profile!.id} onReset={onReset} onClearData={onClearData} onDelete={onDelete} />
+        )}
+      </fieldset>
 
     </form>
   );

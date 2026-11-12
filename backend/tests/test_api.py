@@ -19,6 +19,7 @@ from backend import database as db
 from backend import main
 from backend.models import ProfileDuplicateRequest
 from backend.browser_manager import BrowserManager, RunningProfile
+from backend.binary_cache import PreparedBinary
 from backend.runtime import RuntimeConfig
 
 
@@ -279,19 +280,14 @@ def test_runtime_config_invalid_sidebar_width_falls_back(
 
 
 def test_system_status(app_client: TestClient):
-    # Clear any leaked running profiles from prior tests
     main.browser_mgr.running.clear()
-
-    # Create a profile so profiles_total > 0
-    app_client.post("/api/profiles", json={"name": "Status Test"})
-    resp = app_client.get("/api/status")
-    assert resp.status_code == 200
-    data = resp.json()
+    response = app_client.get("/api/status")
+    assert response.status_code == 200
+    data = response.json()
     assert data["running_count"] == 0
-    # No key in the test env, so there is no build to report.
-    assert data["binary_version"] == ""
-    assert data["license_tier"] == "none"
-    assert data["profiles_total"] >= 1
+    assert data["installed_binary_count"] >= 0
+    assert data["binary_cache_dir"]
+    assert data["profiles_total"] >= 0
 
 
 # ── Launch Args ─────────────────────────────────────────────────────────────
@@ -758,90 +754,93 @@ def _same_origin_request_allows(headers: dict[str, str]) -> bool:
     return main._same_origin_request(_fake_request(headers))
 
 
-# ── Settings ─────────────────────────────────────────────────────────────────
+# ── Per-profile browser configuration ────────────────────────────────────────
 
 
-@pytest.fixture()
-def settings_env(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
-    """Isolate settings.json into the temp dir and neutralise the binary
-    re-resolve (which would validate/download a real Pro build)."""
-    from backend import settings_store
-
-    path = tmp_db / "settings.json"
-    monkeypatch.setattr(settings_store, "_settings_path", lambda: path)
-    monkeypatch.setattr(main.browser_mgr, "resolve_binary_status", MagicMock())
-    # Known baseline so masking/clearing is deterministic.
-    monkeypatch.setattr(main.browser_mgr, "license_key", None)
-    monkeypatch.setattr(main.browser_mgr, "release_channel", "stable")
-    return path
-
-
-def test_get_settings_no_key(app_client: TestClient, settings_env: Path):
-    resp = app_client.get("/api/settings")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["license_key_set"] is False
-    assert data["license_key_masked"] is None
-    assert data["release_channel"] == "stable"
-
-
-def test_get_settings_masks_key(app_client: TestClient, settings_env: Path):
-    main.browser_mgr.license_key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    resp = app_client.get("/api/settings")
-    data = resp.json()
+def test_profile_browser_settings_are_masked(app_client: TestClient):
+    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
+    response = app_client.post(
+        "/api/profiles",
+        json={
+            "name": "Licensed",
+            "license_key": key,
+            "release_channel": "preview",
+            "browser_version": "148.0.7778.215.2",
+        },
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert "license_key" not in data
     assert data["license_key_set"] is True
-    masked = data["license_key_masked"]
-    # Recognisable but not the whole key.
-    assert masked == "cb_ba…63aa"
-    assert "b142a68bc3088" not in masked
+    assert data["license_key_masked"] == "cb_ba…63aa"
+    assert data["release_channel"] == "preview"
+    assert data["browser_version"] == "148.0.7778.215.2"
 
 
-def test_put_settings_persists_and_hot_applies(
-    app_client: TestClient, settings_env: Path
+def test_profile_license_key_can_be_cleared(app_client: TestClient):
+    created = app_client.post(
+        "/api/profiles", json={"name": "Licensed", "license_key": "cb_test_key"}
+    ).json()
+    response = app_client.put(
+        f"/api/profiles/{created['id']}", json={"license_key": None}
+    )
+    assert response.status_code == 200
+    assert response.json()["license_key_set"] is False
+
+
+def test_profile_rejects_invalid_browser_version(app_client: TestClient):
+    response = app_client.post(
+        "/api/profiles", json={"name": "Bad version", "browser_version": "latest"}
+    )
+    assert response.status_code == 422
+
+
+def test_download_profile_browser(app_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    profile_id = app_client.post(
+        "/api/profiles", json={"name": "Prepare"}
+    ).json()["id"]
+    prepared = PreparedBinary(
+        version="145.0.7632.109.2",
+        tier="licensed",
+        binary_path="/cache/chromium-145.0.7632.109.2-pro/chrome",
+        cache_dir="/cache/chromium-145.0.7632.109.2-pro",
+    )
+    prepare = AsyncMock(return_value=prepared)
+    monkeypatch.setattr(main.browser_mgr, "prepare_binary", prepare)
+
+    response = app_client.post(f"/api/profiles/{profile_id}/browser/download")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == "145.0.7632.109.2"
+    prepare.assert_awaited_once()
+
+
+def test_list_and_cleanup_browser_cache(
+    app_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
-    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    resp = app_client.put("/api/settings", json={"license_key": key})
-    assert resp.status_code == 200
-    # Hot-applied to the live browser manager.
-    assert main.browser_mgr.license_key == key
-    main.browser_mgr.resolve_binary_status.assert_called_once()
-    # Persisted to settings.json.
-    import json
+    binary = {
+        "version": "145.0.7632.109.2",
+        "tier": "licensed",
+        "path": "/cache/chromium-145.0.7632.109.2-pro",
+        "size_bytes": 123,
+        "profile_count": 0,
+        "running_count": 0,
+        "in_use": False,
+    }
+    monkeypatch.setattr(main, "list_installed_binaries", MagicMock(return_value=[binary]))
+    monkeypatch.setattr(
+        main,
+        "cleanup_unused_binaries",
+        MagicMock(return_value=([binary], 123)),
+    )
 
-    assert json.loads(settings_env.read_text())["license_key"] == key
+    listed = app_client.get("/api/browsers")
+    cleaned = app_client.delete("/api/browsers/unused")
 
-
-def test_put_settings_clears_key(app_client: TestClient, settings_env: Path):
-    key = "cb_ba5f52e422b142a68bc3088f5cbb63aa"
-    main.browser_mgr.license_key = key
-    settings_env.write_text('{"license_key": "%s"}' % key)
-
-    resp = app_client.put("/api/settings", json={"license_key": ""})
-    assert resp.status_code == 200
-    assert main.browser_mgr.license_key is None
-    import json
-
-    assert "license_key" not in json.loads(settings_env.read_text())
-
-
-def test_put_settings_sets_channel(app_client: TestClient, settings_env: Path):
-    resp = app_client.put("/api/settings", json={"release_channel": "preview"})
-    assert resp.status_code == 200
-    assert main.browser_mgr.release_channel == "preview"
-    import json
-
-    assert json.loads(settings_env.read_text())["release_channel"] == "preview"
-
-
-def test_put_settings_rejects_bad_channel(
-    app_client: TestClient, settings_env: Path
-):
-    resp = app_client.put("/api/settings", json={"release_channel": "nightly"})
-    assert resp.status_code == 400
-    # Nothing persisted / applied on rejection.
-    assert main.browser_mgr.release_channel == "stable"
-    assert not settings_env.exists()
-
+    assert listed.status_code == 200
+    assert listed.json()["binaries"] == [binary]
+    assert cleaned.status_code == 200
+    assert cleaned.json()["reclaimed_bytes"] == 123
 
 # ── settings_store + runtime units ───────────────────────────────────────────
 
@@ -958,6 +957,41 @@ def test_reset_profile_preserves_search_engine_marker(app_client: TestClient):
     assert resp.status_code == 200
     assert marker.exists()
     assert marker.read_text().strip() == "google"
+
+
+def test_clear_data_removes_whole_browser_dir_but_keeps_settings_and_files(app_client: TestClient):
+    create = app_client.post(
+        "/api/profiles", json={"name": "ClearMe", "fingerprint_seed": 4242, "proxy": "http://h:1"}
+    )
+    pid = create.json()["id"]
+    user_data_dir = Path(create.json()["user_data_dir"])
+    (user_data_dir / "Default").mkdir(parents=True, exist_ok=True)
+    (user_data_dir / "Default" / "Bookmarks").write_text("{}")
+    (user_data_dir / "Local State").write_text("{}")
+    upload = app_client.post(
+        f"/api/profiles/{pid}/files", content=b"keep", headers={"X-File-Name": "keep.txt"}
+    )
+    assert upload.status_code == 201
+
+    resp = app_client.post(f"/api/profiles/{pid}/clear-data")
+
+    assert resp.status_code == 200
+    assert not user_data_dir.exists()
+    assert resp.json()["fingerprint_seed"] == 4242
+    assert resp.json()["proxy"] == "http://h:1"
+    files = app_client.get(f"/api/profiles/{pid}/files").json()
+    assert [item["name"] for item in files] == ["keep.txt"]
+
+
+def test_clear_data_stops_a_running_profile_first(app_client: TestClient):
+    pid = app_client.post("/api/profiles", json={"name": "ClearRunning"}).json()["id"]
+    main.browser_mgr.running[pid] = MagicMock(spec=RunningProfile)
+    main.browser_mgr.stop = AsyncMock(side_effect=lambda p: main.browser_mgr.running.pop(p, None))
+
+    resp = app_client.post(f"/api/profiles/{pid}/clear-data")
+
+    assert resp.status_code == 200
+    main.browser_mgr.stop.assert_called_once_with(pid)
 
 
 # ── Duplicate ────────────────────────────────────────────────────────────────

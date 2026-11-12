@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Lock, PanelLeftClose, PanelLeft, Settings, Power } from "lucide-react";
+import { Lock, PanelLeftClose, PanelLeft, Puzzle, Settings, Power } from "lucide-react";
 import { useProfiles } from "./hooks/useProfiles";
 import { api, ApiError, setOnUnauthorized, type ProfileCreateData, type SystemStatus, type UpdateInfo, type LaunchDenial, type RuntimeConfig } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
@@ -12,10 +12,12 @@ import { SystemStatusBadge } from "./components/SystemStatusBadge";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { LaunchErrorBanner } from "./components/LaunchErrorBanner";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { ExtensionsPanel } from "./components/ExtensionsPanel";
 import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
-type View = "empty" | "create" | "edit" | "view";
+// "details" browses a running VNC profile read-only while its viewer stays mounted (hidden).
+type View = "empty" | "create" | "edit" | "view" | "details";
 
 const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
   sidebar_width: "16rem",
@@ -98,7 +100,7 @@ interface AppContentProps {
 }
 
 function AppContent({ authRequired, onLogout }: AppContentProps) {
-  const { profiles, loading, error, create, update, remove, reorder, launch, stop, reset, duplicate } = useProfiles();
+  const { profiles, loading, error, refresh, create, update, remove, reorder, launch, stop, reset, clearData, duplicate } = useProfiles();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("empty");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -107,8 +109,22 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [launchError, setLaunchError] = useState<LaunchDenial | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [extensionsOpen, setExtensionsOpen] = useState(false);
+  // Bumped on every library close so an open profile form re-reads the library.
+  const [extensionLibraryVersion, setExtensionLibraryVersion] = useState(0);
   const [stopped, setStopped] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig>(DEFAULT_RUNTIME_CONFIG);
+
+  const closeExtensions = useCallback(() => {
+    setExtensionsOpen(false);
+    setExtensionLibraryVersion((version) => version + 1);
+  }, []);
+
+  // A library change alters profile_count (and can change what a profile
+  // launches with), so re-read the profiles too.
+  const handleExtensionsChanged = useCallback(() => {
+    void refresh();
+  }, [refresh]);
 
   const handleQuit = useCallback(async () => {
     if (!window.confirm("Quit CloakBrowser Manager? This stops the server and closes all running profiles.")) {
@@ -225,10 +241,15 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
   }, [selectedId, stop]);
 
   const handleReset = useCallback(async () => {
-    if (!selectedId) return;
-    await reset(selectedId);
+    if (!selectedId) return false;
     // Stays in the edit view — the profile is wiped but not launched.
+    return reset(selectedId);
   }, [selectedId, reset]);
+
+  const handleClearData = useCallback(async () => {
+    if (!selectedId) return false;
+    return clearData(selectedId);
+  }, [selectedId, clearData]);
 
   const handleDuplicate = useCallback(async (includeBrowserState: boolean) => {
     if (!selectedId) return;
@@ -273,8 +294,11 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
       {settingsOpen && (
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}
-          onSaved={setSystemStatus}
+          onChanged={() => api.getStatus().then(setSystemStatus).catch(() => undefined)}
         />
+      )}
+      {extensionsOpen && (
+        <ExtensionsPanel onClose={closeExtensions} onChanged={handleExtensionsChanged} />
       )}
       {updateInfo?.update_available && !updateDismissed && (
         <UpdateBanner info={updateInfo} onDismiss={() => setUpdateDismissed(true)} />
@@ -322,6 +346,13 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           <div className="flex items-center gap-3">
             <SystemStatusBadge status={systemStatus} />
             <button
+              onClick={() => setExtensionsOpen(true)}
+              className="text-gray-500 hover:text-gray-300 p-1"
+              title="Extension library"
+            >
+              <Puzzle className="h-4 w-4" />
+            </button>
+            <button
               onClick={() => setSettingsOpen(true)}
               className="text-gray-500 hover:text-gray-300 p-1"
               title="Settings"
@@ -364,48 +395,31 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto overscroll-contain">
-          {view === "empty" &&
-            ((systemStatus?.license_tier ?? "none") === "none" ? (
-              <div className="flex items-center justify-center h-full px-6">
-                <div className="max-w-sm text-center">
-                  <p className="text-sm font-medium text-gray-200">No license key set</p>
-                  <p className="mt-1.5 text-sm text-gray-500">
-                    Profiles need a key to launch. A free key takes one email and
-                    runs the latest build.
-                  </p>
-                  <div className="mt-5 flex flex-col items-center gap-2">
-                    <button
-                      onClick={() => setSettingsOpen(true)}
-                      className="btn-primary w-56"
-                    >
-                      Enter a key in Settings
-                    </button>
-                    <a
-                      href="https://cloakbrowser.dev/free"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-secondary w-56"
-                    >
-                      Get a free key
-                    </a>
-                    <a
-                      href="https://cloakbrowser.dev/#pricing"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-gray-500 hover:text-gray-300"
-                    >
-                      See Pro plans &rarr;
-                    </a>
-                  </div>
+          {view === "empty" && (
+            <div className="flex items-center justify-center h-full px-6">
+              <div className="max-w-sm text-center">
+                <p className="text-sm font-medium text-gray-200">Select or create a profile</p>
+                <p className="mt-1.5 text-sm text-gray-500">
+                  Each profile owns its license key, release channel, and browser version.
+                  Without a key it runs CloakHQ&apos;s signed public 145 build; a free key takes one
+                  email and runs the latest build.
+                </p>
+                <div className="mt-5 flex flex-col items-center gap-2">
+                  <button onClick={handleNew} className="btn-primary w-56">
+                    Create profile
+                  </button>
+                  <a
+                    href="https://cloakbrowser.dev/free"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn-secondary w-56"
+                  >
+                    Get a free key
+                  </a>
                 </div>
               </div>
-            ) : (
-              <div className="flex items-center justify-center h-full">
-                <div className="text-center">
-                  <p className="text-gray-500 text-sm">Select a profile or create a new one</p>
-                </div>
-              </div>
-            ))}
+            </div>
+          )}
 
           {view === "create" && (
             <ProfileForm
@@ -413,6 +427,8 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               hostOs={systemStatus?.host_os ?? null}
               viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleCreate}
+              onManageExtensions={() => setExtensionsOpen(true)}
+              extensionLibraryVersion={extensionLibraryVersion}
               onCancel={() => setView("empty")}
             />
           )}
@@ -424,8 +440,12 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
               viewerMode={systemStatus?.viewer_mode ?? null}
               onSave={handleUpdate}
               onDelete={handleDelete}
+              onBrowserPrepared={() => api.getStatus().then(setSystemStatus).catch(() => undefined)}
               onReset={handleReset}
+              onClearData={handleClearData}
               onDuplicate={handleDuplicate}
+              onManageExtensions={() => setExtensionsOpen(true)}
+              extensionLibraryVersion={extensionLibraryVersion}
               onCancel={() => {
                 setSelectedId(null);
                 setView("empty");
@@ -433,18 +453,34 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             />
           )}
 
-          {view === "view" && selected && selected.status === "running" && (
+          {(view === "view" || view === "details") && selected && selected.status === "running" && (
             selected.viewer_mode === "vnc" ? (
-              <ProfileViewer
-                key={selected.id}
-                profileId={selected.id}
-                profileName={selected.name}
-                cdpUrl={selected.cdp_url}
-                clipboardSync={selected.clipboard_sync}
-                onClipboardSyncChange={handleClipboardSyncChange}
-                onDisconnect={handleVncDisconnect}
-              />
-            ) : (
+              <>
+                {/* Hidden, not unmounted: unmounting would drop the VNC connection. */}
+                <div className={view === "view" ? "h-full" : "hidden"}>
+                  <ProfileViewer
+                    key={selected.id}
+                    profileId={selected.id}
+                    profileName={selected.name}
+                    cdpUrl={selected.cdp_url}
+                    clipboardSync={selected.clipboard_sync}
+                    onClipboardSyncChange={handleClipboardSyncChange}
+                    onDisconnect={handleVncDisconnect}
+                    onShowDetails={() => setView("details")}
+                  />
+                </div>
+                {view === "details" && (
+                  <ProfileForm
+                    readOnly
+                    profile={selected}
+                    hostOs={systemStatus?.host_os ?? null}
+                    viewerMode={systemStatus?.viewer_mode ?? null}
+                    onSave={handleUpdate}
+                    onCancel={() => setView("view")}
+                  />
+                )}
+              </>
+            ) : view === "view" && (
               <NativeWindowStatus
                 key={selected.id}
                 profileId={selected.id}

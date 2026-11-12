@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 import json
 import logging
 import os
@@ -12,7 +12,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from cloakbrowser import launch_persistent_context_async
 from cloakbrowser.license import (
@@ -22,7 +22,14 @@ from cloakbrowser.license import (
 )
 
 from . import downloads
+from . import extensions
 from .runtime import RuntimeConfig, resolve_runtime
+from .binary_cache import (
+    PreparedBinary,
+    ensure_profile_binary,
+    profile_binary_request,
+    wrapper_binary,
+)
 from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
@@ -112,6 +119,26 @@ def _validate_transparent_proxy(url: str | None) -> None:
         raise ValueError("Transparent proxy needs an http:// proxy with a username and password")
 
 
+_LICENSED_ONLY_OPTIONS = (
+    ("transparent_proxy", "Transparent proxy connection"),
+    ("portable_cookies", "Portable cookies"),
+)
+
+
+def _reject_licensed_only_options(profile: dict[str, Any]) -> None:
+    """Refuse options the public keyless builds don't have.
+
+    Their switches don't exist in those binaries, so Chromium would ignore them and
+    the profile would silently run without the behaviour it was configured for.
+    """
+    enabled = [label for key, label in _LICENSED_ONLY_OPTIONS if profile.get(key)]
+    if enabled:
+        raise ValueError(
+            f"{', '.join(enabled)} needs a licensed build: add a license key to this "
+            "profile or turn the option off"
+        )
+
+
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
     """Connect through a proxy, return exit IP + geo + latency (or an error).
 
@@ -153,6 +180,62 @@ def _test_proxy_sync(proxy: str) -> dict[str, Any]:
         "timezone": timezone,
         "latency_ms": latency_ms,
     }
+
+
+# Chromium Memory Saver lives in Local State (browser-wide; each Manager profile
+# is its own browser). State 2 = on, 0 = off; aggressiveness picks the hidden time
+# before a tab is discarded (6 h / 4 h / 2 h in Chromium 145).
+_MEMORY_SAVER_AGGRESSIVENESS = {"conservative": 0, "medium": 1, "aggressive": 2}
+# Every page carries the Manager's own CDP session, which Chromium counts as
+# "DevTools open" and never discards. This feature lifts that protection.
+_MEMORY_SAVER_FEATURES = ("AllowDevtoolsConnectedDiscard",)
+# Playwright launches Chromium with this before our args, and Chromium honours only
+# the last --enable-features switch, so a merged switch must list it again.
+_PLAYWRIGHT_ENABLED_FEATURES = ("CDPScreenshotNewSurface",)
+_ENABLE_FEATURES = "--enable-features="
+
+
+def _apply_memory_saver(user_data_dir: Path, mode: str) -> None:
+    """Write the profile's Memory Saver choice into its Local State before launch."""
+    path = user_data_dir / "Local State"
+    try:
+        local_state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if mode == "off":
+            return  # Chromium's default is off
+        local_state = {}
+    except (OSError, ValueError) as exc:
+        logger.warning("Memory Saver not applied, unreadable %s: %s", path, exc)
+        return
+    if not isinstance(local_state, dict):
+        logger.warning("Memory Saver not applied, unexpected %s", path)
+        return
+
+    tuning = local_state.setdefault("performance_tuning", {})
+    current = tuning.get("high_efficiency_mode") or {}
+    if mode == "off":
+        wanted = {**current, "state": 0}
+    else:
+        wanted = {**current, "state": 2, "aggressiveness": _MEMORY_SAVER_AGGRESSIVENESS[mode]}
+    if wanted == current or (mode == "off" and not current.get("state")):
+        return
+    tuning["high_efficiency_mode"] = wanted
+    tmp = path.with_name("Local State.manager-tmp")
+    tmp.write_text(json.dumps(local_state), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _merge_enabled_features(args: list[str], features: Iterable[str]) -> list[str]:
+    """Fold every --enable-features switch, plus ``features``, into one final switch."""
+    merged = list(_PLAYWRIGHT_ENABLED_FEATURES)
+    kept: list[str] = []
+    for arg in args:
+        if arg.startswith(_ENABLE_FEATURES):
+            merged += [name for name in arg[len(_ENABLE_FEATURES):].split(",") if name]
+        else:
+            kept.append(arg)
+    merged += features
+    return [*kept, _ENABLE_FEATURES + ",".join(dict.fromkeys(merged))]
 
 
 def _init_profile_defaults(user_data_dir: Path) -> None:
@@ -341,24 +424,18 @@ class RunningProfile:
     # context_async on the returned context). Read on close to tell a seat/
     # license denial apart from a real crash or a user-initiated close.
     denial_path: str | None = None
+    browser_version: str | None = None
+    binary_tier: str = "licensed"
+    # Library folders this browser loaded. Nothing may delete them while it runs.
+    extension_dirs: tuple[str, ...] = ()
 
 
 class BrowserManager:
     def __init__(
         self,
         runtime_config: RuntimeConfig | None = None,
-        license_key: str | None = None,
-        release_channel: str | None = None,
     ):
         self.runtime = runtime_config or resolve_runtime()
-        # App-wide license: passed to every launch so the wrapper downloads the
-        # Pro build and injects the key the Pro binary needs to boot + take a seat.
-        self.license_key = license_key
-        self.release_channel = release_channel
-        # Resolved at startup by resolve_binary_status(); read by GET /api/status.
-        self.license_tier = "none"
-        self.license_plan: str | None = None
-        self.binary_version: str | None = None
         self.running: dict[str, RunningProfile] = {}
         # Last launch failure per profile, surfaced on the status poll and cleared
         # on the next launch. Holds post-handshake denials (out of seats, bad key)
@@ -379,61 +456,12 @@ class BrowserManager:
         self._lock = asyncio.Lock()
         self._cdp_ports: set[int] = set()
         self._auto_launch_task: asyncio.Task | None = None
+        self._binary_lock = asyncio.Lock()
 
-    def resolve_binary_status(self) -> None:
-        """Resolve the license tier + binary version and pre-download the binary.
-
-        Blocking — called once at startup (via a thread) so the multi-hundred-MB
-        Pro download stays out of the launch path and auto-launch's 60s timeout.
-        Never raises. Without a key there is nothing to download (wrapper 0.7+
-        needs one for every build); launches then fail with the free-key link.
-        """
-        from cloakbrowser.download import ensure_binary
-        from cloakbrowser.license import (
-            get_pro_latest_version,
-            resolve_license_key,
-            validate_license,
-        )
-
-        tier = "none"
-        version = None
-
-        key = resolve_license_key(self.license_key)
-        if not key:
-            self.license_tier = tier
-            self.license_plan = None
-            self.binary_version = None
-            logger.info("No license key set: add one in Settings to launch profiles")
-            return
-
-        try:
-            info = validate_license(key)
-        except Exception as exc:
-            info = None
-            logger.warning("License validation failed: %s", exc)
-        if info and info.valid:
-            tier = "free" if info.plan == "free" else "pro"
-            self.license_plan = info.plan
-            try:
-                version = get_pro_latest_version(self.release_channel)
-            except Exception as exc:
-                logger.warning("Could not resolve Pro version: %s", exc)
-
-        self.license_tier = tier
-        self.binary_version = version
-
-        try:
-            ensure_binary(
-                license_key=self.license_key,
-                release_channel=self.release_channel,
-            )
-            logger.info("Binary ready: tier=%s version=%s", tier, version)
-        except Exception as exc:
-            logger.error(
-                "Binary pre-download failed: %s",
-                exc,
-                exc_info=True,
-            )
+    async def prepare_binary(self, profile: dict[str, Any]) -> PreparedBinary:
+        """Resolve and download one profile's browser binary on demand."""
+        async with self._binary_lock:
+            return await asyncio.to_thread(ensure_profile_binary, profile)
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
@@ -443,13 +471,14 @@ class BrowserManager:
         # produced it. Proxy credentials are redacted; never log the key.
         from . import diagnostics
 
+        request = profile_binary_request(profile)
         logger.info(
-            "Launching profile %s: seed=%s proxy=%s tier=%s plan=%s runtime=%s",
+            "Launching profile %s: seed=%s proxy=%s browser=%s channel=%s runtime=%s",
             profile_id,
             profile.get("fingerprint_seed"),
             diagnostics.redact_proxy(profile.get("proxy")),
-            self.license_tier,
-            self.license_plan or "-",
+            request.browser_version or "latest",
+            request.release_channel,
             self.runtime.runtime_mode,
         )
 
@@ -474,7 +503,14 @@ class BrowserManager:
         ws_port: int | None = None
         cdp_port: int | None = None
         context: Any | None = None
+        prepared: PreparedBinary | None = None
+        # Holds the keyless executable pin for every wrapper launch below.
+        binary_pin = ExitStack()
         try:
+            prepared = await self.prepare_binary(profile)
+            binary_pin.enter_context(wrapper_binary(prepared))
+            if prepared.tier == "keyless":
+                _reject_licensed_only_options(profile)
             if self.runtime.viewer_mode == "vnc":
                 display, ws_port = await self.vnc.allocate()
 
@@ -493,7 +529,7 @@ class BrowserManager:
             # reports "initializing" via get_status while it works (one short
             # headless launch). Never fatal.
             if profile.get("set_google_default", True):
-                await self._ensure_search_engine(profile_id, user_data_dir)
+                await self._ensure_search_engine(profile, user_data_dir)
 
             if display is not None and ws_port is not None:
                 await self.vnc.start_vnc(
@@ -521,7 +557,14 @@ class BrowserManager:
             # Chrome's persistent session is saved on disk but only restored when told to.
             if profile.get("restore_session", True):
                 extra_args.append("--restore-last-session")
+            memory_saver = profile.get("memory_saver") or "off"
+            # After the search-engine launch above, which rewrites Local State on exit.
+            _apply_memory_saver(user_data_dir, memory_saver)
+            if memory_saver != "off":
+                extra_args = _merge_enabled_features(extra_args, _MEMORY_SAVER_FEATURES)
 
+            # Library extensions come first: a profile's own paths are the override.
+            library_dirs = extensions.profile_extension_paths(profile)
             raw_proxy = profile.get("proxy") or None
             proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
             if proxy:
@@ -540,9 +583,13 @@ class BrowserManager:
                 "human_preset": profile.get("human_preset", "default"),
                 "geoip": bool(profile.get("geoip", False)),
                 "color_scheme": profile.get("color_scheme") or None,
-                "extension_paths": profile.get("extension_paths") or [],
-                "license_key": self.license_key,
-                "release_channel": self.release_channel,
+                "extension_paths": [
+                    *library_dirs,
+                    *(profile.get("extension_paths") or []),
+                ],
+                "license_key": request.license_key,
+                "browser_version": request.browser_version,
+                "release_channel": request.release_channel,
             }
             if display is not None:
                 launch_options["viewport"] = {
@@ -644,6 +691,9 @@ class BrowserManager:
                 user_data_dir=user_data_dir,
                 capture_preview=bool(profile.get("capture_preview", True)),
                 denial_path=getattr(context, "_cloak_denial_path", None),
+                browser_version=prepared.version if prepared else request.browser_version,
+                binary_tier=prepared.tier if prepared else request.tier,
+                extension_dirs=tuple(library_dirs),
             )
             context.on(
                 "close",
@@ -704,9 +754,11 @@ class BrowserManager:
             finally:
                 self._release_stopping(profile_id)
             raise
+        finally:
+            binary_pin.close()
 
     async def _ensure_search_engine(
-        self, profile_id: str, user_data_dir: Path
+        self, profile: dict[str, Any], user_data_dir: Path
     ) -> None:
         """Make Google the default search engine, once per profile.
 
@@ -719,6 +771,7 @@ class BrowserManager:
         so a persistently-failing profile doesn't pay an extra headless launch
         (~5s) on every single launch, silently, forever.
         """
+        profile_id = profile["id"]
         marker = user_data_dir / SEARCH_ENGINE_MARKER
         state = marker.read_text().strip() if marker.exists() else ""
         if state == "google":
@@ -734,7 +787,7 @@ class BrowserManager:
 
         self._initializing.add(profile_id)
         try:
-            await self._setup_google_default(user_data_dir)
+            await self._setup_google_default(profile, user_data_dir)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("google\n")
             logger.info(
@@ -763,7 +816,9 @@ class BrowserManager:
         finally:
             self._initializing.discard(profile_id)
 
-    async def _setup_google_default(self, user_data_dir: Path) -> None:
+    async def _setup_google_default(
+        self, profile: dict[str, Any], user_data_dir: Path
+    ) -> None:
         """Add Google via the settings UI, then commit it as the default.
 
         Single headless launch, no file seeding. A plain Preferences write can't
@@ -774,7 +829,7 @@ class BrowserManager:
         dialog — Chrome creates the row with a valid hash — then "Make default".
         Every later launch then carries Google via the profile's own files.
         """
-        ctx = await self._headless_launch(user_data_dir)
+        ctx = await self._headless_launch(profile, user_data_dir)
         try:
             page = await ctx.new_page()
             await page.goto("chrome://settings/searchEngines")
@@ -815,15 +870,19 @@ class BrowserManager:
             await self._close_context(ctx, "search-init")
         await asyncio.sleep(0.5)
 
-    async def _headless_launch(self, user_data_dir: Path) -> Any:
+    async def _headless_launch(
+        self, profile: dict[str, Any], user_data_dir: Path
+    ) -> Any:
         """Short headless launch used only by the one-time search-engine setup."""
         for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             (user_data_dir / lock_file).unlink(missing_ok=True)
+        request = profile_binary_request(profile)
         return await launch_persistent_context_async(
             user_data_dir=str(user_data_dir),
             headless=True,
-            license_key=self.license_key,
-            release_channel=self.release_channel,
+            license_key=request.license_key,
+            browser_version=request.browser_version,
+            release_channel=request.release_channel,
         )
 
     async def _capture_screenshot(self, running: RunningProfile) -> None:
@@ -1002,6 +1061,15 @@ class BrowserManager:
             or profile_id in self._stopping
         )
 
+    def extension_dirs_in_use(self) -> set[str]:
+        """Library folders the running browsers loaded, so the library never deletes
+        one out from under a profile (Chromium reads its rulesets from there)."""
+        return {
+            str(Path(directory).resolve())
+            for running in list(self.running.values())
+            for directory in running.extension_dirs
+        }
+
     def cdp_client_detached(self, running: RunningProfile) -> None:
         """A proxied CDP client that changed download behaviour has disconnected. Chromium
         reverts to its default, so capture is re-armed. ``running`` is the browser the
@@ -1088,7 +1156,7 @@ class BrowserManager:
         logger.info("Auto-launching %d profile(s)...", len(auto_profiles))
         for profile in auto_profiles:
             try:
-                await asyncio.wait_for(self.launch(profile), timeout=60)
+                await self.launch(profile)
                 logger.info("Auto-launched profile %s (%s)", profile["name"], profile["id"])
             except Exception as exc:
                 logger.error(
@@ -1175,6 +1243,10 @@ class BrowserManager:
         # Persona is always determined by the runtime, not editable profile data.
         platform = "macos" if self.runtime.host_os == "macos" else "windows"
         args.append(f"--fingerprint-platform={platform}")
+        # The Linux runtime presents a Windows persona. With licensed Windows
+        # fonts mounted, align Chromium's text measurements with that persona.
+        if self.runtime.host_os == "linux":
+            args.append("--fingerprint-windows-font-metrics")
 
         # Apple GPU models are selected automatically by the seeded macOS
         # persona. Windows vendor-family overrides are incoherent on macOS.

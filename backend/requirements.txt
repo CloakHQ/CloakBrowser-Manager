@@ -1,10 +1,16 @@
 fastapi>=0.162.0
 uvicorn[standard]>=0.54.0
 pydantic>=2.14.2
-cloakbrowser[geoip]>=0.7.1
+# <0.8: keyless profiles reuse the wrapper's private download/verify helpers and
+# its ensure_binary lookup (backend/binary_cache.py); recheck both before raising.
+cloakbrowser[geoip]>=0.7.1,<0.8
 websockets>=16.1.1; python_version < "3.11"
 websockets>=17.4; python_version >= "3.11"
 httpx>=0.28.1
+# RSA-2048 key generation for extension archives that carry no key of their own
+# (backend/extensions.py): the injected key is what keeps an unpacked extension's
+# ID stable across version folders.
+cryptography>=44
 # Native window shell for the frozen app (WKWebView on macOS, WebView2 on
 # Windows). app_entry.py falls back to the default browser if absent.
 pywebview>=6.2.1

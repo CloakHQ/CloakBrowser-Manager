@@ -148,7 +148,9 @@ def test_build_args_no_seed():
 
 
 def test_build_args_platform_comes_from_runtime():
-    assert "--fingerprint-platform=windows" in _mgr._build_fingerprint_args({})
+    docker_args = _mgr._build_fingerprint_args({})
+    assert "--fingerprint-platform=windows" in docker_args
+    assert "--fingerprint-windows-font-metrics" in docker_args
     mac_runtime = RuntimeConfig(
         host_os="macos",
         runtime_mode="native",
@@ -156,7 +158,9 @@ def test_build_args_platform_comes_from_runtime():
         data_dir=Path("/tmp/manager-data"),
     )
     mac_manager = BrowserManager(mac_runtime)
-    assert "--fingerprint-platform=macos" in mac_manager._build_fingerprint_args({})
+    mac_args = mac_manager._build_fingerprint_args({})
+    assert "--fingerprint-platform=macos" in mac_args
+    assert "--fingerprint-windows-font-metrics" not in mac_args
     assert not any(
         "gpu-vendor" in arg
         for arg in mac_manager._build_fingerprint_args({"gpu_family": "nvidia"})
@@ -189,13 +193,14 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Docker software rendering + runtime platform.
-    assert len(args) == 2
+    # Docker software rendering, Windows persona, and matching font metrics.
+    assert len(args) == 3
 
 
 def test_native_build_args_do_not_force_software_gl():
     args = BrowserManager(NATIVE_RUNTIME)._build_fingerprint_args({})
     assert "--use-angle=swiftshader" not in args
+    assert "--fingerprint-windows-font-metrics" not in args
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────
@@ -243,6 +248,7 @@ def _launch_profile(tmp_path: Path) -> dict:
     return {
         "id": "profile-1",
         "name": "Native",
+        "license_key": "cb_test_key",
         "user_data_dir": str(user_data_dir),
         "screen_width": 1920,
         "screen_height": 1080,
@@ -278,6 +284,54 @@ async def test_native_launch_skips_vnc_and_display(monkeypatch, tmp_path: Path):
     assert "--remote-debugging-address=127.0.0.1" in options["args"]
     assert options["headless"] is False
     assert options["extension_paths"] == []
+
+
+async def _launch_args_with(monkeypatch, tmp_path: Path, **overrides) -> list[str]:
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.add_init_script = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    launch = AsyncMock(return_value=context)
+    monkeypatch.setattr(module, "launch_persistent_context_async", launch)
+    await manager.launch({**_launch_profile(tmp_path), **overrides})
+    return launch.await_args.kwargs["args"]
+
+
+@pytest.mark.asyncio
+async def test_memory_saver_enables_discarding_and_keeps_other_features(monkeypatch, tmp_path: Path):
+    args = await _launch_args_with(
+        monkeypatch, tmp_path,
+        memory_saver="aggressive",
+        launch_args=["--enable-features=WebMCP", "--lang=en-US"],
+    )
+
+    feature_switches = [arg for arg in args if arg.startswith("--enable-features=")]
+    # Chromium honours only the last switch, so it must carry Playwright's and the user's too.
+    assert feature_switches == [
+        "--enable-features=CDPScreenshotNewSurface,WebMCP,AllowDevtoolsConnectedDiscard"
+    ]
+    assert "--lang=en-US" in args
+    local_state = json.loads((tmp_path / "profile-1" / "Local State").read_text())
+    assert local_state["performance_tuning"]["high_efficiency_mode"] == {"state": 2, "aggressiveness": 2}
+
+
+@pytest.mark.asyncio
+async def test_memory_saver_off_turns_a_previous_choice_off(monkeypatch, tmp_path: Path):
+    user_data_dir = tmp_path / "profile-1"
+    user_data_dir.mkdir()
+    (user_data_dir / "Local State").write_text(json.dumps({
+        "browser": {"enabled_labs_experiments": []},
+        "performance_tuning": {"high_efficiency_mode": {"state": 2, "aggressiveness": 0}},
+    }))
+
+    args = await _launch_args_with(monkeypatch, tmp_path, memory_saver="off")
+
+    assert not any(arg.startswith("--enable-features=") for arg in args)
+    local_state = json.loads((user_data_dir / "Local State").read_text())
+    assert local_state["performance_tuning"]["high_efficiency_mode"]["state"] == 0
+    assert local_state["browser"] == {"enabled_labs_experiments": []}
 
 
 @pytest.mark.asyncio
@@ -353,9 +407,7 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
 
     context = MagicMock(pages=[])
     context.add_init_script = AsyncMock()
-    manager = BrowserManager(
-        NATIVE_RUNTIME, license_key="cb_test", release_channel="preview"
-    )
+    manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
     launch = AsyncMock(return_value=context)
     monkeypatch.setattr(module, "launch_persistent_context_async", launch)
@@ -363,11 +415,15 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
     profile = _launch_profile(tmp_path)
     profile["extension_paths"] = ["/tmp/extension"]
     profile["launch_args"] = ["--raw-flag"]
+    profile["license_key"] = "cb_test"
+    profile["release_channel"] = "preview"
+    profile["browser_version"] = "148.0.7778.215.2"
     await manager.launch(profile)
 
     options = launch.await_args.kwargs
     assert options["license_key"] == "cb_test"
     assert options["release_channel"] == "preview"
+    assert options["browser_version"] == "148.0.7778.215.2"
     assert options["extension_paths"] == ["/tmp/extension"]
     assert options["args"].index("--raw-flag") > options["args"].index("--fingerprint-platform=windows")
 

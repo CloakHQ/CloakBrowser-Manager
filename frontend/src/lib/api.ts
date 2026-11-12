@@ -19,9 +19,17 @@ export interface ProfileFile {
   container_path: string;
 }
 
+// Chromium Memory Saver: off, or how long a tab stays hidden before it is
+// discarded (conservative 6 h, medium 4 h, aggressive 2 h).
+export type MemorySaver = "off" | "conservative" | "medium" | "aggressive";
+
 export interface Profile {
   id: string;
   name: string;
+  license_key_set: boolean;
+  license_key_masked: string | null;
+  release_channel: "stable" | "preview";
+  browser_version: string | null;
   fingerprint_seed: number;
   proxy: string | null;
   timezone: string | null;
@@ -37,10 +45,12 @@ export interface Profile {
   color_scheme: string | null;
   launch_args: string[];
   extension_paths: string[];
+  extension_ids: string[];
   allow_3p_cookies: boolean;
   set_google_default: boolean;
   capture_preview: boolean;
   restore_session: boolean;
+  memory_saver: MemorySaver;
   transparent_proxy: boolean;
   portable_cookies: boolean;
   notes: string | null;
@@ -67,6 +77,9 @@ export interface LaunchDenial {
 
 export interface ProfileCreateData {
   name: string;
+  license_key?: string | null;
+  release_channel?: "stable" | "preview";
+  browser_version?: string | null;
   fingerprint_seed?: number | null;
   proxy?: string | null;
   timezone?: string | null;
@@ -82,10 +95,12 @@ export interface ProfileCreateData {
   color_scheme?: string | null;
   launch_args?: string[];
   extension_paths?: string[];
+  extension_ids?: string[];
   allow_3p_cookies?: boolean;
   set_google_default?: boolean;
   capture_preview?: boolean;
   restore_session?: boolean;
+  memory_saver?: MemorySaver;
   transparent_proxy?: boolean;
   portable_cookies?: boolean;
   notes?: string | null;
@@ -114,8 +129,8 @@ export interface ProxyTestResult {
 
 export interface SystemStatus {
   running_count: number;
-  binary_version: string;
-  license_tier: string; // "pro" | "free" | "none"
+  installed_binary_count: number;
+  binary_cache_dir: string;
   profiles_total: number;
   host_os: HostOS;
   runtime_mode: RuntimeMode;
@@ -136,15 +151,55 @@ export interface RuntimeConfig {
   sidebar_width: string;
 }
 
-export interface ManagerSettings {
-  license_key_set: boolean;
-  license_key_masked: string | null;
-  release_channel: string; // "stable" | "preview"
+export interface BrowserBinary {
+  version: string;
+  tier: "licensed" | "keyless";
+  path: string;
+  size_bytes: number;
+  profile_count: number;
+  running_count: number;
+  in_use: boolean;
 }
 
-export interface SettingsUpdate {
-  license_key?: string | null; // omit = unchanged; "" = clear
-  release_channel?: string | null;
+export interface BrowserBinaryList {
+  cache_dir: string;
+  binaries: BrowserBinary[];
+}
+
+export interface BrowserDownloadResult {
+  version: string | null;
+  tier: "licensed" | "keyless";
+  binary_path: string;
+}
+
+export interface BrowserCleanupResult {
+  removed: BrowserBinary[];
+  reclaimed_bytes: number;
+}
+
+export type ExtensionSourceKind = "webstore" | "crx" | "zip" | "upload";
+
+/** One entry of the Manager-wide extension library, shared by every profile. */
+export interface LibraryExtension {
+  id: string;
+  name: string;
+  description: string | null;
+  version: string;
+  previous_version: string | null;
+  manifest_version: 2 | 3;
+  source_kind: ExtensionSourceKind;
+  source_url: string | null;
+  webstore_id: string | null;
+  /** "/api/extensions/{id}/icon" when the extension ships an icon. */
+  icon_url: string | null;
+  profile_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExtensionUpdateResult {
+  extension: LibraryExtension;
+  updated: boolean;
 }
 
 export class ApiError extends Error {
@@ -196,6 +251,29 @@ async function request<T>(
   return res.json();
 }
 
+// The file is the body itself, streamed as-is. Its name travels in a header,
+// URL-encoded, because header values cannot carry arbitrary Unicode.
+async function uploadRequest<T>(path: string, file: File): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    body: file,
+    headers: {
+      "X-File-Name": encodeURIComponent(file.name),
+      "Content-Type": file.type || "application/octet-stream",
+    },
+  });
+  if (!res.ok) {
+    if (res.status === 401 && _onUnauthorized) {
+      _onUnauthorized();
+      throw new ApiError(401, "Unauthorized");
+    }
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof body.detail === "string" ? body.detail : res.statusText;
+    throw new ApiError(res.status, detail);
+  }
+  return res.json();
+}
+
 export const api = {
   authStatus: () =>
     request<{ auth_required: boolean; authenticated: boolean }>("/api/auth/status"),
@@ -243,6 +321,9 @@ export const api = {
   resetProfile: (id: string) =>
     request<Profile>(`/api/profiles/${id}/reset`, { method: "POST" }),
 
+  clearProfileData: (id: string) =>
+    request<Profile>(`/api/profiles/${id}/clear-data`, { method: "POST" }),
+
   duplicateProfile: (id: string, includeBrowserState = false) =>
     request<Profile>(`/api/profiles/${id}/duplicate`, {
       method: "POST",
@@ -252,28 +333,8 @@ export const api = {
   listProfileFiles: (id: string) =>
     request<ProfileFile[]>(`/api/profiles/${id}/files`),
 
-  uploadProfileFile: async (id: string, file: File): Promise<ProfileFile> => {
-    // The file is the body itself, streamed as-is. Its name travels in a header, URL-encoded,
-    // because header values cannot carry arbitrary Unicode.
-    const res = await fetch(`/api/profiles/${id}/files`, {
-      method: "POST",
-      body: file,
-      headers: {
-        "X-File-Name": encodeURIComponent(file.name),
-        "Content-Type": file.type || "application/octet-stream",
-      },
-    });
-    if (!res.ok) {
-      if (res.status === 401 && _onUnauthorized) {
-        _onUnauthorized();
-        throw new ApiError(401, "Unauthorized");
-      }
-      const body = await res.json().catch(() => ({ detail: res.statusText }));
-      const detail = typeof body.detail === "string" ? body.detail : res.statusText;
-      throw new ApiError(res.status, detail);
-    }
-    return res.json();
-  },
+  uploadProfileFile: (id: string, file: File): Promise<ProfileFile> =>
+    uploadRequest<ProfileFile>(`/api/profiles/${id}/files`, file),
 
   deleteProfileFile: (id: string, fileId: string) =>
     request<{ ok: boolean }>(`/api/profiles/${id}/files/${fileId}`, { method: "DELETE" }),
@@ -301,12 +362,14 @@ export const api = {
   shutdown: () =>
     request<{ ok: boolean; message?: string }>("/api/shutdown", { method: "POST" }),
 
-  getSettings: () => request<ManagerSettings>("/api/settings"),
+  listBrowsers: () => request<BrowserBinaryList>("/api/browsers"),
 
-  updateSettings: (data: SettingsUpdate) =>
-    request<SystemStatus>("/api/settings", {
-      method: "PUT",
-      body: JSON.stringify(data),
+  cleanupUnusedBrowsers: () =>
+    request<BrowserCleanupResult>("/api/browsers/unused", { method: "DELETE" }),
+
+  downloadProfileBrowser: (id: string) =>
+    request<BrowserDownloadResult>(`/api/profiles/${id}/browser/download`, {
+      method: "POST",
     }),
 
   setClipboard: (id: string, text: string) =>
@@ -317,4 +380,37 @@ export const api = {
 
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
+
+  // ── Extension library ──
+  listExtensions: () => request<LibraryExtension[]>("/api/extensions"),
+
+  addExtension: (source: string) =>
+    request<LibraryExtension>("/api/extensions", {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+
+  // Uploading with an extensionId installs a new version of that entry.
+  uploadExtension: (file: File, extensionId?: string) =>
+    uploadRequest<LibraryExtension>(
+      extensionId
+        ? `/api/extensions/upload?extension_id=${encodeURIComponent(extensionId)}`
+        : "/api/extensions/upload",
+      file,
+    ),
+
+  // source null re-downloads the stored webstore ID / URL.
+  updateExtension: (id: string, source: string | null = null) =>
+    request<ExtensionUpdateResult>(`/api/extensions/${id}/update`, {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+
+  rollbackExtension: (id: string) =>
+    request<LibraryExtension>(`/api/extensions/${id}/rollback`, { method: "POST" }),
+
+  deleteExtension: (id: string) =>
+    request<{ ok: boolean }>(`/api/extensions/${id}`, { method: "DELETE" }),
+
+  extensionIconUrl: (id: string) => `/api/extensions/${id}/icon`,
 };

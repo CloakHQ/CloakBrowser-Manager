@@ -22,6 +22,7 @@ function profile(overrides: Partial<Profile>): Profile {
     color_scheme: null,
     launch_args: [],
     extension_paths: [],
+    extension_ids: [],
     allow_3p_cookies: true,
     set_google_default: true,
     capture_preview: true,

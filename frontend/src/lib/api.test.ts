@@ -191,6 +191,62 @@ describe("api.getClipboard", () => {
   });
 });
 
+// ── Extension library ───────────────────────────────────────────────────────
+
+describe("api extension library", () => {
+  it("lists, adds from a source and updates", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    expect(await api.listExtensions()).toEqual([]);
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/extensions");
+
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "abc" }));
+    await api.addExtension("ddkjiahejlhfcafbddmgiahcphecmpfh");
+    const [addUrl, addInit] = mockFetch.mock.calls[1];
+    expect(addUrl).toBe("/api/extensions");
+    expect(addInit.method).toBe("POST");
+    expect(JSON.parse(addInit.body)).toEqual({ source: "ddkjiahejlhfcafbddmgiahcphecmpfh" });
+
+    mockFetch.mockResolvedValueOnce(jsonResponse({ extension: { id: "abc" }, updated: false }));
+    const result = await api.updateExtension("abc");
+    expect(result.updated).toBe(false);
+    expect(JSON.parse(mockFetch.mock.calls[2][1].body)).toEqual({ source: null });
+  });
+
+  it("uploads a file, optionally as a new version of an existing entry", async () => {
+    const stored = { id: "abc", name: "uBlock Origin Lite" };
+    mockFetch.mockResolvedValueOnce(jsonResponse(stored));
+    const file = new File([new Uint8Array([0x43, 0x72, 0x32, 0x34])], "ublock.crx", {
+      type: "application/octet-stream",
+    });
+
+    expect(await api.uploadExtension(file)).toEqual(stored);
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/extensions/upload");
+    expect(mockFetch.mock.calls[0][1].body).toBe(file);
+
+    mockFetch.mockResolvedValueOnce(jsonResponse(stored));
+    await api.uploadExtension(file, "abc");
+    expect(mockFetch.mock.calls[1][0]).toBe("/api/extensions/upload?extension_id=abc");
+  });
+
+  it("rolls back and deletes", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "abc", version: "1.0.0" }));
+    await api.rollbackExtension("abc");
+    expect(mockFetch.mock.calls[0][0]).toBe("/api/extensions/abc/rollback");
+
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    await api.deleteExtension("abc");
+    expect(mockFetch.mock.calls[1][0]).toBe("/api/extensions/abc");
+    expect(mockFetch.mock.calls[1][1].method).toBe("DELETE");
+  });
+
+  it("surfaces the server's reason when an add is refused", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: "Already in the library" }, 409));
+    await expect(api.addExtension("ddkjiahejlhfcafbddmgiahcphecmpfh")).rejects.toThrow(
+      "Already in the library",
+    );
+  });
+});
+
 // ── Error handling ──────────────────────────────────────────────────────────
 
 describe("error handling", () => {

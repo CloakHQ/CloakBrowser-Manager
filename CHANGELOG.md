@@ -4,6 +4,24 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Per-profile license keys and browser versions.** Every profile now owns its CloakBrowser key, Stable/Preview channel, and optional exact Chromium version pin, so one Manager runs profiles on several keys at once. Paid-key profiles can track their channel or roll back to an exact version; free keys always run the latest build.
+- **Keyless profiles on engine 0.7.** A profile without a key runs CloakHQ's signed public build (145.0.7632.109.2 by default, or a pinned public version). The Manager downloads it from GitHub Releases, verifies the Ed25519-signed manifest the same way the engine verifies Pro builds, and launches it through the engine. Transparent proxy and portable cookies are refused on keyless profiles because those builds lack them.
+- **Per-profile Memory Saver.** A new Behavior setting turns on Chromium's Memory Saver for a profile, unloading tabs left in the background for 2, 4 or 6 hours. The Manager enables `AllowDevtoolsConnectedDiscard` with it, because Chromium otherwise never unloads a tab with a CDP client attached, and every tab carries the Manager's own connection.
+- **Clear browser data.** Deletes a profile's entire browser data folder (cookies, logins, history, bookmarks, browser preferences) while keeping its Manager settings, fingerprint and files, so the next launch starts like a fresh browser. `POST /api/profiles/{id}/clear-data`.
+- **Profile details from the VNC viewer.** A sliders icon next to *Connected* opens the running profile's settings read-only. The viewer stays mounted behind it, so **Back to browser** (or clicking the profile in the sidebar) returns to the same session without reconnecting.
+- **Extension library.** Add extensions once from a Chrome Web Store link or ID, a CRX/ZIP URL, or an uploaded file; the Manager unpacks them into the data directory, reads name, icon, version and manifest version, and profiles tick them under *From library* next to their custom paths. **Update** re-downloads or takes a new URL or file, the previous version stays for **Roll back**, and an injected manifest `key` keeps each extension's ID (and its data) across versions. MV2 entries are flagged: CloakBrowser 145 and 156 disable unpacked MV2 extensions.
+- **Persistent multi-version browser cache.** Browser binaries download on demand when a profile starts, default to the Manager data directory, can use an external `CLOAKBROWSER_CACHE_DIR` mount, and can be inspected or cleaned from the gear panel.
+
+### Changed
+- **Reset and Delete moved out of the profile header.** They now live with Clear browser data in a collapsed, red **Destructive Operations** block at the end of the profile form, where each action asks for a second, confirming click. Reset is labelled **Reset identity** to say what it does: new fingerprint and wiped site data, with settings, bookmarks and default search kept.
+- **Removed global browser licensing.** `CLOAKBROWSER_LICENSE_KEY` and `CLOAKBROWSER_RELEASE_CHANNEL` are no longer runtime settings, and the Settings key field is replaced by the browser cache view. Existing values migrate once to existing profiles. A profile without its own key runs keyless instead of falling back to a shared key.
+
+### Fixed
+- **Linux Docker font identity now matches the Windows persona more closely.** The image includes the recommended emoji and CJK baseline fonts, replaces the incomplete XP-era core-font download with a private licensed-font mount, refreshes that mount at startup, and enables CloakBrowser's Windows font-metrics profile for Linux sessions.
+
 ## [0.2.1] - 2026-11-08
 
 ### Added

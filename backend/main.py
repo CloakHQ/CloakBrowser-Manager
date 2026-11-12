@@ -34,12 +34,23 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .env_file import load_env_file
 
-# Populate os.environ from the manager-root .env before anything reads it
-# (database.resolve_runtime, AUTH_TOKEN, the license config below).
+# Load the legacy deployment settings once, then remove them before importing
+# cloakbrowser. Explicit per-profile arguments must be the only license source.
 load_env_file()
+_LEGACY_ENV_LICENSE_KEY = os.environ.pop("CLOAKBROWSER_LICENSE_KEY", None)
+_LEGACY_ENV_RELEASE_CHANNEL = os.environ.pop("CLOAKBROWSER_RELEASE_CHANNEL", None)
+os.environ.pop("CLOAKBROWSER_VERSION", None)
+os.environ.pop("CLOAKBROWSER_BINARY_PATH", None)
 
 from . import artifacts
 from . import database as db
+from . import extensions
+
+# Persist downloaded binaries with Manager data unless an external cache mount
+# was explicitly configured.
+if not os.environ.get("CLOAKBROWSER_CACHE_DIR"):
+    os.environ["CLOAKBROWSER_CACHE_DIR"] = str(db.DATA_DIR / "binaries")
+
 from cloakbrowser.license import CloakBrowserLicenseError
 
 from .browser_manager import (
@@ -52,7 +63,14 @@ from .browser_manager import (
 )
 from .models import (
     ArtifactResponse,
+    BrowserBinaryListResponse,
+    BrowserCleanupResponse,
+    BrowserDownloadResponse,
     ClipboardRequest,
+    ExtensionCreateRequest,
+    ExtensionResponse,
+    ExtensionUpdateRequest,
+    ExtensionUpdateResponse,
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
@@ -64,13 +82,17 @@ from .models import (
     ProxyTestResponse,
     ReorderRequest,
     RuntimeConfigResponse,
-    SettingsResponse,
-    SettingsUpdate,
     StatusResponse,
     TagResponse,
     UpdateCheckResponse,
 )
 from .runtime import bundle_dir
+from .binary_cache import (
+    assert_no_global_license_file,
+    cache_dir as browser_cache_dir,
+    cleanup_unused_binaries,
+    list_installed_binaries,
+)
 from .settings_store import load_settings, save_settings
 
 logger = logging.getLogger("cloakbrowser.manager")
@@ -119,23 +141,14 @@ AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 DEFAULT_SIDEBAR_WIDTH = "16rem"
 _SIDEBAR_WIDTH_RE = re.compile(r"^\d+(?:\.\d+)?(?:px|rem|em|vw)$")
 
-# App-wide CloakBrowser Pro license. One key per Manager instance — the
-# concurrency-seat pool is per-license, so every launched profile shares it.
-# Release channel picks Stable vs Preview builds.
-#
-# Precedence: environment (incl. values load_env_file pulled from a .env) wins,
-# then the in-app Settings (settings.json). Native users have no .env and set
-# the key in the Settings UI; Docker/CI keep overriding via env vars.
 _STORED_SETTINGS = load_settings()
-
-
-def _resolve_setting(env_key: str, settings_key: str) -> str | None:
-    return os.environ.get(env_key) or _STORED_SETTINGS.get(settings_key) or None
-
-
-LICENSE_KEY: str | None = _resolve_setting("CLOAKBROWSER_LICENSE_KEY", "license_key")
-RELEASE_CHANNEL: str | None = _resolve_setting(
-    "CLOAKBROWSER_RELEASE_CHANNEL", "release_channel"
+_LEGACY_LICENSE_KEY = (
+    _LEGACY_ENV_LICENSE_KEY or _STORED_SETTINGS.get("license_key") or None
+)
+_LEGACY_RELEASE_CHANNEL = (
+    _LEGACY_ENV_RELEASE_CHANNEL
+    or _STORED_SETTINGS.get("release_channel")
+    or "stable"
 )
 
 # Paths that bypass authentication even when AUTH_TOKEN is set
@@ -294,7 +307,7 @@ class AuthMiddleware:
 
 
 # Singleton browser manager
-browser_mgr = BrowserManager(license_key=LICENSE_KEY, release_channel=RELEASE_CHANNEL)
+browser_mgr = BrowserManager()
 
 # Frontend build directory (React production build). bundle_dir() resolves to
 # the PyInstaller extraction root when frozen, else the manager repo root.
@@ -517,10 +530,26 @@ async def lifespan(app: FastAPI):
     for profile_id in db.profile_ids_with_artifacts():
         artifacts.sync_picker_view(profile_id, refresh_bookmarks=False)
     artifacts.refresh_picker_bookmarks()
+    # Same repair for the extension library: half-written staging trees and version
+    # folders no row references (nothing is running yet, so none is in use).
+    try:
+        removed = extensions.reclaim()
+    except OSError as exc:
+        logger.warning("Could not clean up the extension library: %s", exc)
+    else:
+        if removed:
+            logger.info("Removed %d stale extension library path(s)", removed)
+    migrated = db.migrate_legacy_browser_settings(
+        _LEGACY_LICENSE_KEY,
+        _LEGACY_RELEASE_CHANNEL,
+    )
+    migrated_settings = dict(_STORED_SETTINGS)
+    migrated_settings.pop("license_key", None)
+    migrated_settings.pop("release_channel", None)
+    if migrated_settings != _STORED_SETTINGS:
+        save_settings(migrated_settings)
+    assert_no_global_license_file()
     await browser_mgr.cleanup_stale()
-    # Resolve tier + pre-download the (Pro) binary before serving launches, so the
-    # download never blocks a launch or auto-launch's 60s timeout.
-    await asyncio.to_thread(browser_mgr.resolve_binary_status)
     diagnostics.install_asyncio_handler(asyncio.get_running_loop(), logger)
     logger.info(diagnostics.startup_line(browser_mgr))
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
@@ -589,7 +618,11 @@ async def auth_logout(request: Request, response: Response):
 
 
 def _profile_response(profile: dict) -> ProfileResponse:
+    license_key = profile.get("license_key")
     payload = {**profile, **browser_mgr.get_status(profile["id"])}
+    payload.pop("license_key", None)
+    payload["license_key_set"] = bool(license_key)
+    payload["license_key_masked"] = _mask_key(license_key)
     payload["tags"] = [TagResponse(**tag) for tag in profile.get("tags", [])]
     return ProfileResponse(**payload)
 
@@ -616,6 +649,7 @@ async def create_profile(req: ProfileCreate):
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
     else:
         data["tags"] = []
+    _require_extensions(data.get("extension_ids"))
     return _profile_response(db.create_profile(**data))
 
 
@@ -640,6 +674,8 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     tags = data.pop("tags", None)
     if tags is not None:
         data["tags"] = [t.model_dump() if hasattr(t, "model_dump") else t for t in tags]
+    if "extension_ids" in data:
+        _require_extensions(data["extension_ids"])
     profile = db.update_profile(profile_id, **data)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -738,6 +774,37 @@ async def reset_profile(profile_id: str):
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to reset profile")
     return _profile_response(updated)
+
+
+@app.post("/api/profiles/{profile_id}/clear-data", response_model=ProfileResponse)
+async def clear_profile_data(profile_id: str):
+    """Delete the profile's whole browser data directory; keep its Manager settings.
+
+    Unlike reset, nothing inside the directory survives (bookmarks, preferences,
+    search-engine setup, preview) and the fingerprint seed is unchanged. Uploaded
+    and downloaded files live outside it and are kept. The next launch starts
+    from an empty directory and redoes the one-time setup.
+    """
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    if profile_id in browser_mgr.running:
+        await browser_mgr.stop(profile_id)
+
+    user_data_dir = Path(profile["user_data_dir"])
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            if user_data_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, user_data_dir)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        logger.error("Failed to clear data of profile %s: %s", profile_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Browser data was only partly removed; try again"
+        ) from exc
+    return _profile_response(db.get_profile(profile_id))
 
 
 # Never travels with a copy: Chromium's single-instance lock (SingletonLock is
@@ -1006,6 +1073,193 @@ async def delete_profile_file(profile_id: str, artifact_id: str):
     return {"ok": True}
 
 
+# ── Extension library ─────────────────────────────────────────────────────────
+
+
+def _require_extensions(extension_ids: list[str] | None) -> None:
+    """Refuse a profile that attaches an id the library does not have."""
+    unknown = [
+        extension_id
+        for extension_id in (extension_ids or [])
+        if db.get_extension(extension_id) is None
+    ]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown extension(s): " + ", ".join(sorted(set(unknown))),
+        )
+
+
+def _extension_error(exc: extensions.ExtensionError) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=str(exc))
+
+
+def _extension_response(
+    row: dict, usage: dict[str, list[str]] | None = None
+) -> ExtensionResponse:
+    usage = db.extension_usage() if usage is None else usage
+    return ExtensionResponse(
+        id=row["id"],
+        name=row["name"],
+        description=row.get("description"),
+        version=row["version"],
+        previous_version=row.get("previous_version"),
+        manifest_version=row["manifest_version"],
+        source_kind=row["source_kind"],
+        source_url=row.get("source_url"),
+        webstore_id=row.get("webstore_id"),
+        icon_url=(
+            f"/api/extensions/{row['id']}/icon"
+            if extensions.icon_path(row) is not None
+            else None
+        ),
+        profile_count=len(usage.get(row["id"], [])),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _require_extension(extension_id: str) -> dict:
+    row = db.get_extension(extension_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    return row
+
+
+@app.get("/api/extensions", response_model=list[ExtensionResponse])
+async def list_extensions():
+    """Every library extension, by name."""
+    usage = db.extension_usage()
+    return [_extension_response(row, usage) for row in db.list_extensions()]
+
+
+@app.post("/api/extensions", response_model=ExtensionResponse, status_code=201)
+async def add_extension(req: ExtensionCreateRequest):
+    """Add an extension from a Web Store link/ID or a CRX/ZIP URL."""
+    try:
+        row, _ = await asyncio.to_thread(
+            extensions.import_source,
+            req.source,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    except OSError as exc:
+        logger.exception("Failed to install extension from %s", req.source)
+        raise HTTPException(status_code=500, detail=f"Failed to install extension: {exc}") from exc
+    return _extension_response(row)
+
+
+@app.post("/api/extensions/upload", response_model=ExtensionResponse, status_code=201)
+async def upload_extension(request: Request, extension_id: str | None = None):
+    """Store the raw request body as an extension, or as a new version of one.
+
+    ``X-File-Name`` carries the file name (URL-encoded), like the profile file upload.
+    ``?extension_id=<id>`` updates that entry; without it a new entry is created.
+    """
+    encoded_name = request.headers.get("x-file-name")
+    if encoded_name is None:
+        raise HTTPException(
+            status_code=400, detail="X-File-Name header (the URL-encoded file name) is required"
+        )
+    name = unquote_to_bytes(encoded_name.encode("latin-1")).decode("utf-8", "replace")
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="X-File-Name must name the file")
+    stop_sending = {"Connection": "close"}  # a refusal before the body is read must end it
+    declared = _content_length(request)
+    if declared is not None and declared > extensions.MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"upload exceeds {extensions.MAX_ARCHIVE_BYTES} bytes",
+            headers=stop_sending,
+        )
+    if extension_id is not None:
+        if db.get_extension(extension_id) is None:
+            raise HTTPException(
+                status_code=404, detail="Extension not found", headers=stop_sending
+            )
+    try:
+        archive = await extensions.save_upload(request.stream())
+    except extensions.ExtensionError as exc:
+        raise HTTPException(
+            status_code=exc.status, detail=str(exc), headers=stop_sending
+        ) from exc
+    except ClientDisconnect as exc:
+        raise HTTPException(status_code=400, detail="client disconnected during upload") from exc
+    try:
+        row, _ = await asyncio.to_thread(
+            extensions.install_upload,
+            archive,
+            extension_id=extension_id,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    except OSError as exc:
+        logger.exception("Failed to install uploaded extension %s", name)
+        raise HTTPException(status_code=500, detail=f"Failed to install extension: {exc}") from exc
+    payload = _extension_response(row)
+    if extension_id is not None:
+        # A new version of an existing entry: the resource existed before this call, and
+        # FastAPI only honours the route's 201 for a returned model.
+        return JSONResponse(status_code=200, content=payload.model_dump())
+    return payload
+
+
+@app.post("/api/extensions/{extension_id}/update", response_model=ExtensionUpdateResponse)
+async def update_extension(extension_id: str, req: ExtensionUpdateRequest | None = None):
+    """Re-download an entry from its stored source, or from a new one."""
+    row = _require_extension(extension_id)
+    source = req.source if req is not None else None
+    try:
+        source = source if source and source.strip() else extensions.stored_source(row)
+        row, updated = await asyncio.to_thread(
+            extensions.import_source,
+            source,
+            extension_id=extension_id,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    except OSError as exc:
+        logger.exception("Failed to update extension %s", extension_id)
+        raise HTTPException(status_code=500, detail=f"Failed to update extension: {exc}") from exc
+    return ExtensionUpdateResponse(extension=_extension_response(row), updated=updated)
+
+
+@app.post("/api/extensions/{extension_id}/rollback", response_model=ExtensionResponse)
+async def rollback_extension(extension_id: str):
+    """Go back to the previous version folder."""
+    try:
+        row = await asyncio.to_thread(
+            extensions.rollback,
+            extension_id,
+            in_use=browser_mgr.extension_dirs_in_use(),
+        )
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    return _extension_response(row)
+
+
+@app.delete("/api/extensions/{extension_id}")
+async def delete_extension(extension_id: str):
+    """Remove an entry and its files. Refused while any profile attaches it."""
+    try:
+        await asyncio.to_thread(extensions.delete, extension_id)
+    except extensions.ExtensionError as exc:
+        raise _extension_error(exc) from exc
+    return {"ok": True}
+
+
+@app.get("/api/extensions/{extension_id}/icon")
+async def extension_icon(extension_id: str):
+    """Serve the entry's icon from its current version folder."""
+    path = extensions.icon_path(_require_extension(extension_id))
+    if path is None:
+        raise HTTPException(status_code=404, detail="This extension has no icon")
+    return FileResponse(path)
+
+
 # ── Launch / Stop ─────────────────────────────────────────────────────────────
 
 
@@ -1098,17 +1352,19 @@ def _windows_font_health() -> tuple[int | None, int | None, bool | None]:
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
-    # Resolved at startup; empty until then, and with no key (no build to report).
-    binary_version = browser_mgr.binary_version or ""
-
     profiles = db.list_profiles()
+    installed = await asyncio.to_thread(
+        list_installed_binaries,
+        profiles,
+        list(browser_mgr.running.values()),
+    )
     fonts_present, fonts_required, fonts_complete = await asyncio.to_thread(
         _windows_font_health
     )
     return StatusResponse(
         running_count=len(browser_mgr.running),
-        binary_version=binary_version,
-        license_tier=browser_mgr.license_tier,
+        installed_binary_count=len(installed),
+        binary_cache_dir=str(browser_cache_dir()),
         profiles_total=len(profiles),
         host_os=browser_mgr.runtime.host_os,
         runtime_mode=browser_mgr.runtime.runtime_mode,
@@ -1218,12 +1474,6 @@ def _mask_key(key: str | None) -> str | None:
     return f"{key[:5]}…{key[-4:]}"
 
 
-def _settings_response() -> SettingsResponse:
-    return SettingsResponse(
-        license_key_set=bool(browser_mgr.license_key),
-        license_key_masked=_mask_key(browser_mgr.license_key),
-        release_channel=(browser_mgr.release_channel or "stable"),
-    )
 
 
 @app.post("/api/shutdown")
@@ -1257,43 +1507,67 @@ async def shutdown_manager(request: Request):
     return {"ok": True, "message": "CloakBrowser Manager is shutting down"}
 
 
-@app.get("/api/settings", response_model=SettingsResponse)
-async def get_settings():
-    return _settings_response()
+@app.get("/api/browsers", response_model=BrowserBinaryListResponse)
+async def list_browsers():
+    profiles = db.list_profiles()
+    async with browser_mgr._binary_lock:
+        binaries = await asyncio.to_thread(
+            list_installed_binaries,
+            profiles,
+            list(browser_mgr.running.values()),
+        )
+    return BrowserBinaryListResponse(
+        cache_dir=str(browser_cache_dir()),
+        binaries=binaries,
+    )
 
 
-@app.put("/api/settings", response_model=StatusResponse)
-async def update_settings(payload: SettingsUpdate):
-    """Persist license key / release channel and hot-apply without a restart.
+@app.delete("/api/browsers/unused", response_model=BrowserCleanupResponse)
+async def cleanup_browsers():
+    profiles = db.list_profiles()
+    async with browser_mgr._binary_lock:
+        removed, reclaimed = await asyncio.to_thread(
+            cleanup_unused_binaries,
+            profiles,
+            list(browser_mgr.running.values()),
+        )
+    return BrowserCleanupResponse(removed=removed, reclaimed_bytes=reclaimed)
 
-    Returns the refreshed system status (tier + resolved binary version) so the
-    top-bar badge updates immediately. Re-resolving may download the Pro build,
-    so it runs off the event loop; the request completes when it's ready.
-    """
-    stored = load_settings()
 
-    if payload.license_key is not None:
-        key = payload.license_key.strip()
-        if key:
-            stored["license_key"] = key
-            browser_mgr.license_key = key
-        else:  # empty string = clear the key
-            stored.pop("license_key", None)
-            browser_mgr.license_key = None
+@app.post(
+    "/api/profiles/{profile_id}/browser/download",
+    response_model=BrowserDownloadResponse,
+)
+async def download_profile_browser(profile_id: str):
+    profile = db.get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if browser_mgr.is_active(profile_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the profile before updating its browser binary",
+        )
+    try:
+        prepared = await browser_mgr.prepare_binary(profile)
+    except CloakBrowserLicenseError as exc:
+        raise HTTPException(status_code=403, detail=license_error_detail(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error(
+            "Failed to prepare browser for profile %s: %s",
+            profile_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=502, detail="Failed to download browser binary")
+    return BrowserDownloadResponse(
+        version=prepared.version,
+        tier=prepared.tier,
+        binary_path=prepared.binary_path,
+    )
 
-    if payload.release_channel is not None:
-        channel = payload.release_channel.strip().lower()
-        if channel not in {"stable", "preview"}:
-            raise HTTPException(
-                status_code=400,
-                detail="release_channel must be 'stable' or 'preview'",
-            )
-        stored["release_channel"] = channel
-        browser_mgr.release_channel = channel
 
-    save_settings(stored)
-    await asyncio.to_thread(browser_mgr.resolve_binary_status)
-    return await get_system_status()
 
 
 # ── Clipboard Relay ──────────────────────────────────────────────────────────

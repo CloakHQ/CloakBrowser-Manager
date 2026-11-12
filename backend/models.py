@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from .runtime import HostOS, RuntimeMode, ViewerMode
+from .binary_cache import normalize_version
+
+# Chromium Memory Saver: "off", or how eagerly background tabs are discarded
+# (6 h / 4 h / 2 h hidden in Chromium 145).
+MemorySaver = Literal["off", "conservative", "medium", "aggressive"]
 
 
 class ProfileCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    license_key: str | None = None
+    release_channel: Literal["stable", "preview"] = "stable"
+    browser_version: str | None = None
     fingerprint_seed: int | None = None
     proxy: str | None = None
     timezone: str | None = None
@@ -28,20 +36,38 @@ class ProfileCreate(BaseModel):
     color_scheme: Literal["light", "dark", "no-preference"] | None = None
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
+    extension_ids: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    memory_saver: MemorySaver = "off"
     transparent_proxy: bool = False
     portable_cookies: bool = False
     notes: str | None = None
     tags: list[TagCreate] | None = None
+    @field_validator("license_key", mode="before")
+    @classmethod
+    def normalize_optional_license_key(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("browser_version", mode="before")
+    @classmethod
+    def validate_browser_version(cls, value: object) -> object:
+        return normalize_version(value)
+
 
 
 class ProfileUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
+    license_key: str | None = Field(default=None)
+    release_channel: Literal["stable", "preview"] | None = None
+    browser_version: str | None = Field(default=None)
     fingerprint_seed: int | None = None
     proxy: str | None = Field(default=None)
     timezone: str | None = Field(default=None)
@@ -57,20 +83,42 @@ class ProfileUpdate(BaseModel):
     color_scheme: Literal["light", "dark", "no-preference"] | None = Field(default=None)
     launch_args: list[str] | None = None
     extension_paths: list[str] | None = None
+    extension_ids: list[str] | None = None
     allow_3p_cookies: bool | None = None
     set_google_default: bool | None = None
     capture_preview: bool | None = None
     restore_session: bool | None = None
+    memory_saver: MemorySaver | None = None
     transparent_proxy: bool | None = None
     portable_cookies: bool | None = None
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
-
-    @field_validator("gpu_family", mode="before")
+    @field_validator("license_key", mode="before")
     @classmethod
-    def reject_null_gpu_family(cls, value: object) -> object:
+    def normalize_optional_license_update(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("browser_version", mode="before")
+    @classmethod
+    def validate_browser_version_update(cls, value: object) -> object:
+        return normalize_version(value)
+
+    @field_validator("release_channel", mode="before")
+    @classmethod
+    def reject_null_release_channel(cls, value: object) -> object:
         if value is None:
-            raise ValueError("gpu_family cannot be null")
+            raise ValueError("release_channel cannot be null")
+        return value
+
+
+    @field_validator("gpu_family", "memory_saver", mode="before")
+    @classmethod
+    def reject_null_choice(cls, value: object, info: ValidationInfo) -> object:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be null")
         return value
 
 
@@ -115,6 +163,10 @@ class ReorderRequest(BaseModel):
 class ProfileResponse(BaseModel):
     id: str
     name: str
+    license_key_set: bool = False
+    license_key_masked: str | None = None
+    release_channel: Literal["stable", "preview"] = "stable"
+    browser_version: str | None = None
     fingerprint_seed: int
     proxy: str | None = None
     timezone: str | None = None
@@ -136,10 +188,12 @@ class ProfileResponse(BaseModel):
     color_scheme: str | None = None
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
+    extension_ids: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
     set_google_default: bool = True
     capture_preview: bool = True
     restore_session: bool = True
+    memory_saver: MemorySaver = "off"
     transparent_proxy: bool = False
     portable_cookies: bool = False
     notes: str | None = None
@@ -170,8 +224,8 @@ class LaunchResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     running_count: int
-    binary_version: str
-    license_tier: str = "none"
+    installed_binary_count: int
+    binary_cache_dir: str
     profiles_total: int
     host_os: HostOS
     runtime_mode: RuntimeMode
@@ -192,16 +246,30 @@ class RuntimeConfigResponse(BaseModel):
     sidebar_width: str
 
 
-class SettingsResponse(BaseModel):
-    license_key_set: bool
-    license_key_masked: str | None = None
-    release_channel: str = "stable"
+class BrowserBinaryResponse(BaseModel):
+    version: str
+    tier: Literal["licensed", "keyless"]
+    path: str
+    size_bytes: int
+    profile_count: int = 0
+    running_count: int = 0
+    in_use: bool = False
 
 
-class SettingsUpdate(BaseModel):
-    # None = leave unchanged; "" = clear the license key.
-    license_key: str | None = None
-    release_channel: str | None = None
+class BrowserBinaryListResponse(BaseModel):
+    cache_dir: str
+    binaries: list[BrowserBinaryResponse] = Field(default_factory=list)
+
+
+class BrowserDownloadResponse(BaseModel):
+    version: str | None = None
+    tier: Literal["licensed", "keyless"]
+    binary_path: str
+
+
+class BrowserCleanupResponse(BaseModel):
+    removed: list[BrowserBinaryResponse] = Field(default_factory=list)
+    reclaimed_bytes: int = 0
 
 
 class ProfileStatusResponse(BaseModel):
@@ -234,3 +302,38 @@ class ProxyTestResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     token: str
+
+
+class ExtensionResponse(BaseModel):
+    """One entry of the global extension library."""
+
+    id: str
+    name: str
+    description: str | None = None
+    version: str
+    previous_version: str | None = None
+    manifest_version: int
+    source_kind: Literal["webstore", "crx", "zip", "upload"]
+    source_url: str | None = None
+    webstore_id: str | None = None
+    # "/api/extensions/{id}/icon" when the current version carries an icon.
+    icon_url: str | None = None
+    profile_count: int = 0
+    created_at: str
+    updated_at: str
+
+
+class ExtensionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source: str = Field(min_length=1, max_length=2048)
+
+
+class ExtensionUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # None re-downloads the stored source (an upload has none: pick a file instead).
+    source: str | None = Field(default=None, max_length=2048)
+
+
+class ExtensionUpdateResponse(BaseModel):
+    extension: ExtensionResponse
+    updated: bool
