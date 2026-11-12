@@ -128,6 +128,7 @@ CloakBrowser Manager runs on your own machine, and every profile inherits the Cl
 - **Humanized interaction** — optional human-like mouse, keyboard, and scrolling behavior
 - **Compatibility controls** — unpacked extensions, third-party-cookie support, and advanced Chromium arguments
 - **Clipboard sync** — copy and paste between the Manager and Linux VNC browser profiles
+- **Profile details while connected** — the sliders icon next to *Connected* in the Linux VNC viewer shows the running profile's settings read-only; **Back to browser** (or clicking the profile in the sidebar) returns to the same VNC session without reconnecting
 - **System status** — see the number and location of cached browser versions and Windows font health in the top bar
 - **Optional authentication** — protect the web UI and API with a single token, or run locally without authentication
 - **Powered by CloakBrowser** — the identities don't just look different, they hold up: a source-level C++ patched Chromium engine tested against Cloudflare Turnstile, reCAPTCHA v3, FingerprintJS, and BrowserScan

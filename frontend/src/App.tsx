@@ -15,7 +15,8 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { LoginPage } from "./components/LoginPage";
 
 type AuthState = "checking" | "required" | "ok" | "error";
-type View = "empty" | "create" | "edit" | "view";
+// "details" browses a running VNC profile read-only while its viewer stays mounted (hidden).
+type View = "empty" | "create" | "edit" | "view" | "details";
 
 const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
   sidebar_width: "16rem",
@@ -423,18 +424,34 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             />
           )}
 
-          {view === "view" && selected && selected.status === "running" && (
+          {(view === "view" || view === "details") && selected && selected.status === "running" && (
             selected.viewer_mode === "vnc" ? (
-              <ProfileViewer
-                key={selected.id}
-                profileId={selected.id}
-                profileName={selected.name}
-                cdpUrl={selected.cdp_url}
-                clipboardSync={selected.clipboard_sync}
-                onClipboardSyncChange={handleClipboardSyncChange}
-                onDisconnect={handleVncDisconnect}
-              />
-            ) : (
+              <>
+                {/* Hidden, not unmounted: unmounting would drop the VNC connection. */}
+                <div className={view === "view" ? "h-full" : "hidden"}>
+                  <ProfileViewer
+                    key={selected.id}
+                    profileId={selected.id}
+                    profileName={selected.name}
+                    cdpUrl={selected.cdp_url}
+                    clipboardSync={selected.clipboard_sync}
+                    onClipboardSyncChange={handleClipboardSyncChange}
+                    onDisconnect={handleVncDisconnect}
+                    onShowDetails={() => setView("details")}
+                  />
+                </div>
+                {view === "details" && (
+                  <ProfileForm
+                    readOnly
+                    profile={selected}
+                    hostOs={systemStatus?.host_os ?? null}
+                    viewerMode={systemStatus?.viewer_mode ?? null}
+                    onSave={handleUpdate}
+                    onCancel={() => setView("view")}
+                  />
+                )}
+              </>
+            ) : view === "view" && (
               <NativeWindowStatus
                 key={selected.id}
                 profileId={selected.id}

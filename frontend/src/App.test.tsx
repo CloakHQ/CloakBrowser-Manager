@@ -1,8 +1,29 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { api } from "./lib/api";
 import { useProfiles } from "./hooks/useProfiles";
+import type { Profile } from "./lib/api";
+
+const { rfbCreated, rfbDisconnect } = vi.hoisted(() => ({
+  rfbCreated: vi.fn(),
+  rfbDisconnect: vi.fn(),
+}));
+
+vi.mock("@novnc/novnc", () => ({
+  default: class extends EventTarget {
+    disconnect = rfbDisconnect;
+    constructor() {
+      super();
+      rfbCreated();
+    }
+  },
+}));
+
+vi.mock("./components/ProfileFiles", () => ({
+  ProfileFilesButton: () => null,
+  useProfileFiles: () => ({ files: [], transfers: [], uploading: false, error: null }),
+}));
 
 vi.mock("./lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/api")>();
@@ -63,5 +84,43 @@ describe("App", () => {
 
     await waitFor(() => expect(mockApi.getConfig).toHaveBeenCalled());
     await waitFor(() => expect(sidebar.getAttribute("style")).toContain("width: 20rem"));
+  });
+});
+
+describe("running VNC profile details", () => {
+  it("opens read-only details and returns without dropping the VNC session", async () => {
+    const running = {
+      id: "p1",
+      name: "Work",
+      status: "running",
+      viewer_mode: "vnc",
+      cdp_url: null,
+      clipboard_sync: false,
+      fingerprint_seed: 42,
+      license_key_set: false,
+      license_key_masked: null,
+      release_channel: "stable",
+      browser_version: null,
+      screen_width: 1920,
+      screen_height: 1080,
+      launch_args: [],
+      extension_paths: [],
+      tags: [],
+    } as unknown as Profile;
+    mockUseProfiles.mockReturnValue({ ...mockUseProfiles(), profiles: [running] });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText("Work"));
+    await waitFor(() => expect(rfbCreated).toHaveBeenCalledOnce());
+
+    fireEvent.click(screen.getByLabelText("Profile details"));
+    const back = await screen.findByRole("button", { name: "Back to browser" });
+    expect(screen.getByDisplayValue("42").matches(":disabled")).toBe(true);
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+
+    fireEvent.click(back);
+    expect(screen.queryByText("Profile Details")).toBeNull();
+    expect(rfbDisconnect).not.toHaveBeenCalled();
+    expect(rfbCreated).toHaveBeenCalledOnce();
   });
 });

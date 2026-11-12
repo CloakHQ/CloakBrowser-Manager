@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Copy, Loader2, Save, X } from "lucide-react";
+import { Check, ChevronDown, Copy, Loader2, Lock, Monitor, Save, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import { DangerZone } from "./DangerZone";
@@ -22,6 +22,8 @@ interface ProfileFormProps {
   onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
   onBrowserPrepared?: () => void;
   onCancel: () => void;
+  // Browse a running profile's settings without changing them; onCancel returns to the browser.
+  readOnly?: boolean;
 }
 
 const RESOLUTION_PRESETS: Record<string, { width: number; height: number }> = {
@@ -44,7 +46,7 @@ const TAG_COLORS = [
   "#ec4899", // pink
 ];
 
-export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onClearData, onDuplicate, onBrowserPrepared, onCancel }: ProfileFormProps) {
+export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onReset, onClearData, onDuplicate, onBrowserPrepared, onCancel, readOnly = false }: ProfileFormProps) {
   const isEdit = profile !== null;
 
   const [form, setForm] = useState<ProfileCreateData>({
@@ -273,12 +275,20 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
 
   return (
     <form onSubmit={handleSubmit} className="p-6 max-w-3xl mx-auto">
-      <div className="flex items-center justify-between mb-6">
+      <div
+        className={`flex items-center justify-between mb-6 ${readOnly ? "sticky top-0 z-10 -mx-6 -mt-6 px-6 py-3 bg-surface-0 border-b border-border" : ""}`}
+      >
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">
-            {isEdit ? "Edit Profile" : "New Profile"}
+            {readOnly ? "Profile Details" : isEdit ? "Edit Profile" : "New Profile"}
           </h2>
-          {isEdit && onDuplicate && (
+          {readOnly && (
+            <span className="flex items-center gap-1 rounded bg-surface-3 px-1.5 py-0.5 text-xs text-gray-400">
+              <Lock className="h-3 w-3" />
+              Read-only while running
+            </span>
+          )}
+          {isEdit && onDuplicate && !readOnly && (
             <div ref={duplicateMenuRef} className="relative flex items-stretch">
               <button
                 type="button"
@@ -335,18 +345,26 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             </div>
           )}
         </div>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={onCancel} className="btn-secondary">
-            Cancel
+        {readOnly ? (
+          <button type="button" onClick={onCancel} className="btn-primary flex items-center gap-1.5">
+            <Monitor className="h-3.5 w-3.5" />
+            <span>Back to browser</span>
           </button>
-          <button type="submit" disabled={saving || saved} className="btn-primary flex items-center gap-1.5">
-            {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
-            <span>{saved ? "Saved" : saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
-          </button>
-        </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={onCancel} className="btn-secondary">
+              Cancel
+            </button>
+            <button type="submit" disabled={saving || saved} className="btn-primary flex items-center gap-1.5">
+              {saved ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
+              <span>{saved ? "Saved" : saving ? "Saving..." : isEdit ? "Save" : "Create"}</span>
+            </button>
+          </div>
+        )}
       </div>
 
-      <div className="space-y-5">
+      {/* A disabled fieldset turns every control inside read-only at once. */}
+      <fieldset disabled={readOnly} className="min-w-0 space-y-5">
         {/* Last preview — the last frame captured before the browser stopped */}
         {isEdit && !previewError && (
           <section>
@@ -384,6 +402,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   onChange={(e) => set("fingerprint_seed", e.target.value ? Number(e.target.value) : null)}
                   placeholder="Auto (random)"
                 />
+                {!readOnly && (
                 <button
                   type="button"
                   onClick={randomizeSeed}
@@ -415,6 +434,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                     <circle cx="24" cy="20" r="0.9" fill="currentColor" opacity="0.5" />
                   </svg>
                 </button>
+                )}
               </div>
             </div>
           </div>
@@ -490,7 +510,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               Leave empty for automatic selection. Exact pins work for paid keys and for keyless profiles (any signed public build); free keys always use the latest build.
             </p>
 
-            {isEdit && (
+            {isEdit && !readOnly && (
               <div className="flex items-center gap-3">
                 <button
                   type="button"
@@ -819,17 +839,22 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   style={t.color ? { backgroundColor: `${t.color}20`, color: t.color } : undefined}
                 >
                   {t.tag}
-                  <button
-                    type="button"
-                    onClick={() => removeTag(t.tag)}
-                    className="hover:opacity-70"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
+                  {!readOnly && (
+                    <button
+                      type="button"
+                      onClick={() => removeTag(t.tag)}
+                      className="hover:opacity-70"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </span>
               ))}
             </div>
           )}
+          {readOnly ? (
+            (form.tags ?? []).length === 0 && <p className="text-xs text-gray-500">None</p>
+          ) : (
           <div className="flex gap-2 items-center">
             <div className="flex gap-1">
               {TAG_COLORS.map((c) => (
@@ -857,6 +882,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               Add
             </button>
           </div>
+          )}
         </section>
 
         {/* Extensions */}
@@ -868,13 +894,18 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               {(form.extension_paths ?? []).map((path, index) => (
                 <div key={`${path}-${index}`} className="flex items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5">
                   <code className="flex-1 truncate text-xs text-gray-300">{path}</code>
-                  <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
-                    <X className="h-3 w-3" />
-                  </button>
+                  {!readOnly && (
+                    <button type="button" onClick={() => removeExtensionPath(index)} className="hover:opacity-70">
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
           )}
+          {readOnly ? (
+            (form.extension_paths ?? []).length === 0 && <p className="text-xs text-gray-500">None</p>
+          ) : (
           <div className="flex gap-2">
             <input
               className="input flex-1 font-mono"
@@ -885,6 +916,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             <button type="button" onClick={addExtensionPath} className="btn-secondary text-xs">Add</button>
           </div>
+          )}
         </section>
 
         {/* Advanced */}
@@ -903,13 +935,18 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                   className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-surface-3 text-gray-300 font-mono"
                 >
                   {arg}
-                  <button type="button" onClick={() => removeLaunchArg(index)} className="hover:opacity-70">
-                    <X className="h-3 w-3" />
-                  </button>
+                  {!readOnly && (
+                    <button type="button" onClick={() => removeLaunchArg(index)} className="hover:opacity-70">
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </span>
               ))}
             </div>
           )}
+          {readOnly ? (
+            (form.launch_args ?? []).length === 0 && <p className="text-xs text-gray-500">None</p>
+          ) : (
           <div className="flex gap-2">
             <input
               className="input flex-1 font-mono"
@@ -920,6 +957,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             />
             <button type="button" onClick={addLaunchArg} className="btn-secondary text-xs">Add</button>
           </div>
+          )}
         </details>
 
         {/* Notes */}
@@ -933,10 +971,10 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
           />
         </section>
 
-        {isEdit && (
+        {isEdit && !readOnly && (
           <DangerZone key={profile!.id} onReset={onReset} onClearData={onClearData} onDelete={onDelete} />
         )}
-      </div>
+      </fieldset>
 
     </form>
   );
