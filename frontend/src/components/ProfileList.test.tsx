@@ -23,7 +23,7 @@ function profile(overrides: Partial<Profile>): Profile {
     launch_args: [],
     extension_paths: [],
     allow_3p_cookies: true,
-    set_google_default: true,
+    search_engine: "google",
     capture_preview: true,
     restore_session: true,
     notes: null,

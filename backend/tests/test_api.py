@@ -934,30 +934,12 @@ def test_reset_profile_wipes_state_but_preserves_config_files(app_client: TestCl
     assert not (default_dir / "Cookies").exists()
     assert not (default_dir / "History").exists()
     assert not cache.exists()
-    # Preserved: config + default search engine (Web Data holds the keyword row,
-    # Secure Preferences the default pointer) + bookmarks
+    # Preserved: config + any search engine chosen in the browser (Web Data holds
+    # keyword rows, Secure Preferences the default pointer) + bookmarks
     assert (default_dir / "Web Data").exists()
     assert (default_dir / "Secure Preferences").exists()
     assert (default_dir / "Bookmarks").exists()
     assert (default_dir / "Preferences").exists()
-
-
-def test_reset_profile_preserves_search_engine_marker(app_client: TestClient):
-    """Reset keeps the search config, so the one-time setup marker must survive
-    (no fragile Google rebuild is triggered on the next launch)."""
-    from backend.browser_manager import SEARCH_ENGINE_MARKER
-
-    create = app_client.post("/api/profiles", json={"name": "ResetMarker"})
-    pid = create.json()["id"]
-    user_data_dir = Path(app_client.get(f"/api/profiles/{pid}").json()["user_data_dir"])
-    (user_data_dir / "Default").mkdir(parents=True, exist_ok=True)
-    marker = user_data_dir / SEARCH_ENGINE_MARKER
-    marker.write_text("google\n")
-
-    resp = app_client.post(f"/api/profiles/{pid}/reset")
-    assert resp.status_code == 200
-    assert marker.exists()
-    assert marker.read_text().strip() == "google"
 
 
 # ── Duplicate ────────────────────────────────────────────────────────────────

@@ -38,7 +38,7 @@ export interface Profile {
   launch_args: string[];
   extension_paths: string[];
   allow_3p_cookies: boolean;
-  set_google_default: boolean;
+  search_engine: "google" | "bing" | "duckduckgo" | "none";
   capture_preview: boolean;
   restore_session: boolean;
   transparent_proxy: boolean;
@@ -49,7 +49,7 @@ export interface Profile {
   updated_at: string;
   sort_order: number;
   tags: { tag: string; color: string | null }[];
-  status: "running" | "stopped" | "initializing";
+  status: "running" | "stopped";
   runtime_mode: RuntimeMode;
   viewer_mode: ViewerMode;
   vnc_ws_port: number | null;
@@ -83,7 +83,7 @@ export interface ProfileCreateData {
   launch_args?: string[];
   extension_paths?: string[];
   allow_3p_cookies?: boolean;
-  set_google_default?: boolean;
+  search_engine?: "google" | "bing" | "duckduckgo" | "none";
   capture_preview?: boolean;
   restore_session?: boolean;
   transparent_proxy?: boolean;

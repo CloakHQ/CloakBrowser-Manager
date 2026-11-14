@@ -4,6 +4,14 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Default search engine is now a per-profile dropdown: Google, Bing, DuckDuckGo or None.** It replaces the "Set Google as the default search engine" checkbox. The browser now ships with Google as its default, so the Manager no longer runs a one-time setup launch to add it. Existing profiles are set to Google. An engine picked in the browser's own settings still takes priority over the dropdown.
+
+### Fixed
+- **No more "Default-search-engine setup failed … Add dialog stayed disabled after fill" warning on launch.** The setup step that logged it has been removed.
+
 ## [0.2.1] - 2026-11-08
 
 ### Added

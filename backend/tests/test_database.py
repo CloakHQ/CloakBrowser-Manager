@@ -71,6 +71,27 @@ def test_init_db_rebuilds_old_schema_preserving_profile_and_tags(tmp_db: Path):
     assert profile["portable_cookies"] == 0
 
 
+def test_init_db_replaces_set_google_default_with_search_engine(tmp_db: Path):
+    with db.get_db() as conn:
+        conn.executescript("""
+            DROP TABLE profile_tags; DROP TABLE profiles;
+            CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, fingerprint_seed INTEGER NOT NULL, set_google_default BOOLEAN DEFAULT 1, user_data_dir TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE profile_tags (profile_id TEXT REFERENCES profiles(id) ON DELETE CASCADE, tag TEXT NOT NULL, color TEXT, PRIMARY KEY(profile_id, tag));
+            INSERT INTO profiles VALUES ('on', 'On', 1, 1, '/data/on', 'c', 'u');
+            INSERT INTO profiles VALUES ('off', 'Off', 2, 0, '/data/off', 'c', 'u');
+            INSERT INTO profile_tags VALUES ('off', 'keep', NULL);
+        """)
+        conn.commit()
+    db.init_db()
+    assert db.get_profile("on")["search_engine"] == "google"
+    off = db.get_profile("off")
+    assert off["search_engine"] == "google"
+    assert off["tags"] == [{"tag": "keep", "color": None}]
+    with db.get_db() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)")}
+    assert "set_google_default" not in columns
+
+
 # ── create_profile ───────────────────────────────────────────────────────────
 
 

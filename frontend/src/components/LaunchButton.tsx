@@ -2,7 +2,7 @@ import { Play, Square, Loader2 } from "lucide-react";
 import { useState } from "react";
 
 interface LaunchButtonProps {
-  status: "running" | "stopped" | "initializing";
+  status: "running" | "stopped";
   onLaunch: () => Promise<void>;
   onStop: () => Promise<void>;
 }
@@ -27,13 +27,8 @@ export function LaunchButton({ status, onLaunch, onStop }: LaunchButtonProps) {
     }
   };
 
-  if (loading || status === "initializing") {
-    const label =
-      status === "initializing"
-        ? "First-time setup..."
-        : status === "running"
-          ? "Stopping..."
-          : "Launching...";
+  if (loading) {
+    const label = status === "running" ? "Stopping..." : "Launching...";
     return (
       <button disabled className="btn-secondary opacity-60 cursor-not-allowed flex items-center gap-1.5">
         <Loader2 className="h-3.5 w-3.5 animate-spin" />

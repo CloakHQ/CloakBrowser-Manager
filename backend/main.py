@@ -678,9 +678,8 @@ async def delete_profile(profile_id: str):
 
 # Browser state wiped on reset (inside the profile's Default/ dir). Bookmarks,
 # Preferences, Secure Preferences and Web Data are deliberately preserved so the
-# profile keeps its default search engine (the Google keyword row lives in Web
-# Data, the default pointer in Secure Preferences) and bookmarks across a reset —
-# no fragile search-engine rebuild is needed.
+# profile keeps any search engine the user chose in the browser (keyword rows live
+# in Web Data, the default pointer in Secure Preferences) and bookmarks across a reset.
 _RESET_STATE_FILES = [
     "Cookies", "Cookies-journal",
     "History", "History-journal", "History Provider Cache",

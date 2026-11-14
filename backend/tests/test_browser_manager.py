@@ -17,7 +17,6 @@ from backend.browser_manager import (
     BrowserManager,
     ProfileBusyError,
     RunningProfile,
-    SEARCH_ENGINE_MARKER,
 )
 from backend.runtime import RuntimeConfig
 
@@ -172,6 +171,22 @@ def test_build_args_gpu_family_and_cookie_compatibility():
     assert not any("gpu-vendor" in arg for arg in _mgr._build_fingerprint_args({"gpu_family": "auto"}))
 
 
+@pytest.mark.parametrize(
+    "engine, expected",
+    [
+        (None, None),
+        ("google", None),
+        ("bing", "--fingerprint-search-engine=bing"),
+        ("duckduckgo", "--fingerprint-search-engine=duckduckgo"),
+        ("none", "--fingerprint-search-engine=none"),
+    ],
+)
+def test_build_args_search_engine(engine, expected):
+    args = _mgr._build_fingerprint_args({"search_engine": engine})
+    flags = [arg for arg in args if arg.startswith("--fingerprint-search-engine")]
+    assert flags == ([expected] if expected else [])
+
+
 def test_build_args_transparent_proxy_and_portable_cookies():
     args = _mgr._build_fingerprint_args({"transparent_proxy": True, "portable_cookies": True})
     assert "--fingerprint-transparent-proxy" in args
@@ -237,9 +252,6 @@ def test_launch_args_none_no_effect():
 def _launch_profile(tmp_path: Path) -> dict:
     user_data_dir = tmp_path / "profile-1"
     user_data_dir.mkdir(parents=True, exist_ok=True)
-    # Skip the one-time default-search-engine setup (unrelated to launch mechanics;
-    # it would otherwise spawn its own real browser launches during these tests).
-    (user_data_dir / SEARCH_ENGINE_MARKER).write_text("google\n")
     return {
         "id": "profile-1",
         "name": "Native",
@@ -373,30 +385,6 @@ async def test_launch_passes_license_config(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled", [True, False])
-async def test_launch_gates_search_engine_on_flag(monkeypatch, tmp_path: Path, enabled: bool):
-    from backend import browser_manager as module
-
-    context = MagicMock(pages=[])
-    context.add_init_script = AsyncMock()
-    manager = BrowserManager(NATIVE_RUNTIME)
-    manager._wait_for_cdp = AsyncMock()
-    manager._ensure_search_engine = AsyncMock()
-    monkeypatch.setattr(
-        module, "launch_persistent_context_async", AsyncMock(return_value=context)
-    )
-
-    profile = _launch_profile(tmp_path)
-    profile["set_google_default"] = enabled
-    await manager.launch(profile)
-
-    if enabled:
-        manager._ensure_search_engine.assert_awaited_once()
-    else:
-        manager._ensure_search_engine.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_launch_retries_failed_cdp_and_closes_first_context(
     monkeypatch,
     tmp_path: Path,
@@ -438,7 +426,6 @@ async def test_failed_launch_stays_active_until_its_context_is_closed(monkeypatc
 
     manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
-    manager._ensure_search_engine = AsyncMock()
     monkeypatch.setattr(manager, "_close_context", blocked_close)
     monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
     profile = _launch_profile(tmp_path)
@@ -585,9 +572,8 @@ def test_init_creates_bookmarks_not_preferences(tmp_path: Path):
     _init_profile_defaults(tmp_path)
     # Bookmarks are seeded here.
     assert (tmp_path / "Default" / "Bookmarks").exists()
-    # The default search engine is NOT set via Preferences (it can't stick — it
-    # lives in MAC-protected Secure Preferences). That is handled once per profile
-    # by BrowserManager._ensure_search_engine, not here.
+    # The default search engine comes from the --fingerprint-search-engine flag,
+    # not from a Preferences file.
     assert not (tmp_path / "Default" / "Preferences").exists()
 
 
@@ -614,7 +600,6 @@ async def test_downloads_are_captured_only_under_docker(monkeypatch, tmp_path: P
     context.add_init_script = AsyncMock()
     manager = BrowserManager(NATIVE_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
-    manager._ensure_search_engine = AsyncMock()
     monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
     watch = AsyncMock()
     monkeypatch.setattr(module.downloads, "watch", watch)
@@ -633,7 +618,6 @@ async def test_downloads_are_captured_under_docker(monkeypatch, tmp_db: Path, tm
     context.add_init_script = AsyncMock()
     manager = BrowserManager(DOCKER_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
-    manager._ensure_search_engine = AsyncMock()
     manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
     manager.vnc.start_vnc = AsyncMock()
     manager.vnc.stop_vnc = AsyncMock()
@@ -660,7 +644,6 @@ async def test_stopping_a_browser_settles_its_pending_downloads(
     context.add_init_script = AsyncMock()
     manager = BrowserManager(DOCKER_RUNTIME)
     manager._wait_for_cdp = AsyncMock()
-    manager._ensure_search_engine = AsyncMock()
     manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
     manager.vnc.start_vnc = AsyncMock()
     manager.vnc.stop_vnc = AsyncMock()

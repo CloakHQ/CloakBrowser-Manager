@@ -29,7 +29,7 @@ class ProfileCreate(BaseModel):
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
-    set_google_default: bool = True
+    search_engine: Literal["google", "bing", "duckduckgo", "none"] = "google"
     capture_preview: bool = True
     restore_session: bool = True
     transparent_proxy: bool = False
@@ -58,7 +58,7 @@ class ProfileUpdate(BaseModel):
     launch_args: list[str] | None = None
     extension_paths: list[str] | None = None
     allow_3p_cookies: bool | None = None
-    set_google_default: bool | None = None
+    search_engine: Literal["google", "bing", "duckduckgo", "none"] | None = None
     capture_preview: bool | None = None
     restore_session: bool | None = None
     transparent_proxy: bool | None = None
@@ -66,11 +66,11 @@ class ProfileUpdate(BaseModel):
     notes: str | None = Field(default=None)
     tags: list[TagCreate] | None = None
 
-    @field_validator("gpu_family", mode="before")
+    @field_validator("gpu_family", "search_engine", mode="before")
     @classmethod
-    def reject_null_gpu_family(cls, value: object) -> object:
+    def reject_null_choice(cls, value: object) -> object:
         if value is None:
-            raise ValueError("gpu_family cannot be null")
+            raise ValueError("value cannot be null")
         return value
 
 
@@ -137,7 +137,7 @@ class ProfileResponse(BaseModel):
     launch_args: list[str] = Field(default_factory=list)
     extension_paths: list[str] = Field(default_factory=list)
     allow_3p_cookies: bool = True
-    set_google_default: bool = True
+    search_engine: Literal["google", "bing", "duckduckgo", "none"] = "google"
     capture_preview: bool = True
     restore_session: bool = True
     transparent_proxy: bool = False

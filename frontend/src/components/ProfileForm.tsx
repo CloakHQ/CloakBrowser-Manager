@@ -54,7 +54,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     clipboard_sync: true,
     auto_launch: false,
     allow_3p_cookies: true,
-    set_google_default: true,
+    search_engine: "google",
     capture_preview: true,
     restore_session: true,
     transparent_proxy: false,
@@ -108,7 +108,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
         auto_launch: profile.auto_launch,
         extension_paths: profile.extension_paths ?? [],
         allow_3p_cookies: profile.allow_3p_cookies,
-        set_google_default: profile.set_google_default,
+        search_engine: profile.search_engine,
         capture_preview: profile.capture_preview,
         restore_session: profile.restore_session,
         transparent_proxy: profile.transparent_proxy,
@@ -708,20 +708,22 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
               </span>
             </span>
           </label>
-          <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer mt-3">
-            <input
-              type="checkbox"
-              checked={form.set_google_default ?? true}
-              onChange={(e) => set("set_google_default", e.target.checked)}
-              className="rounded border-border bg-surface-2 mt-0.5"
-            />
-            <span>
-              Set Google as the default search engine
-              <span className="block text-xs text-gray-500">
-                Adds a few seconds to the profile's first launch (one-time setup).
-              </span>
-            </span>
-          </label>
+          <div className="mt-3">
+            <label className="label">Default search engine</label>
+            <select
+              className="input"
+              value={form.search_engine ?? "google"}
+              onChange={(e) => set("search_engine", e.target.value as "google" | "bing" | "duckduckgo" | "none")}
+            >
+              <option value="google">Google</option>
+              <option value="bing">Bing</option>
+              <option value="duckduckgo">DuckDuckGo</option>
+              <option value="none">None</option>
+            </select>
+            <p className="text-xs text-gray-500 mt-1">
+              The browser's default. An engine you pick in the browser's own settings takes priority.
+            </p>
+          </div>
         </section>
 
         {/* Tags */}
