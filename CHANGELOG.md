@@ -6,11 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-20
+
 ### Changed
 - **Default search engine is now a per-profile dropdown: Google, Bing, DuckDuckGo or None.** It replaces the "Set Google as the default search engine" checkbox. The browser now ships with Google as its default, so the Manager no longer runs a one-time setup launch to add it. Existing profiles are set to Google. An engine picked in the browser's own settings still takes priority over the dropdown.
+- **Upgrades the CloakBrowser engine dependency to 0.7.3 or newer.** It supports Playwright 1.65 and keeps Playwright at the tested version, so a newer Playwright release can no longer break the install.
+- **Updated frontend, Python, and CI dependencies.**
 
 ### Fixed
 - **No more "Default-search-engine setup failed … Add dialog stayed disabled after fill" warning on launch.** The setup step that logged it has been removed.
+- **The live view no longer disconnects at random.** Sessions dropped with "Unsupported encoding" or "Unexpected server message (type 180)", most often on large screen updates or when copying text in the remote browser. Copied CJK text no longer turns into `?`. Thanks to [qjebbs](https://github.com/qjebbs) (#61).
 
 ## [0.2.1] - 2026-11-08
 

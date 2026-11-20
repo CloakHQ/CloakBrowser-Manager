@@ -359,6 +359,7 @@ Contributions are welcome. Please [open an issue](https://github.com/CloakHQ/Clo
 - [shellus](https://github.com/shellus): auth-gated status endpoint and unauthenticated health probe, offline VNC startup, multi-tag profile filters, and configurable sidebar width
 - [hayka-pacha](https://github.com/hayka-pacha) — profile reset endpoint
 - [theaafofficial](https://github.com/theaafofficial) — duplicating a profile with its browser state, and per-profile files with download capture
+- [qjebbs](https://github.com/qjebbs) — live view clipboard and disconnect fixes
 
 ## Links
 
