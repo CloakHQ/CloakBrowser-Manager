@@ -1614,7 +1614,7 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                                     await websocket.send_bytes(rest)
                                 continue
                             if msg[0] == 180:
-                                logger.warning("VNC proxy [v->c]: unparsed type-180 frame len=%d head=%s", len(msg), msg[:48].hex())
+                                logger.debug("VNC proxy [v->c]: unparsed type-180 frame len=%d head=%s", len(msg), msg[:48].hex())
                             await websocket.send_bytes(msg)
                         elif isinstance(msg, bytes):
                             await websocket.send_bytes(msg)
