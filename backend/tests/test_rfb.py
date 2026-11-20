@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import struct
+import zlib
 
 from backend.main import (
     _build_server_cut_text,
     _filter_rfb_client_messages,
-    _parse_kasmvnc_clipboard,
+    _find_embedded_clipboard,
+    _scan_kasmvnc_clipboard,
+    _split_kasmvnc_clipboard,
     _rewrite_pointer_event,
     _rewrite_set_encodings,
     _rfb_msg_length,
@@ -52,90 +55,152 @@ def _make_extension_150() -> bytes:
     return struct.pack(">BBHHHH", 150, 1, 0, 0, 1920, 1080)
 
 
-def _make_kasmvnc_clipboard(mime: str, data: str) -> bytes:
-    """Build a KasmVNC BinaryClipboard message (type 180)."""
-    mime_bytes = mime.encode()
-    data_bytes = data.encode("utf-8")
-    buf = bytearray()
-    buf.append(180)       # type
-    buf.append(0)         # action
-    buf.extend(b'\x00' * 4)  # flags
-    buf.append(len(mime_bytes))  # mime_len (u8)
-    buf.extend(mime_bytes)
-    buf.extend(struct.pack(">I", len(data_bytes)))  # data_len (u32 BE)
-    buf.extend(data_bytes)
+def _make_kasmvnc_clipboard(*entries: tuple[str, str], flags: int = 0) -> bytes:
+    """Build a KasmVNC BinaryClipboard message (type 180).
+
+    Layout: type(1) count(1) then per entry flags(u32) mime_len(u8) mime
+    data_len(u32 BE) data.
+    """
+    buf = bytearray([180, len(entries)])
+    for mime, data in entries:
+        mime_bytes = mime.encode()
+        data_bytes = data.encode("utf-8")
+        buf.extend(struct.pack(">I", flags))
+        buf.append(len(mime_bytes))
+        buf.extend(mime_bytes)
+        buf.extend(struct.pack(">I", len(data_bytes)))
+        buf.extend(data_bytes)
     return bytes(buf)
 
 
-# ── _parse_kasmvnc_clipboard ────────────────────────────────────────────────
+# Real frame captured from KasmVNC 1.3.3 after copying the text "blank".
+_REAL_CLIPBOARD_FRAME = bytes.fromhex(
+    "b402000000000a746578742f706c61696e00000005626c616e6b"
+    "000000010a746578742f706c61696e00000005626c616e6b"
+)
 
 
-def test_parse_clipboard_text_plain():
-    data = _make_kasmvnc_clipboard("text/plain", "hello")
-    assert _parse_kasmvnc_clipboard(data) == "hello"
+# ── _scan_kasmvnc_clipboard ─────────────────────────────────────────────────
 
 
-def test_parse_clipboard_no_text_plain():
-    data = _make_kasmvnc_clipboard("image/png", "binary")
-    assert _parse_kasmvnc_clipboard(data) is None
+def test_scan_every_truncation_of_real_frame_is_partial():
+    for cut in range(2 + 4 + 1 + len("text/plain") + 4, len(_REAL_CLIPBOARD_FRAME)):
+        assert _scan_kasmvnc_clipboard(_REAL_CLIPBOARD_FRAME[:cut])[0] == "partial", cut
+    assert _scan_kasmvnc_clipboard(_REAL_CLIPBOARD_FRAME)[0] == "ok"
 
 
-def test_parse_clipboard_too_short():
-    assert _parse_kasmvnc_clipboard(b"\xb4\x00\x00") is None
+def test_scan_accepts_mime_with_parameters():
+    data = _make_kasmvnc_clipboard(("text/plain;charset=utf-8", "hi"))
+    assert _scan_kasmvnc_clipboard(data) == ("ok", len(data), None)
 
 
-def test_parse_clipboard_empty_text():
-    data = _make_kasmvnc_clipboard("text/plain", "")
-    assert _parse_kasmvnc_clipboard(data) == ""
+def test_scan_garbage_is_bad_not_partial():
+    assert _scan_kasmvnc_clipboard(b"\xb4\x02" + b"\x00" * 4 + b"\x0a" + b"\xff" * 5)[0] == "bad"
 
 
-def test_parse_clipboard_multiple_mimes():
-    """First mime is image/png, second is text/plain — should find text/plain."""
-    buf = bytearray()
-    buf.append(180)
-    buf.append(0)
-    buf.extend(b'\x00' * 4)
-    # Entry 1: image/png
-    mime1 = b"image/png"
-    buf.append(len(mime1))
-    buf.extend(mime1)
-    buf.extend(struct.pack(">I", 3))
-    buf.extend(b"PNG")
-    # Entry 2: text/plain
-    mime2 = b"text/plain"
-    buf.append(len(mime2))
-    buf.extend(mime2)
-    text = b"world"
-    buf.extend(struct.pack(">I", len(text)))
-    buf.extend(text)
-    assert _parse_kasmvnc_clipboard(bytes(buf)) == "world"
+def test_find_embedded_clipboard_at_frame_end():
+    tail = b"\x01\xb4\x99" * 5
+    assert _find_embedded_clipboard(tail + _REAL_CLIPBOARD_FRAME) == len(tail)
+
+
+def test_find_embedded_clipboard_partial():
+    tail = b"\x00\x01\x02" * 5
+    assert _find_embedded_clipboard(tail + _REAL_CLIPBOARD_FRAME[:-3]) == len(tail)
+
+
+def test_find_embedded_clipboard_ignores_pixel_data():
+    assert _find_embedded_clipboard(b"\x00" + b"\xb4\x02\x8a\x11" * 40) is None
+    # complete message followed by more data is not a frame-final clipboard
+    assert _find_embedded_clipboard(b"\x00" + _REAL_CLIPBOARD_FRAME + b"\x01\x02") is None
+
+
+def test_scan_short_tail_starting_with_b4_is_not_held():
+    # Could be the tail of a FramebufferUpdate; holding it would stall the stream.
+    for tail in (b"\xb4\x01", b"\xb4\x02\x00\x00", b"\xb4\x01\x00\x00\x00\x00\x0a", b"\xb4\x01\x00\x00\x00\x00\x0a\x74\x65"):
+        assert _scan_kasmvnc_clipboard(tail)[0] == "bad", tail
+
+
+# ── _split_kasmvnc_clipboard ────────────────────────────────────────────────
+
+
+def test_split_clipboard_real_frame():
+    assert _split_kasmvnc_clipboard(_REAL_CLIPBOARD_FRAME) == (
+        len(_REAL_CLIPBOARD_FRAME), "blank",
+    )
+
+
+def test_split_clipboard_text_plain():
+    data = _make_kasmvnc_clipboard(("text/plain", "hello"))
+    assert _split_kasmvnc_clipboard(data) == (len(data), "hello")
+
+
+def test_split_clipboard_no_text_plain():
+    data = _make_kasmvnc_clipboard(("image/png", "binary"))
+    assert _split_kasmvnc_clipboard(data) == (len(data), None)
+
+
+def test_split_clipboard_empty_text():
+    data = _make_kasmvnc_clipboard(("text/plain", ""))
+    assert _split_kasmvnc_clipboard(data) == (len(data), "")
+
+
+def test_split_clipboard_multiple_mimes():
+    data = _make_kasmvnc_clipboard(("image/png", "PNG"), ("text/plain", "world"))
+    assert _split_kasmvnc_clipboard(data) == (len(data), "world")
+
+
+def test_split_clipboard_trailing_bytes_reported():
+    """Other RFB data merged into the same frame must be left for passthrough."""
+    msg = _REAL_CLIPBOARD_FRAME
+    result = _split_kasmvnc_clipboard(msg + b"\x00\x00\x00\x01")
+    assert result == (len(msg), "blank")
+
+
+def test_split_clipboard_rejects_pixel_data_starting_with_180():
+    """A continuation frame that merely starts with 0xB4 is not a clipboard."""
+    assert _split_kasmvnc_clipboard(b"\xb4" + b"\x8a" * 60) is None
+    assert _split_kasmvnc_clipboard(bytes.fromhex("b482ead6e346b08e68678c3a")) is None
+
+
+def test_split_clipboard_rejects_truncated():
+    assert _split_kasmvnc_clipboard(_REAL_CLIPBOARD_FRAME[:-1]) is None
+    assert _split_kasmvnc_clipboard(b"\xb4\x02\x00") is None
+    assert _split_kasmvnc_clipboard(b"\xb4") is None
+
+
+def test_split_clipboard_rejects_other_type_and_zero_count():
+    assert _split_kasmvnc_clipboard(b"\x03" + _REAL_CLIPBOARD_FRAME[1:]) is None
+    assert _split_kasmvnc_clipboard(b"\xb4\x00") is None
 
 
 # ── _build_server_cut_text ───────────────────────────────────────────────────
 
 
+def _decode_extended_cut_text(msg: bytes) -> str:
+    assert msg[0] == 3  # ServerCutText type
+    length = struct.unpack_from(">i", msg, 4)[0]
+    assert length < 0  # negative length marks the extended format
+    assert -length == len(msg) - 8
+    flags = struct.unpack_from(">I", msg, 8)[0]
+    assert flags == (1 << 28) | 1  # Provide + text
+    raw = zlib.decompress(msg[12:])
+    size = struct.unpack_from(">I", raw, 0)[0]
+    assert size == len(raw) - 4
+    assert raw.endswith(b"\0")
+    return raw[4:-1].decode("utf-8")
+
+
 def test_build_cut_text_basic():
-    result = _build_server_cut_text("hi")
-    assert result[0] == 3  # ServerCutText type
-    length = struct.unpack_from(">I", result, 4)[0]
-    assert length == 2
-    assert result[8:] == b"hi"
+    assert _decode_extended_cut_text(_build_server_cut_text("hi")) == "hi"
 
 
 def test_build_cut_text_empty():
-    result = _build_server_cut_text("")
-    assert result[0] == 3
-    length = struct.unpack_from(">I", result, 4)[0]
-    assert length == 0
-    assert len(result) == 8
+    assert _decode_extended_cut_text(_build_server_cut_text("")) == ""
 
 
-def test_build_cut_text_latin1_fallback():
-    # CJK chars are outside Latin-1 — replaced with '?'
-    result = _build_server_cut_text("hello \u65e5\u672c")
-    text_bytes = result[8:]
-    assert b"?" in text_bytes  # unicode replaced
-    assert text_bytes.startswith(b"hello ")
+def test_build_cut_text_preserves_unicode():
+    text = "hello \u65e5\u672c \U0001f600" * 500
+    assert _decode_extended_cut_text(_build_server_cut_text(text)) == text
 
 
 # ── _rfb_msg_length ─────────────────────────────────────────────────────────
