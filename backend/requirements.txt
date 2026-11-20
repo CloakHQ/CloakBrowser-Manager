@@ -1,7 +1,7 @@
-fastapi>=0.162.0
+fastapi>=0.162.4
 uvicorn[standard]>=0.54.0
-pydantic>=2.14.2
-cloakbrowser[geoip]>=0.7.1
+pydantic>=2.14.3
+cloakbrowser[geoip]>=0.7.2
 websockets>=16.1.1; python_version < "3.11"
 websockets>=17.4; python_version >= "3.11"
 httpx>=0.28.1
