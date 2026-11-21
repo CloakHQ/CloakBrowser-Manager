@@ -1,4 +1,4 @@
-fastapi>=0.162.4
+fastapi>=0.163.2
 uvicorn[standard]>=0.54.0
 pydantic>=2.14.3
 cloakbrowser[geoip]>=0.7.3
