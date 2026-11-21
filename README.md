@@ -69,6 +69,18 @@ docker compose up --build
 
 Open [http://localhost:8080](http://localhost:8080), create a profile, and click Launch.
 
+#### Windows fonts (Docker)
+
+Docker profiles present as Windows, and a Windows browser without Windows fonts is easy to flag. These fonts are Microsoft-proprietary, so the image can't include them: copy them from a real Windows machine's `C:\Windows\Fonts\` folder and mount that folder into the container:
+
+```bash
+docker run -p 127.0.0.1:8080:8080 -v cloakprofiles:/data \
+  -v /path/to/windows-fonts:/usr/share/fonts/windows:ro \
+  cloakhq/cloakbrowser-manager
+```
+
+The fonts stay on your machine, so they survive container updates (fonts added with `docker cp` are lost when the container is recreated). Mount them to a subfolder as shown, not over `/usr/share/fonts` itself, which would hide the fonts the image already ships. When the set is complete, the **Fonts incomplete** warning disappears from the top bar.
+
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues) and attach the log so we can help. On Windows/macOS it's `logs/manager.log` in the data folder (`%LOCALAPPDATA%\CloakBrowser Manager` / `~/Library/Application Support/CloakBrowser Manager`); on Linux/Docker use `docker logs <container>`.
 
 ## CloakBrowser license key
